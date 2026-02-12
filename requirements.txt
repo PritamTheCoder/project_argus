@@ -1,0 +1,7 @@
+langgraph 
+langchain-openai
+ddgs
+crawl4ai
+pydantic
+pytest
+# playwright
