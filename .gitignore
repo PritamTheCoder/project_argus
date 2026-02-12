@@ -1,1 +1,8 @@
 Docs/
+.env
+.venv
+__pycache__/
+debug_scraper.py
+test_output1.log
+sample_output.json
+demo_scout.py
