@@ -5,3 +5,8 @@ __pycache__/
 debug_scraper.py
 test_output1.log
 sample_output.json
+.vscode
+.pytest_cache
+test_failure.log
+test_results.txt
+demo_phase_2.py
