@@ -16,6 +16,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 
+# ── Agent LLM Settings ──────────────────────────────────────────────────────
+LIBRARIAN_MODEL: str = os.getenv("LIBRARIAN_MODEL", "gemini-2.5-flash")
+CRITIC_MODEL: str    = os.getenv("CRITIC_MODEL", "gemini-2.5-flash")
+WRITER_MODEL: str    = os.getenv("WRITER_MODEL", "gemini-2.5-flash")
+
 # ── Refiner Settings ────────────────────────────────────────────────────────
 REFINER_MODEL: str = os.getenv("REFINER_MODEL", "gemini-2.5-flash")
 
