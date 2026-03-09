@@ -48,8 +48,8 @@ async def run_scout(query: str, max_results: int | None = None) -> list[dict]:
 
     logger.info(f" Found {len(urls)} URLs, starting scrape...")
 
-    # Scrape all URLs concurrently
-    results = await scrape_urls(urls)
+    # Scrape all URLs concurrently, passing query for pre-filtering
+    results = await scrape_urls(urls, query=query)
 
     # Log summary
     successful = [r for r in results if r["success"]]

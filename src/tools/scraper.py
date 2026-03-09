@@ -1,3 +1,5 @@
+import sqlite3
+import os
 """
 Project Argus - Crawl4AI Web Scraper
 
@@ -9,18 +11,91 @@ import asyncio
 import logging
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from src.config import SCRAPE_TIMEOUT
+from src.utils.cache import get_cached_markdown, set_cached_markdown, init_db
+import re
 
 logger = logging.getLogger(__name__)
 
+# Ensure DB is initialized on import
+init_db()
+
+def _filter_long_content(content: str, query: str, max_length: int = 50000, intro_length: int = 10000) -> str:
+    """
+    If content exceeds max_length, aggressively filter it to reduce noise.
+    Keeps the introduction (first `intro_length` chars).
+    Then scans paragraphs for keywords from the query and builds up the remaining allowed budget.
+    """
+    if len(content) <= max_length:
+        return content
+        
+    logger.info(f"    [!] Document length {len(content)} exceeds {max_length}. Applying pre-filter against query: '{query}'")
+    
+    # 1. Always keep the intro
+    intro = content[:intro_length]
+    remaining_budget = max_length - intro_length
+    
+    # 2. Extract keywords from query (ignoring common stop words roughly via length)
+    keywords = [w.lower() for w in re.findall(r'\b\w+\b', query) if len(w) > 3]
+    if not keywords:
+        # If no good keywords, just truncate
+        return intro + "\n\n... [CONTENT TRUNCATED FOR LENGTH] ..."
+        
+    # 3. Score paragraphs by keyword density
+    rest_of_content = content[intro_length:]
+    paragraphs = rest_of_content.split('\n\n')
+    
+    scored_paragraphs = []
+    for i, p in enumerate(paragraphs):
+        words = p.split()
+        if not words:
+            continue
+            
+        p_lower = p.lower()
+        keyword_count = sum(p_lower.count(kw) for kw in keywords)
+        
+        if keyword_count > 0:
+            density = keyword_count / len(words)
+            scored_paragraphs.append((density, i, p))
+            
+    # Sort by density (highest first)
+    scored_paragraphs.sort(key=lambda x: x[0], reverse=True)
+    
+    # Pick top paragraphs that fit in the budget
+    selected_indices = []
+    current_length = 0
+    
+    for density, original_idx, p in scored_paragraphs:
+        # +2 for newlines
+        if current_length + len(p) + 2 > remaining_budget:
+            # Look for smaller paragraphs that might still fit
+            continue
+            
+        selected_indices.append(original_idx)
+        current_length += len(p) + 2
+        
+    # Sort selected indices back to original reading order for coherence
+    selected_indices.sort()
+    filtered_paragraphs = [paragraphs[i] for i in selected_indices]
+            
+    filtered_text = "\n\n".join(filtered_paragraphs)
+    
+    final_output = intro + f"\n\n... [SKIPPED {len(paragraphs) - len(filtered_paragraphs)} LESS RELEVANT PARAGRAPHS] ...\n\n" + filtered_text
+    
+    if len(selected_indices) < len(scored_paragraphs):
+         final_output += "\n\n... [REMAINING LESS RELEVANT CONTENT TRUNCATED] ..."
+         
+    logger.info(f"    [!] Pre-filter complete. Final size: {len(final_output)} chars.")
+    return final_output
 
 async def _scrape_single(
     crawler: AsyncWebCrawler,
     url: str,
     run_config: CrawlerRunConfig,
+    query: str = ""
 ) -> dict:
     """
     Scrape a single URL and return a structured result dict.
-
+    Checks cache first to avoid reduntant network calls.
     Returns:
         {
             "url": str,
@@ -29,6 +104,23 @@ async def _scrape_single(
             "error": str | None
         }
     """
+    # 1. Check persistent cache
+    cached_content = get_cached_markdown(url)
+    if cached_content:
+        logger.info(f"[CACHE HIT] Loaded {url} from local DB ({len(cached_content)} chars)")
+        
+        # apply query pre-filter to cached content for the specific query
+        if query and cached_content:
+            cached_content = _filter_long_content(cached_content, query)
+            
+        return {
+            "url": url,
+            "content": cached_content.strip(),
+            "success": True,
+            "error": None,
+        }
+
+    # 2. Scrape live if not in cache
     try:
         result = await asyncio.wait_for(
             crawler.arun(url=url, config=run_config),
@@ -37,6 +129,14 @@ async def _scrape_single(
 
         if result.success:
             content = result.markdown or ""
+            
+            # Save raw content to cache before filtering
+            if content:
+                 set_cached_markdown(url, content)
+            
+            # Apply Wikipedia Noise Filter / Pre-filtering if query is provided
+            if query and content:
+                content = _filter_long_content(content, query)
 
             logger.info(f"[OK] Scraped {url} ({len(content)} chars)")
             return {
@@ -75,7 +175,7 @@ async def _scrape_single(
         }
 
 
-async def scrape_urls(urls: list[str]) -> list[dict]:
+async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
     """
     Scrape multiple URLs concurrently using Crawl4AI.
 
@@ -112,7 +212,7 @@ async def scrape_urls(urls: list[str]) -> list[dict]:
     async with AsyncWebCrawler(config=browser_config) as crawler:
         # Fire all scrapes concurrently with asyncio.gather
         tasks = [
-            _scrape_single(crawler, url, run_config)
+            _scrape_single(crawler, url, run_config, query)
             for url in urls
         ]
         results = await asyncio.gather(*tasks, return_exceptions=False)
