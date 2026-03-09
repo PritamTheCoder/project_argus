@@ -2,8 +2,7 @@ langgraph
 langchain-openai
 ddgs
 crawl4ai
-pydantic
-pytest
-# playwright
-langextract
+pydantic>=2.0.0
+duckduckgo-search>=5.0.0
 langchain-google-genai
+langgraph-checkpoint-sqlite
