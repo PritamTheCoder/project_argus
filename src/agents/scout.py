@@ -7,7 +7,6 @@ and builds the raw data payload.
 """
 
 import logging
-import asyncio
 from src.schema.state import AgentState
 from src.tools.scout import run_scout
 
@@ -46,29 +45,41 @@ async def scout_node(state: AgentState) -> dict:
     
     for q in queries:
         logger.info(f"Scout: Processing query '{q}'")
-        results = await run_scout(q)
+        
+        # We need to extract the search+scrape steps from run_scout so we can intercept 
+        # the URLs before scraping to apply the Global Seen-Set.
+        from src.tools.search import search_ddg
+        from src.tools.scraper import scrape_urls
+        
+        # 1. Search
+        urls = await search_ddg(q)
+        if not urls:
+            continue
+            
+        # 2. Apply Global Seen-Set Deduplication
+        seen_urls = {v["url"] for v in source_map.values()}
+        new_urls = [u for u in urls if u not in seen_urls]
+        
+        if not new_urls:
+            logger.info(f"Scout: All {len(urls)} URLs for query '{q}' were already seen.")
+            continue
+            
+        logger.info(f"Scout: Found {len(urls)} URLs, {len(new_urls)} are new. Scraping...")
+        
+        # 3. Scrape ONLY the new URLs
+        results = await scrape_urls(new_urls, query=q)
         
         # Process successful results
         for res in results:
             if not res["success"] or not res["content"]:
                 continue
                 
-            # Check if URL is already in our map to avoid duplicates
-            existing_id = None
-            for sid, sdata in source_map.items():
-                if sdata["url"] == res["url"]:
-                    existing_id = sid
-                    break
-            
-            if existing_id:
-                source_id = existing_id
-            else:
-                source_id = f"[{next_id}]"
-                source_map[source_id] = {
-                    "url": res["url"],
-                    "snippet": res["content"][:200] + "..." # Preview for UI/Citations
-                }
-                next_id += 1
+            source_id = f"[{next_id}]"
+            source_map[source_id] = {
+                "url": res["url"],
+                "snippet": res["content"][:200] + "..." # Preview for UI/Citations
+            }
+            next_id += 1
             
             # Append to scraped data payload
             all_scraped_data.append({

@@ -10,6 +10,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from src.schema.state import AgentState, ResearchPlan
 from src.config import LIBRARIAN_MODEL
+from src.utils.retry import retry_on_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +48,9 @@ def librarian_node(state: AgentState) -> dict:
         ("human", "{input}")
     ])
     
-    # Execute the chain
+    # Execute the chain with retry logic for rate-limit errors
     chain = prompt | structured_llm
-    result: ResearchPlan = chain.invoke({"input": query})
+    result: ResearchPlan = retry_on_rate_limit(chain.invoke, {"input": query})
     
     logger.info(f"Librarian: Generated {len(result.search_queries)} queries: {result.search_queries}")
     
@@ -57,3 +58,4 @@ def librarian_node(state: AgentState) -> dict:
         "plan": result.search_queries,
         "active_node": "librarian"
     }
+

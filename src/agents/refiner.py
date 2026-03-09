@@ -7,58 +7,56 @@ Dynamically generates a schema based on the plan.
 """
 
 import logging
+from typing import Dict
+from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
 from src.schema.state import AgentState
 from src.tools.refiner import extract_facts
 from src.config import LIBRARIAN_MODEL
 
 logger = logging.getLogger(__name__)
 
+class ExtractionSchema(BaseModel):
+    schema_dict: Dict[str, str] = Field(
+        description="A dictionary where keys are entity types (e.g., 'dates', 'companies', 'metrics') and values are short descriptions of what to extract."
+    )
+
 
 def _generate_dynamic_schema(plan: list[str]) -> dict:
     """
     Use an LLM to generate an extraction schema based on the research plan.
-    Ideally, this should be robust. For now, we use a simple prompt to get JSON.
+    Uses Pydantic structured output to guarantee valid formatting.
     """
     try:
-        llm = ChatGoogleGenerativeAI(model=LIBRARIAN_MODEL, temperature=0, model_kwargs={"response_format": {"type": "json_object"}})
+        llm = ChatGoogleGenerativeAI(model=LIBRARIAN_MODEL, temperature=0)
+        structured_llm = llm.with_structured_output(ExtractionSchema)
         
         system_prompt = (
-            "You are a data schema expert. Given a research plan, generate a JSON object "
-            "where keys are entity types (e.g., 'dates', 'metrics', 'costs', 'definitions') "
-            "and values are short descriptions of what to extract."
-            "\n\nExample Output:\n"
-            "{\n  \"dates\": \"exact dates of events\",\n  \"metrics\": \"performance numbers like Wh/kg\"\n}"
+            "You are a data schema expert. Given a research plan, define the precise data points we need to extract from web pages to answer the queries."
+            "Generate a dictionary where keys are entity shortnames and values are descriptions of the data to extract."
         )
         
-        user_msg = f"Plan: {plan}"
+        user_msg = f"Research Plan target queries: {plan}"
         
         messages = [
             ("system", system_prompt),
             ("human", user_msg)
         ]
         
-        response = llm.invoke(messages)
-        import json
-        return json.loads(response.content)
+        result: ExtractionSchema = structured_llm.invoke(messages)
+        return result.schema_dict
         
     except Exception as e:
-        logger.warning(f"Refiner: Schema generation failed ({e}). Using fallback.")
+        logger.warning(f"Refiner: Structured schema generation failed ({e}). Using fallback.")
         return {"facts": "important facts found in the text"}
 
 
 def refiner_node(state: AgentState) -> dict:
     """
-    Extract facts from scraped data using a dynamically generated schema.
-    
-    Args:
-        state: AgentState with `scraped_data` and `plan`.
-        
-    Returns:
-        dict: Updates `structured_evidence`.
+    Batch extracts facts from scraped data.
+    Takes all scraped_data, packs them into a single string with source tags, and invokes the Refiner Tool.
     """
-    logger.info("Refiner: Starting fact extraction...")
+    logger.info("Refiner: Starting batched fact extraction...")
     
     scraped_data = state.get("scraped_data", [])
     if not scraped_data:
@@ -71,36 +69,28 @@ def refiner_node(state: AgentState) -> dict:
     schema = _generate_dynamic_schema(plan)
     logger.info(f"Refiner: Generated schema: {schema}")
     
-    # 2. Extract from each document
-    all_facts = []
-    
-    import time
-    
+    # 2. Pack the context
+    batched_text = ""
     for doc in scraped_data:
         text = doc.get("content", "")
         source_id = doc.get("source_id", "[?]")
+        # Trim very long docs to prevent overflow if necessary, otherwise rely on 1M token limit
+        if text.strip():
+            batched_text += f"\n<document source_id=\"{source_id}\">\n{text}\n</document>\n"
+            
+    if not batched_text.strip():
+        logger.warning("Refiner: All scraped data was empty.")
+        return {"structured_evidence": [], "active_node": "refiner"}
         
-        # Skip empty docs
-        if not text.strip():
-            continue
-            
-        try:
-            # Rate limit protection
-            time.sleep(2)
-            
-            # Call the tool
-            extraction_result = extract_facts(text[:15000], schema) # Limit context win if needed
-            
-            # Tag facts with source ID
-            for fact in extraction_result["facts"]:
-                fact["source_id"] = source_id
-                all_facts.append(fact)
-                
-        except Exception as e:
-            logger.error(f"Refiner: Failed to extract from {source_id}: {e}")
-            continue
-            
-    logger.info(f"Refiner: Extracted {len(all_facts)} total facts.")
+    # 3. Call the Batch Tool
+    all_facts = []
+    try:
+        logger.info(f"Refiner: Passing massive batched payload to natively extract facts...")
+        extraction_result = extract_facts(batched_text, schema)
+        all_facts = extraction_result.get("facts", [])
+        logger.info(f"Refiner: Extracted {len(all_facts)} total facts from batched payload.")
+    except Exception as e:
+        logger.error(f"Refiner: Batch extraction failed: {e}")
     
     return {
         "structured_evidence": all_facts,

@@ -42,13 +42,16 @@ def critic_node(state: AgentState) -> dict:
     structured_llm = llm.with_structured_output(FactCheckResult)
     
     system_prompt = (
-        "You are a rigorous Fact Checker. Your job is to verify if the extracted evidence "
-        "sufficiently answers the user's query.\n\n"
+        "You are a rigorous Fact Checker and Source Cross-Referencing Engine. "
+        "Your job is to review the extracted evidence against the user's query.\n\n"
         "Criteria:\n"
         "1. Coverage: Do we have facts for all parts of the query?\n"
-        "2. Verification: Are there conflicting numbers?\n"
+        "2. Cross-Referencing: Are there CONTRADICTIONS or CONFLICTS between different sources? "
+        "(e.g., Timeline conflicts where Source [2] says 2027 but Source [9] says 2030, or differing metrics).\n"
         "3. Specificity: Is the data specific enough (not vague)?\n\n"
-        "Output a boolean `re_search_required` and a `critique` explaining what is missing."
+        "Output a boolean `re_search_required` and a highly detailed `critique`. "
+        "CRITICAL: If you find conflicting facts, you MUST explicitly list the conflicting source IDs "
+        "and explain the contradiction in your critique so the Writer can address it in the final report."
     )
     
     prompt = ChatPromptTemplate.from_messages([
