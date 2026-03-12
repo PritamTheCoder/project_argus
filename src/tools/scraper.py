@@ -9,10 +9,16 @@ and returns clean Markdown. Zero dependency on LLMs.
 
 import asyncio
 import logging
+import warnings
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from src.config import SCRAPE_TIMEOUT
 from src.utils.cache import get_cached_markdown, set_cached_markdown, init_db
 import re
+
+try:
+    from playwright._impl._errors import Error as PlaywrightError
+except ImportError:
+    PlaywrightError = OSError  # safe fallback
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +101,12 @@ async def _scrape_single(
 ) -> dict:
     """
     Scrape a single URL and return a structured result dict.
-    Checks cache first to avoid reduntant network calls.
+    Checks cache first to avoid redundant network calls.
+
+    Uses Playwright-native timeouts (via CrawlerRunConfig.page_timeout)
+    instead of asyncio.wait_for to prevent orphaned Futures that cause
+    'Future exception was never retrieved' warnings.
+
     Returns:
         {
             "url": str,
@@ -108,11 +119,11 @@ async def _scrape_single(
     cached_content = get_cached_markdown(url)
     if cached_content:
         logger.info(f"[CACHE HIT] Loaded {url} from local DB ({len(cached_content)} chars)")
-        
+
         # apply query pre-filter to cached content for the specific query
         if query and cached_content:
             cached_content = _filter_long_content(cached_content, query)
-            
+
         return {
             "url": url,
             "content": cached_content.strip(),
@@ -122,18 +133,45 @@ async def _scrape_single(
 
     # 2. Scrape live if not in cache
     try:
-        result = await asyncio.wait_for(
-            crawler.arun(url=url, config=run_config),
-            timeout=SCRAPE_TIMEOUT,
-        )
+        # Let Playwright handle the timeout natively — avoids orphaned
+        # Futures that asyncio.wait_for would create when it cancels
+        # the coroutine while Playwright navigation is still in-flight.
+        result = await crawler.arun(url=url, config=run_config)
 
         if result.success:
             content = result.markdown or ""
-            
+
+            # --- Robustness: Retry if suspiciously small ---
+            if len(content) < 1000:
+                logger.info(f"[!] Scrape of {url} yielded only {len(content)} chars. Retrying with headless=False...")
+                try:
+                    retry_browser_config = BrowserConfig(headless=False, verbose=False)
+                    retry_run_config = CrawlerRunConfig(
+                        word_count_threshold=run_config.word_count_threshold,
+                        excluded_tags=run_config.excluded_tags,
+                        exclude_external_links=run_config.exclude_external_links,
+                        page_timeout=SCRAPE_TIMEOUT * 1000,  # ms
+                    )
+                    async with AsyncWebCrawler(config=retry_browser_config) as retry_crawler:
+                        retry_result = await retry_crawler.arun(
+                            url=url, config=retry_run_config
+                        )
+                        # Settle pending network requests/frames
+                        await asyncio.sleep(1.0)
+                    if retry_result.success and retry_result.markdown and len(retry_result.markdown) > len(content):
+                        content = retry_result.markdown
+                        logger.info(f"    [+] Retry successful! Extracted {len(content)} chars.")
+                    else:
+                        logger.warning(f"    [-] Retry failed or yielded shorter content. Keeping original.")
+                except (PlaywrightError, asyncio.TimeoutError) as e:
+                    logger.warning(f"    [-] Retry navigation error: {e}")
+                except Exception as e:
+                    logger.warning(f"    [-] Retry failed with error: {e}")
+
             # Save raw content to cache before filtering
             if content:
                  set_cached_markdown(url, content)
-            
+
             # Apply Wikipedia Noise Filter / Pre-filtering if query is provided
             if query and content:
                 content = _filter_long_content(content, query)
@@ -155,6 +193,17 @@ async def _scrape_single(
                 "error": error_msg,
             }
 
+    except PlaywrightError as e:
+        # Playwright navigation errors (ERR_ABORTED, frame detached, etc.)
+        # Caught explicitly to prevent them from becoming orphaned Futures.
+        error_msg = f"Navigation error for {url}: {e}"
+        logger.warning(f"[X] {error_msg}")
+        return {
+            "url": url,
+            "content": "",
+            "success": False,
+            "error": error_msg,
+        }
     except asyncio.TimeoutError:
         error_msg = f"Timeout ({SCRAPE_TIMEOUT}s) scraping {url}"
         logger.warning(f"[X] {error_msg}")
@@ -207,6 +256,7 @@ async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
         word_count_threshold=10,       # Skip pages with very little text
         excluded_tags=["nav", "footer", "header", "aside", "script", "style"],
         exclude_external_links=True,   # Keep output clean
+        page_timeout=SCRAPE_TIMEOUT * 1000,  # ms — Playwright-native timeout
     )
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
@@ -215,9 +265,25 @@ async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
             _scrape_single(crawler, url, run_config, query)
             for url in urls
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=False)
+        # Use return_exceptions=True to prevent a single TargetClosedError from crashing the batch
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Give Playwright time to clean up frames / pending navigations
+        await asyncio.sleep(1.0)
 
-    successful = sum(1 for r in results if r["success"])
+    results = []
+    for url, res in zip(urls, raw_results):
+        if isinstance(res, Exception):
+            logger.warning(f"[X] Unhandled exception during scrape of {url}: {type(res).__name__}: {res}")
+            results.append({
+                "url": url,
+                "content": "",
+                "success": False,
+                "error": f"{type(res).__name__}: {res}"
+            })
+        else:
+            results.append(res)
+
+    successful = sum(1 for r in results if r.get("success", False))
     logger.info(f"Scraping complete: {successful}/{len(urls)} succeeded")
 
     return results
