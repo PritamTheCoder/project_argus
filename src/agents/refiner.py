@@ -32,8 +32,9 @@ def _generate_dynamic_schema(plan: list[str]) -> dict:
         structured_llm = llm.with_structured_output(ExtractionSchema)
         
         system_prompt = (
-            "You are a data schema expert. Given a research plan, define the precise data points we need to extract from web pages to answer the queries."
-            "Generate a dictionary where keys are entity shortnames and values are descriptions of the data to extract."
+            "You are a data schema expert. Given a research plan, define the precise data points we need to extract from web pages to answer the queries.\n"
+            "Generate a dictionary where keys are entity shortnames and values are descriptions of the data to extract.\n"
+            "CRITICAL: You MUST ALWAYS include keys named 'Notable_Outliers' and 'Lateral_Innovations' to capture unexpected, serendipitous, or edge-case discoveries that don't fit standard metrics."
         )
         
         user_msg = f"Research Plan target queries: {plan}"
@@ -82,12 +83,23 @@ def refiner_node(state: AgentState) -> dict:
         logger.warning("Refiner: All scraped data was empty.")
         return {"structured_evidence": [], "active_node": "refiner"}
         
+    source_map = state.get("source_map", {})
+    
     # 3. Call the Batch Tool
     all_facts = []
     try:
         logger.info(f"Refiner: Passing massive batched payload to natively extract facts...")
         extraction_result = extract_facts(batched_text, schema)
         all_facts = extraction_result.get("facts", [])
+        
+        # Inject source_url from source_map
+        for fact in all_facts:
+            s_id = fact.get("source_id")
+            if s_id and s_id in source_map:
+                fact["source_url"] = source_map[s_id].get("url", "")
+            else:
+                fact["source_url"] = ""
+                
         logger.info(f"Refiner: Extracted {len(all_facts)} total facts from batched payload.")
     except Exception as e:
         logger.error(f"Refiner: Batch extraction failed: {e}")
