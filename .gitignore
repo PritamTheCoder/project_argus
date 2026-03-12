@@ -16,3 +16,6 @@ demo_refiner.py
 test_results2.txt
 tests/test_graph.py
 demo_phase_3.py
+src/ui/
+knowledge_graph.db
+embedding_cache_local.json
