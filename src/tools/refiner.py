@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 
 class ExtractedFact(BaseModel):
     extraction_class: str = Field(description="The category of the extracted fact (e.g., 'dates', 'metrics').")
-    text: str = Field(description="The exact text extracted from the source document.")
+    claim: str = Field(description="A clear, standalone factual claim extracted from the document.")
+    source_excerpt: str = Field(description="The exact text quote from the document that explicitly supports the claim.")
     source_id: str = Field(description="The source_id of the document where this fact was found. MUST exactly match the source_id in the <document source_id=\"...\"> tag.")
     attributes: Dict[str, Any] = Field(description="Additional attributes summarizing the fact based on the schema.", default_factory=dict)
 
@@ -39,21 +40,22 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
     joined_schema = ", ".join(parts)
     
     prompt = f"""You are a specialized Data Extraction Engine.
-Your task is to extract highly specific facts from the provided documents.
-Each document is wrapped in <document source_id="..."> tags. 
+                    Your task is to extract highly specific facts from the provided documents.
+                    Each document is wrapped in <document source_id="..."> tags. 
 
-Target Schema: Extract the following entities: {joined_schema}.
-For each fact:
-1. Provide the exact text from the document.
-2. Provide the extraction_class based on the Target Schema.
-3. Critically: You must provide the exact `source_id` of the document where you found the fact.
-4. Add meaningful `attributes` to provide context.
+                    Target Schema: Extract the following entities: {joined_schema}.
+                    For each fact:
+                    1. Provide a clear, standalone factual `claim` based on the document.
+                    2. Provide the `source_excerpt` containing the exact text quote that supports the claim.
+                    3. Provide the `extraction_class` based on the Target Schema.
+                    3. Critically: You must provide the exact `source_id` of the document where you found the fact.
+                    4. Add meaningful `attributes` to provide context.
 
-Documents to Analyze:
-====================
-{batched_text}
-====================
-"""
+                    Documents to Analyze:
+                    ====================
+                    {batched_text}
+                    ====================
+            """
 
     try:
         # Context Window Meter
@@ -77,7 +79,8 @@ Documents to Analyze:
             for fact in result.facts:
                 facts.append({
                     "class": fact.extraction_class,
-                    "text": fact.text,
+                    "claim": fact.claim,
+                    "source_excerpt": fact.source_excerpt,
                     "source_id": fact.source_id,
                     "attributes": fact.attributes or {},
                     "source_span": {"start": None, "end": None} # Legacy compatibility
