@@ -19,6 +19,7 @@ from src.config import MAX_RESEARCH_LOOPS
 from src.agents.librarian import librarian_node
 from src.agents.scout import scout_node
 from src.agents.refiner import refiner_node
+from src.agents.verifier import verifier_node
 from src.agents.critic import critic_node
 from src.agents.writer import writer_node
 
@@ -84,6 +85,7 @@ def build_graph(checkpointer=None):
     builder.add_node("librarian", librarian_node)
     builder.add_node("scout", scout_node)            # async — LangGraph handles it
     builder.add_node("refiner", refiner_node)
+    builder.add_node("verifier", verifier_node)
     builder.add_node("fact_checker", _critic_with_counter)
     builder.add_node("ghostwriter", writer_node)
 
@@ -91,7 +93,8 @@ def build_graph(checkpointer=None):
     builder.add_edge(START, "librarian")
     builder.add_edge("librarian", "scout")
     builder.add_edge("scout", "refiner")
-    builder.add_edge("refiner", "fact_checker")
+    builder.add_edge("refiner", "verifier")
+    builder.add_edge("verifier", "fact_checker")
 
     # ── Conditional Edge (the Research Loop) ────────────────────────────────
     builder.add_conditional_edges(
