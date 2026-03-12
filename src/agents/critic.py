@@ -28,12 +28,14 @@ def critic_node(state: AgentState) -> dict:
     logger.info("Critic: Reviewing evidence...")
     
     query = state["query"]
-    evidence = state.get("structured_evidence", [])
+    evidence = state.get("verified_facts", [])
     
     # Format evidence for the LLM
     evidence_text = ""
     for i, fact in enumerate(evidence[:50]): # Limit to top 50 facts to fit context
-        evidence_text += f"- [{fact.get('source_id', '?')}] {fact['class']}: {fact['text']} ({fact.get('attributes')})\n"
+        support = fact.get("support_level", "UNCERTAIN")
+        claim = fact.get("claim", fact.get("text", "Unknown Claim"))
+        evidence_text += f"- [{fact.get('source_id', '?')}] ({support}) {claim}\n"
         
     if not evidence_text:
         evidence_text = "(No evidence extracted independently.)"
