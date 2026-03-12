@@ -29,14 +29,35 @@ def writer_node(state: AgentState) -> dict:
     logger.info("Writer: Synthesizing report...")
     
     query = state["query"]
-    evidence = state.get("structured_evidence", [])
+    evidence = state.get("verified_facts", [])
     source_map = state.get("source_map", {})
     
-    # Format evidence
+    # --- Citation Deduplication & Mapping Layer ---
+    unique_urls = {}       # url -> new_source_id (e.g. "[1]")
+    new_source_map = {}    # new_source_id -> {"url": url, ...}
+    old_to_new_id_map = {} # old_source_id (e.g. "[4]") -> new_source_id (e.g. "[1]")
+    
+    next_id = 1
+    for old_id, data in source_map.items():
+        url = data.get("url")
+        if url not in unique_urls:
+            new_id = f"[{next_id}]"
+            unique_urls[url] = new_id
+            new_source_map[new_id] = data
+            next_id += 1
+        
+        old_to_new_id_map[old_id] = unique_urls[url]
+
+    # Format evidence using the deduplicated IDs
     evidence_text = ""
     for fact in evidence:
-        sid = fact.get("source_id", "?")
-        evidence_text += f"- {fact['text']} [Source: {sid}]\n"
+        if fact.get("support_level") not in ["SUPPORTED", "PARTIALLY_SUPPORTED"]:
+            continue
+        old_sid = fact.get("source_id", "?")
+        new_sid = old_to_new_id_map.get(old_sid, old_sid) # Use original if not in map somehow
+        
+        claim = fact.get("claim", fact.get("text", ""))
+        evidence_text += f"- {claim} [Source: {new_sid}]\n"
         
     llm = ChatGoogleGenerativeAI(model=WRITER_MODEL, temperature=0.7)
     
@@ -45,28 +66,31 @@ def writer_node(state: AgentState) -> dict:
         "RULES:\n"
         "1. Use ONLY the provided evidence. Do not use outside knowledge.\n"
         "2. Cite every claim using the source ID, e.g. 'The battery density is 500 Wh/kg [1].'\n"
-        "3. If evidence is missing, state 'Evidence not found for X'.\n"
+        "3. If evidence is missing for a specific topic (e.g., Contradictions/Critiques), DO NOT mention the topic. DO NOT write 'No evidence found'. Simply omit the section entirely.\n"
         "4. Write in clean Markdown with headers.\n"
-        "5. Do NOT generate a 'References' section manually; just use the [ID] markers in text."
+        "5. Do NOT generate a 'References' section manually; just use the [ID] markers in text.\n"
+        "6. CRITICAL: Address any highlighted contradictions or caveats found in the Critique.\n"
+        "7. Attempt to cite at least 6 unique sources to ensure a broad consensus, provided the sources meet the quality threshold."
     )
+    
+    critique = state.get("critique", "")
     
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
-        ("human", "Query: {query}\n\nEvidence:\n{evidence}")
+        ("human", "Query: {query}\n\nCritique/Contradictions:\n{critique}\n\nEvidence:\n{evidence}")
     ])
     
     chain = prompt | llm
-    response = chain.invoke({"query": query, "evidence": evidence_text})
+    response = chain.invoke({"query": query, "critique": critique, "evidence": evidence_text})
     report_content = response.content
     
-    # Append References Section from Source Map
-    if source_map:
+    # Append References Section from Source Map using new deduplicated mapping
+    if new_source_map:
         report_content += "\n\n---\n### References\n"
-        # Sort by ID if possible, roughly
-        sorted_ids = sorted(source_map.keys(), key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 0)
+        sorted_ids = sorted(new_source_map.keys(), key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 0)
         
         for sid in sorted_ids:
-            data = source_map[sid]
+            data = new_source_map[sid]
             url = data.get("url", "#")
             report_content += f"- **{sid}**: {url}\n"
             
