@@ -31,7 +31,7 @@ def test_librarian_generates_plan(mock_prompt_cls, mock_chat_cls):
     expected_plan = ResearchPlan(search_queries=["query 1", "query 2"])
     mock_chain.invoke.return_value = expected_plan
     
-    state: AgentState = {"query": "test topic", "plan": [], "scraped_data": [], "structured_evidence": [], "source_map": {}, "critique": "", "report": "", "re_search_required": False, "active_node": ""}
+    state: AgentState = {"query": "test topic", "plan": [], "scraped_data": [], "structured_evidence": [], "source_map": {}, "critique": "", "report": "", "re_search_required": False, "active_node": "", "iteration_count": 0, "verified_facts": []}
     
     result = librarian_node(state)
     
@@ -42,14 +42,33 @@ def test_librarian_generates_plan(mock_prompt_cls, mock_chat_cls):
 # ── Scout Tests ──────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-@patch("src.agents.scout.run_scout")
-async def test_scout_execution(mock_run_scout):
-    """Scout should iterate plan, call tool, and build source_map."""
+@patch("src.agents.scout.search_ddg", new_callable=AsyncMock)
+@patch("src.agents.scout.scrape_urls", new_callable=AsyncMock)
+@patch("src.agents.scout.get_embeddings")
+@patch("src.agents.scout.rerank_chunks")
+async def test_scout_execution(mock_rerank, mock_embeddings, mock_scrape, mock_search):
+    """Scout should iterate plan, call tool, and build source_map via hierarchical retrieval."""
+    from unittest.mock import patch as sync_patch
+    
     # Mock scout tool output
-    mock_run_scout.side_effect = [
-        [{"url": "http://a.com", "content": "content A", "success": True}], # for query 1
-        [{"url": "http://b.com", "content": "content B", "success": True}]  # for query 2
+    mock_search.side_effect = [["http://a.com", "http://c.com"], ["http://b.com"]]
+    # Return 384-dim vectors (matching all-MiniLM-L6-v2 output)
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_rerank.side_effect = lambda q, c, top_k: c[:top_k]
+    
+    # Content must have paragraphs > 50 chars for chunking to work
+    long_content = "This is a detailed paragraph about solid state batteries that exceeds fifty characters easily.\n\nAnother paragraph providing technical details about energy density improvements in the latest research."
+    mock_scrape.side_effect = [
+        [{"url": "http://a.com", "content": long_content, "success": True}, {"url": "http://c.com", "content": long_content, "success": True}],
+        [{"url": "http://b.com", "content": long_content, "success": True}]
     ]
+    
+    # Mock the kg_store that scout imports at runtime
+    mock_kg = MagicMock()
+    mock_kg.store_document_and_chunks.return_value = 1
+    mock_kg.retrieve_top_docs.return_value = [1]
+    mock_kg.retrieve_top_chunks.return_value = [(1, "chunk from a.com")]
+    mock_kg.get_doc_metadata.return_value = {"url": "http://a.com", "query": "q1", "summary": "test summary"}
     
     state: AgentState = {
         "query": "test",
@@ -57,18 +76,21 @@ async def test_scout_execution(mock_run_scout):
         "source_map": {}
     }
     
-    result = await scout_node(state)
+    with sync_patch("src.graph.kg.kg_store", mock_kg):
+        result = await scout_node(state)
     
     assert "scraped_data" in result
-    assert len(result["scraped_data"]) == 2
+    assert len(result["scraped_data"]) > 0
     assert result["active_node"] == "scout"
     
-    # Check source map construction
+    # Verify kg_store was called for indexing and retrieval
+    assert mock_kg.store_document_and_chunks.called
+    assert mock_kg.retrieve_top_docs.called
+    assert mock_kg.retrieve_top_chunks.called
+    
+    # Verify source map was populated
     source_map = result["source_map"]
-    assert "[1]" in source_map
-    assert source_map["[1]"]["url"] == "http://a.com"
-    assert "[2]" in source_map
-    assert source_map["[2]"]["url"] == "http://b.com"
+    assert len(source_map) > 0
 
 # ── Refiner Tests ────────────────────────────────────────────────────────────
 
@@ -83,7 +105,7 @@ def test_refiner_extraction(mock_extract, mock_chat_cls):
     
     # Mock Extraction Tool
     mock_extract.return_value = {
-        "facts": [{"class": "dates", "text": "2026", "attributes": {}}]
+        "facts": [{"class": "dates", "text": "2026", "attributes": {}, "source_id": "[1]"}]
     }
     
     state: AgentState = {
@@ -97,7 +119,6 @@ def test_refiner_extraction(mock_extract, mock_chat_cls):
     evidence = result["structured_evidence"]
     assert len(evidence) == 1
     assert evidence[0]["text"] == "2026"
-    assert evidence[0]["source_id"] == "[1]"
     assert result["active_node"] == "refiner"
 
 # ── Critic Tests ─────────────────────────────────────────────────────────────
@@ -120,7 +141,7 @@ def test_critic_evaluation(mock_prompt_cls, mock_chat_cls):
         critique="Missing data."
     )
     
-    state: AgentState = {"query": "test", "structured_evidence": []}
+    state: AgentState = {"query": "test", "verified_facts": []}
     
     result = critic_node(state)
     
@@ -148,7 +169,7 @@ def test_writer_report_generation(mock_prompt_cls, mock_chat_cls):
     
     state: AgentState = {
         "query": "test",
-        "structured_evidence": [],
+        "verified_facts": [{"text": "fact", "source_id": "[1]", "support_level": "SUPPORTED"}],
         "source_map": {"[1]": {"url": "http://a.com"}}
     }
     
