@@ -6,7 +6,7 @@ Pydantic models for structured LLM outputs.
 """
 
 import operator
-from typing import Annotated, TypedDict, List
+from typing import Annotated, TypedDict, List, Literal
 from pydantic import BaseModel, Field
 
 
@@ -33,10 +33,25 @@ class AgentState(TypedDict):
     critique: str
     report: str
     re_search_required: bool
+    verified_facts: List[dict]
+    iteration_count: int  # Loop-safety counter for fact-checker re-search cycles
     active_node: str
 
 
 # ── Pydantic Models for Structured Output ────────────────────────────────────
+
+class VerifiedFact(BaseModel):
+    claim: str
+    source_url: str
+    source_excerpt: str
+    support_level: Literal["SUPPORTED", "PARTIALLY_SUPPORTED", "NOT_SUPPORTED", "UNCERTAIN"]
+    confidence: float
+
+class VerifiedFactBatch(BaseModel):
+    """Batch of verified facts — returned by a single LLM call."""
+    results: List[VerifiedFact] = Field(
+        description="List of verified facts with support levels and confidence scores."
+    )
 
 class ResearchPlan(BaseModel):
     """Output schema for the Librarian node."""
