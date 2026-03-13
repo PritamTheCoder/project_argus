@@ -1,5 +1,6 @@
 langgraph 
 langchain-openai
+langchain-groq
 ddgs
 crawl4ai
 pydantic>=2.0.0
@@ -9,3 +10,5 @@ langgraph-checkpoint-sqlite
 sqlite-vec
 sentence-transformers
 openai
+PyMuPDF
+aiohttp
