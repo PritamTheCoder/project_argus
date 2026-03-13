@@ -10,6 +10,8 @@ and returns clean Markdown. Zero dependency on LLMs.
 import asyncio
 import logging
 import warnings
+import aiohttp
+import fitz  # PyMuPDF
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
 from src.config import SCRAPE_TIMEOUT
 from src.utils.cache import get_cached_markdown, set_cached_markdown, init_db
@@ -93,6 +95,64 @@ def _filter_long_content(content: str, query: str, max_length: int = 50000, intr
     logger.info(f"    [!] Pre-filter complete. Final size: {len(final_output)} chars.")
     return final_output
 
+async def _download_and_parse_pdf_in_memory(url: str, session: aiohttp.ClientSession) -> dict:
+    """
+    Downloads a PDF directly into memory (no lingering disk files)
+    and extracts all text using PyMuPDF (fitz).
+    """
+    try:
+        logger.info(f"    [PDF Route] Downloading PDF into memory from {url}...")
+        async with session.get(url, timeout=SCRAPE_TIMEOUT) as response:
+            if response.status != 200:
+                error_msg = f"Failed to download PDF, status code {response.status}"
+                logger.warning(f"[X] {error_msg}")
+                return {"url": url, "content": "", "success": False, "error": error_msg}
+            
+            # Read entire byte stream into memory
+            pdf_bytes = await response.read()
+            
+        logger.info(f"    [PDF Route] Parsing {len(pdf_bytes)} bytes of PDF in memory...")
+        # Open PDF from memory stream
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        pdf_text = []
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            text = page.get_text("text")  # basic text extraction
+            pdf_text.append(text)
+            
+        full_text = "\n\n".join(pdf_text)
+        
+        # Free memory associated with the document
+        doc.close()
+        del pdf_bytes
+        
+        if not full_text.strip():
+            error_msg = "PDF downloaded but extracted text is empty (might be scanned images)."
+            logger.warning(f"[X] {error_msg}")
+            return {"url": url, "content": "", "success": False, "error": error_msg}
+            
+        logger.info(f"[OK] Parsed PDF {url} ({len(full_text)} chars extracted)")
+        return {
+            "url": url,
+            "content": full_text.strip(),
+            "success": True,
+            "error": None,
+        }
+            
+    except asyncio.TimeoutError:
+        error_msg = f"Timeout ({SCRAPE_TIMEOUT}s) downloading PDF from {url}"
+        logger.warning(f"[X] {error_msg}")
+        return {"url": url, "content": "", "success": False, "error": error_msg}
+    except fitz.FileDataError as e:
+        error_msg = f"Corrupted or invalid PDF from {url}: {e}"
+        logger.warning(f"[X] {error_msg}")
+        return {"url": url, "content": "", "success": False, "error": error_msg}
+    except Exception as e:
+        error_msg = f"Error extracting PDF from {url}: {type(e).__name__}: {e}"
+        logger.warning(f"[X] {error_msg}")
+        return {"url": url, "content": "", "success": False, "error": error_msg}
+
 async def _scrape_single(
     crawler: AsyncWebCrawler,
     url: str,
@@ -133,6 +193,45 @@ async def _scrape_single(
 
     # 2. Scrape live if not in cache
     try:
+        # Pre-flight check via aiohttp to route PDFs and standard HTML
+        async with aiohttp.ClientSession() as session:
+            try:
+                # First try lightweight HEAD request
+                async with session.head(url, allow_redirects=True, timeout=10) as head_resp:
+                    content_type = head_resp.headers.get("Content-Type", "").lower()
+                    
+                # If HEAD fails or content-type is empty, some servers require GET
+                if not content_type or head_resp.status != 200:
+                    async with session.get(url, allow_redirects=True, timeout=10) as get_resp:
+                        content_type = get_resp.headers.get("Content-Type", "").lower()
+                        # We don't read the body yet unless we know what it is
+            except Exception as e:
+                logger.warning(f"    [!] Pre-flight check failed for {url} ({e}). Defaulting to HTML crawler.")
+                content_type = "text/html" # assume standard web page on failure
+
+        # Route 1: PDF Handling
+        if "application/pdf" in content_type or url.lower().endswith(".pdf"):
+            logger.info(f"    [!] Detected PDF artifact at {url}. Bypassing Playwright crawler.")
+            async with aiohttp.ClientSession() as session:
+                pdf_result = await _download_and_parse_pdf_in_memory(url, session)
+                
+                if pdf_result["success"] and pdf_result["content"]:
+                    content = pdf_result["content"]
+                    set_cached_markdown(url, content)
+                    
+                    if query:
+                        content = _filter_long_content(content, query)
+                        
+                    return {
+                        "url": url,
+                        "content": content.strip(),
+                        "success": True,
+                        "error": None,
+                    }
+                else:
+                    return pdf_result # error structure already built
+
+        # Route 2: Default HTML Handling via Crawl4AI
         # Let Playwright handle the timeout natively — avoids orphaned
         # Futures that asyncio.wait_for would create when it cancels
         # the coroutine while Playwright navigation is still in-flight.
