@@ -7,10 +7,10 @@ Decides if we have enough info or need to loop back.
 """
 
 import logging
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from src.schema.state import AgentState, FactCheckResult
-from src.config import CRITIC_MODEL
+from src.config import CRITIC_MODEL, CRITIC_PROVIDER
+from src.utils.llm_factory import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ def critic_node(state: AgentState) -> dict:
     if not evidence_text:
         evidence_text = "(No evidence extracted independently.)"
         
-    llm = ChatGoogleGenerativeAI(model=CRITIC_MODEL, temperature=0)
+    llm = get_llm(CRITIC_MODEL, CRITIC_PROVIDER, temperature=0)
     structured_llm = llm.with_structured_output(FactCheckResult)
     
     system_prompt = (
