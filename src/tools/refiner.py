@@ -7,8 +7,8 @@ Extracts structured facts from concatenated raw Markdown using Gemini Guided JSO
 import logging
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
-from langchain_google_genai import ChatGoogleGenerativeAI
-from src.config import REFINER_MODEL
+from src.config import REFINER_MODEL, REFINER_PROVIDER
+from src.utils.llm_factory import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -57,23 +57,12 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
                     ====================
             """
 
-    try:
-        # Context Window Meter
-        estimated_tokens = len(batched_text) // 4
-        limit = 1000000
-        percent = (estimated_tokens / limit) * 100
-        bars = int(percent / 5)
-        meter = f"[{'|'*bars}{' '*(20-bars)}] {percent:.1f}% ({estimated_tokens:,} / 1M tokens)"
-        logger.info(f"Refiner: Context Window Utilization:\n    {meter}")
-        
-        logger.info("Refiner: Passing massive batched payload to natively extract facts...")
-        
-        llm = ChatGoogleGenerativeAI(model=REFINER_MODEL, temperature=0, max_retries=2)
+    def _invoke_extraction(model: str, provider: str) -> list[dict]:
+        """Attempt fact extraction with the given model/provider."""
+        llm = get_llm(model, provider, temperature=0)
         structured_llm = llm.with_structured_output(FactExtractionResult)
-        
         result: FactExtractionResult = structured_llm.invoke(prompt)
-        
-        # Convert Pydantic to old dict format for compatibility with the rest of the application
+
         facts = []
         if result and result.facts:
             for fact in result.facts:
@@ -83,10 +72,25 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
                     "source_excerpt": fact.source_excerpt,
                     "source_id": fact.source_id,
                     "attributes": fact.attributes or {},
-                    "source_span": {"start": None, "end": None} # Legacy compatibility
+                    "source_span": {"start": None, "end": None}
                 })
-        
+        return facts
+
+    # --- Attempt primary model ---
+    try:
+        logger.info(f"Refiner: Attempting extraction with {REFINER_MODEL} via {REFINER_PROVIDER}...")
+        facts = _invoke_extraction(REFINER_MODEL, REFINER_PROVIDER)
         return {"facts": facts, "raw_jsonl": ""}
-    except Exception as e:
-        logger.error(f"Failed to extract facts natively: {e}")
-        raise e
+
+    except Exception as primary_err:
+        logger.warning(f"Refiner: Primary model failed ({primary_err}). Trying Gemini fallback...")
+
+        # --- Fallback to Gemini (1M context, handles large payloads) ---
+        try:
+            facts = _invoke_extraction("gemini-2.5-flash", "gemini")
+            logger.info(f"Refiner: Gemini fallback succeeded — extracted {len(facts)} facts.")
+            return {"facts": facts, "raw_jsonl": ""}
+        except Exception as fallback_err:
+            logger.error(f"Refiner: Gemini fallback also failed: {fallback_err}")
+            raise fallback_err
+
