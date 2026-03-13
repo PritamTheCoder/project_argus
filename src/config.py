@@ -18,9 +18,17 @@ GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 
 # ── Agent LLM Settings ──────────────────────────────────────────────────────
-LIBRARIAN_MODEL: str = os.getenv("LIBRARIAN_MODEL", "gemini-2.5-flash")
-CRITIC_MODEL: str    = os.getenv("CRITIC_MODEL", "gemini-2.5-flash")
+LIBRARIAN_MODEL: str = os.getenv("LIBRARIAN_MODEL", "llama-3.3-70b-versatile")
+LIBRARIAN_PROVIDER: str = os.getenv("LIBRARIAN_PROVIDER", "groq")
+
+CRITIC_MODEL: str    = os.getenv("CRITIC_MODEL", "llama-3.3-70b-versatile")
+CRITIC_PROVIDER: str = os.getenv("CRITIC_PROVIDER", "groq")
+
+VERIFIER_MODEL: str  = os.getenv("VERIFIER_MODEL", "gemini-2.5-flash")
+VERIFIER_PROVIDER: str = os.getenv("VERIFIER_PROVIDER", "gemini")
+
 WRITER_MODEL: str    = os.getenv("WRITER_MODEL", "gemini-2.5-flash")
+WRITER_PROVIDER: str = os.getenv("WRITER_PROVIDER", "gemini")
 
 # ── Embedding Settings ───────────────────────────────────────────────────────
 EMBEDDING_MODE: str = os.getenv("EMBEDDING_MODE", "local") # "local" or "openai"
@@ -29,9 +37,12 @@ MAX_CHUNK_TOKENS: int = int(os.getenv("MAX_CHUNK_TOKENS", "300"))
 TOP_K_CHUNKS: int = int(os.getenv("TOP_K_CHUNKS", "8"))
 
 # ── Refiner Settings ────────────────────────────────────────────────────────
+# Refiner sends entire scraped documents (~40K+ tokens). Groq free tier caps
+# at 12K TPM, so Gemini (1M context) is the correct default here.
 REFINER_MODEL: str = os.getenv("REFINER_MODEL", "gemini-2.5-flash")
+REFINER_PROVIDER: str = os.getenv("REFINER_PROVIDER", "gemini")
 REFINER_FALLBACK_MODEL: str = os.getenv("REFINER_FALLBACK_MODEL", "llama3-8b-8192")
-REFINER_PROVIDERS: list[str] = ["gemini", "groq"]
+REFINER_FALLBACK_PROVIDER: str = os.getenv("REFINER_FALLBACK_PROVIDER", "groq")
 
 # ── Search Settings ──────────────────────────────────────────────────────────
 MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "5"))
