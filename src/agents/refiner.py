@@ -9,10 +9,10 @@ Dynamically generates a schema based on the plan.
 import logging
 from typing import Dict
 from pydantic import BaseModel, Field
-from langchain_google_genai import ChatGoogleGenerativeAI
 from src.schema.state import AgentState
 from src.tools.refiner import extract_facts
-from src.config import LIBRARIAN_MODEL
+from src.config import LIBRARIAN_MODEL, LIBRARIAN_PROVIDER
+from src.utils.llm_factory import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +28,7 @@ def _generate_dynamic_schema(plan: list[str]) -> dict:
     Uses Pydantic structured output to guarantee valid formatting.
     """
     try:
-        llm = ChatGoogleGenerativeAI(model=LIBRARIAN_MODEL, temperature=0)
+        llm = get_llm(LIBRARIAN_MODEL, LIBRARIAN_PROVIDER, temperature=0)
         structured_llm = llm.with_structured_output(ExtractionSchema)
         
         system_prompt = (
