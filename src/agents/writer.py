@@ -7,11 +7,10 @@ Ensures rigorous citation.
 """
 
 import logging
-import logging
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from src.schema.state import AgentState
-from src.config import WRITER_MODEL
+from src.config import WRITER_MODEL, WRITER_PROVIDER
+from src.utils.llm_factory import get_llm
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +58,7 @@ def writer_node(state: AgentState) -> dict:
         claim = fact.get("claim", fact.get("text", ""))
         evidence_text += f"- {claim} [Source: {new_sid}]\n"
         
-    llm = ChatGoogleGenerativeAI(model=WRITER_MODEL, temperature=0.7)
+    llm = get_llm(WRITER_MODEL, WRITER_PROVIDER, temperature=0.7)
     
     system_prompt = (
         "You are a technical Ghostwriter. Write a comprehensive answer to the user's query.\n\n"
