@@ -6,10 +6,10 @@ Responsibility: Takes a high-level query and breaks it down into specific search
 """
 
 import logging
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from src.schema.state import AgentState, ResearchPlan
-from src.config import LIBRARIAN_MODEL
+from src.config import LIBRARIAN_MODEL, LIBRARIAN_PROVIDER
+from src.utils.llm_factory import get_llm
 from src.utils.retry import retry_on_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ def librarian_node(state: AgentState) -> dict:
     query = state["query"]
     
     # Initialize LLM
-    llm = ChatGoogleGenerativeAI(model=LIBRARIAN_MODEL, temperature=0)
+    llm = get_llm(LIBRARIAN_MODEL, LIBRARIAN_PROVIDER, temperature=0)
     structured_llm = llm.with_structured_output(ResearchPlan)
     
     # System prompt to guide the planning
