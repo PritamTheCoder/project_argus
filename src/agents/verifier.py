@@ -1,7 +1,22 @@
 import json
 import logging
-from langchain_google_genai import ChatGoogleGenerativeAI
-from src.schema.state import AgentState, VerifiedFact, VerifiedFactBatch
+from src.schema.state import AgentState
+from src.utils.llm_factory import get_llm
+from pydantic import BaseModel, Field
+from typing import Literal, List
+
+class LLMVerificationResult(BaseModel):
+    index: int = Field(description="The exact index matching the input fact.")
+    reasoning: str = Field(description="Briefly explain why the excerpt does or does not support the claim.")
+    support_level: Literal["SUPPORTED", "PARTIALLY_SUPPORTED", "NOT_SUPPORTED", "UNCERTAIN"] = Field(description="Level of support the excerpt provides for the claim.")
+    confidence: float = Field(description="Confidence score between 0.0 and 1.0.")
+
+class LLMBatchVerification(BaseModel):
+    """Batch of verified facts with minimal output — returned by a single LLM call."""
+    results: List[LLMVerificationResult] = Field(
+        description="List of verification results IN THE EXACT SAME ORDER as the input facts."
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +35,13 @@ def _build_batch_prompt(facts: list[dict]) -> str:
         })
 
     return (
-        "You are an expert fact verifier. You will receive a list of facts, each with a claim, source URL, and source excerpt.\n"
+        "You are an expert fact verifier. You will receive a list of facts, each with an index, claim, source URL, and source excerpt.\n"
         "For EACH fact, you must:\n"
-        "1. Copy the claim, source_url, and source_excerpt exactly as provided.\n"
-        "2. Determine the support_level: SUPPORTED, PARTIALLY_SUPPORTED, NOT_SUPPORTED, or UNCERTAIN.\n"
-        "3. Assign a confidence score (0.0 to 1.0) based on how well the excerpt supports the claim.\n\n"
-        "Return ALL results in the same order as the input.\n\n"
+        "1. Write a `reasoning` string explaining how and why the excerpt proves or disproves the claim.\n"
+        "2. Determine the `support_level`: SUPPORTED, PARTIALLY_SUPPORTED, NOT_SUPPORTED, or UNCERTAIN.\n"
+        "3. Assign a `confidence` score (0.0 to 1.0) based on how well the excerpt supports the claim.\n"
+        "4. Include the exact same `index` from the input to map the result back.\n\n"
+        "Return ALL results.\n\n"
         f"Facts to verify:\n{json.dumps(facts_json, indent=2)}"
     )
 
@@ -33,14 +49,24 @@ def _build_batch_prompt(facts: list[dict]) -> str:
 def _verify_batch(structured_llm, facts: list[dict]) -> list[dict]:
     """Verify a batch of facts with a single LLM call. Returns list of verified fact dicts."""
     prompt = _build_batch_prompt(facts)
-    result: VerifiedFactBatch = structured_llm.invoke(prompt)
+    result: LLMBatchVerification = structured_llm.invoke(prompt)
 
     verified = []
-    for i, vf in enumerate(result.results):
-        v_dict = vf.model_dump()
-        # Carry over source_id from the original fact
-        if i < len(facts):
-            v_dict["source_id"] = facts[i].get("source_id", "?")
+    
+    # Create a mapping from index to verification result
+    result_map = {res.index: res for res in result.results}
+    
+    for i, fact in enumerate(facts):
+        v_dict = fact.copy()
+        if i in result_map:
+            v_dict["reasoning"] = result_map[i].reasoning
+            v_dict["support_level"] = result_map[i].support_level
+            v_dict["confidence"] = result_map[i].confidence
+        else:
+            # Fallback if LLM missed this index
+            v_dict["reasoning"] = "LLM missed this index during batch processing."
+            v_dict["support_level"] = "UNCERTAIN"
+            v_dict["confidence"] = 0.0
         verified.append(v_dict)
 
     return verified
@@ -66,30 +92,44 @@ def verifier_node(state: AgentState) -> dict:
         logger.warning("Verifier: All facts were missing claim or excerpt.")
         return {"verified_facts": [], "active_node": "verifier"}
 
-    from src.config import CRITIC_MODEL
-    llm = ChatGoogleGenerativeAI(model=CRITIC_MODEL, temperature=0)
-    structured_llm = llm.with_structured_output(VerifiedFactBatch)
+    from src.config import VERIFIER_MODEL, VERIFIER_PROVIDER
+    
+    def _run_with_fallback(batch: list[dict], model: str, provider: str) -> list[dict]:
+        """Attempt to verify the batch using the primary model. If it fails, fallback to Gemini."""
+        try:
+            llm = get_llm(model, provider, temperature=0)
+            structured_llm = llm.with_structured_output(LLMBatchVerification)
+            return _verify_batch(structured_llm, batch)
+        except Exception as primary_err:
+            logger.warning(f"Verifier: Primary model failed ({primary_err}). Falling back to Gemini...")
+            try:
+                fallback_llm = get_llm("gemini-2.5-flash", "gemini", temperature=0)
+                fallback_structured = fallback_llm.with_structured_output(LLMBatchVerification)
+                return _verify_batch(fallback_structured, batch)
+            except Exception as fallback_err:
+                logger.error(f"Verifier: Gemini fallback failed: {fallback_err}")
+                raise fallback_err
 
     verified_facts = []
 
-    # Try full-batch first (1 API call for all facts)
+    # Try full-batch first
     try:
-        logger.info(f"Verifier: Batch-verifying {len(valid_facts)} facts in a single LLM call...")
-        verified_facts = _verify_batch(structured_llm, valid_facts)
-        logger.info(f"Verifier: Successfully verified {len(verified_facts)} facts in 1 call.")
+        logger.info(f"Verifier: Batch-verifying {len(valid_facts)} facts...")
+        verified_facts = _run_with_fallback(valid_facts, VERIFIER_MODEL, VERIFIER_PROVIDER)
+        logger.info(f"Verifier: Successfully verified {len(verified_facts)} facts in full batch.")
     except Exception as e:
-        logger.warning(f"Verifier: Full-batch call failed ({e}). Falling back to mini-batches of {MINI_BATCH_SIZE}...")
+        logger.warning(f"Verifier: Full-batch failed ({e}). Falling back to mini-batches of {MINI_BATCH_SIZE}...")
 
         # Mini-batch fallback: split into chunks of MINI_BATCH_SIZE
         verified_facts = []
         for start in range(0, len(valid_facts), MINI_BATCH_SIZE):
             batch = valid_facts[start:start + MINI_BATCH_SIZE]
             try:
-                batch_results = _verify_batch(structured_llm, batch)
+                batch_results = _run_with_fallback(batch, VERIFIER_MODEL, VERIFIER_PROVIDER)
                 verified_facts.extend(batch_results)
                 logger.info(f"Verifier: Mini-batch {start // MINI_BATCH_SIZE + 1} verified {len(batch_results)} facts.")
             except Exception as batch_err:
-                logger.error(f"Verifier: Mini-batch failed: {batch_err}")
+                logger.error(f"Verifier: Mini-batch failed completely: {batch_err}")
                 # Mark remaining facts as UNCERTAIN
                 for fact in batch:
                     fact["support_level"] = "UNCERTAIN"
