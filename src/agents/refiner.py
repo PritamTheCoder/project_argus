@@ -70,9 +70,22 @@ def refiner_node(state: AgentState) -> dict:
     schema = _generate_dynamic_schema(plan)
     logger.info(f"Refiner: Generated schema: {schema}")
     
-    # 2. Pack the context
+    # Track which source_ids have already been processed to avoid re-extracting
+    already_processed_sids = {
+        f.get("source_id") for f in state.get("verified_facts", [])
+    }
+    new_docs = [
+        doc for doc in scraped_data 
+        if doc.get("source_id") not in already_processed_sids
+    ]
+    
+    if not new_docs:
+        logger.warning("Refiner: No new documents to process.")
+        return {"structured_evidence": [], "active_node": "refiner"}
+        
+    # 2. Pack the context using only new documents
     batched_text = ""
-    for doc in scraped_data:
+    for doc in new_docs:
         text = doc.get("content", "")
         source_id = doc.get("source_id", "[?]")
         # Trim very long docs to prevent overflow if necessary, otherwise rely on 1M token limit

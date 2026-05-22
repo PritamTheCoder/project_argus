@@ -1,9 +1,10 @@
 """
-Project Argus - Graph Builder 
+Project Argus - Graph Builder
 
-Wires the five agent nodes into a cyclic LangGraph StateGraph:
-    START → librarian → scout → refiner → fact_checker →(conditional)→
-        ├→ librarian  (re-search loop)
+Wires agent nodes into a cyclic LangGraph StateGraph:
+    START → librarian → scout → refiner → verifier → fact_checker →(conditional)→
+        ├→ reflector → scout   (targeted gap-fill loop when gaps detected)
+        ├→ scout               (broad re-search loop when no specific gaps)
         └→ ghostwriter → END
 
 The conditional edge honours MAX_RESEARCH_LOOPS to prevent infinite loops.
@@ -15,45 +16,55 @@ from langgraph.graph import StateGraph, START, END
 from src.schema.state import AgentState
 from src.config import MAX_RESEARCH_LOOPS
 
-# ── Agent Node Imports ──────────────────────────────────────────────────────
+# Agent Node Imports
 from src.agents.librarian import librarian_node
 from src.agents.scout import scout_node
 from src.agents.refiner import refiner_node
 from src.agents.verifier import verifier_node
 from src.agents.critic import critic_node
+from src.agents.reflector import reflector_node
 from src.agents.writer import writer_node
 
 logger = logging.getLogger(__name__)
 
 
-# ── Conditional Routing ─────────────────────────────────────────────────────
+# Conditional Routing
 
 def route_after_critic(state: AgentState) -> str:
     """
     Decide what happens after the fact-checker:
-      • If re_search_required AND we haven't hit the loop cap → "librarian"
-      • Otherwise → "ghostwriter"
+      • gaps + specific claims detected → "reflector" (targeted sub-queries)
+      • re-search requested but no specific gaps → "scout" (broad re-search)
+      • loop cap hit or sufficient evidence → "ghostwriter"
     """
     re_search = state.get("re_search_required", False)
+    gap_detected = state.get("knowledge_gap_detected", False)
+    knowledge_gaps = state.get("knowledge_gaps", [])
     iteration = state.get("iteration_count", 0)
 
     if re_search and iteration < MAX_RESEARCH_LOOPS:
+        if gap_detected and knowledge_gaps:
+            logger.info(
+                f"Router: {len(knowledge_gaps)} specific gap(s) detected "
+                f"(iteration {iteration}/{MAX_RESEARCH_LOOPS}). "
+                "Routing to Reflector for targeted queries."
+            )
+            return "reflector"
         logger.info(
             f"Router: Re-search requested (iteration {iteration}/{MAX_RESEARCH_LOOPS}). "
-            "Looping back to Librarian."
+            "No specific gaps — looping back to Scout with critic's queries."
         )
-        return "librarian"
+        return "scout"
 
     if re_search and iteration >= MAX_RESEARCH_LOOPS:
         logger.warning(
-            f"Router: Re-search requested but loop cap ({MAX_RESEARCH_LOOPS}) reached. "
-            "Proceeding to Ghostwriter."
+            f"Router: Loop cap ({MAX_RESEARCH_LOOPS}) reached. Proceeding to Ghostwriter."
         )
 
     return "ghostwriter"
 
 
-# ── Wrapper to increment iteration_count ────────────────────────────────────
+# Wrapper to increment iteration_count
 
 def _critic_with_counter(state: AgentState) -> dict:
     """
@@ -66,7 +77,7 @@ def _critic_with_counter(state: AgentState) -> dict:
     return result
 
 
-# ── Graph Construction ──────────────────────────────────────────────────────
+# Graph Construction
 
 def build_graph(checkpointer=None):
     """
@@ -81,35 +92,40 @@ def build_graph(checkpointer=None):
     """
     builder = StateGraph(AgentState)
 
-    # ── Register Nodes ──────────────────────────────────────────────────────
+    # Register Nodes
     builder.add_node("librarian", librarian_node)
     builder.add_node("scout", scout_node)            # async — LangGraph handles it
     builder.add_node("refiner", refiner_node)
     builder.add_node("verifier", verifier_node)
     builder.add_node("fact_checker", _critic_with_counter)
+    builder.add_node("reflector", reflector_node)
     builder.add_node("ghostwriter", writer_node)
 
-    # ── Linear Edges ────────────────────────────────────────────────────────
+    # Linear Edges
     builder.add_edge(START, "librarian")
     builder.add_edge("librarian", "scout")
     builder.add_edge("scout", "refiner")
     builder.add_edge("refiner", "verifier")
     builder.add_edge("verifier", "fact_checker")
 
-    # ── Conditional Edge (the Research Loop) ────────────────────────────────
+    # Reflector feeds back into Scout with targeted queries
+    builder.add_edge("reflector", "scout")
+
+    # Conditional Edge (the Research Loop)
     builder.add_conditional_edges(
         "fact_checker",
         route_after_critic,
         {
-            "librarian": "librarian",
+            "reflector": "reflector",
+            "scout": "scout",
             "ghostwriter": "ghostwriter",
         },
     )
 
-    # ── Terminal Edge ───────────────────────────────────────────────────────
+    # Terminal Edge
     builder.add_edge("ghostwriter", END)
 
-    # ── Compile ─────────────────────────────────────────────────────────────
+    # Compile
     compile_kwargs = {}
     if checkpointer is not None:
         compile_kwargs["checkpointer"] = checkpointer

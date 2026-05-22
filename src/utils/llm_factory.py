@@ -2,7 +2,7 @@
 Project Argus - LLM Factory
 
 Provides a unified interface to instantiate LangChain chat models
-across different providers (Gemini, Groq, OpenAI).
+across different providers (Gemini, Groq, OpenAI, NVIDIA).
 
 Includes automatic fallback: if the requested provider fails or has an
 invalid API key, falls back to Gemini as the guaranteed-available provider.
@@ -49,8 +49,19 @@ def _create_llm(model_name: str, provider: str, temperature: float) -> BaseChatM
             temperature=temperature,
         )
 
+    elif provider == "nvidia":
+        from langchain_nvidia_ai_endpoints import ChatNVIDIA
+        nvidia_key = os.getenv("NVIDIA_API_KEY", "")
+        return ChatNVIDIA(
+            model=model_name,
+            api_key=nvidia_key,
+            temperature=temperature,
+            top_p=0.95,
+            max_tokens=16384,
+        )
+
     else:
-        raise ValueError(f"Unsupported LLM provider: '{provider}'. Supported: ['gemini', 'groq', 'openai']")
+        raise ValueError(f"Unsupported LLM provider: '{provider}'. Supported: ['gemini', 'groq', 'openai', 'nvidia']")
 
 
 def get_llm(
@@ -75,7 +86,7 @@ def get_llm(
     """
     provider_lower = provider.lower().strip()
 
-    # --- Key prefix validation (catches common misconfigurations) ---
+    # Key prefix validation (catches common misconfigurations)
     groq_key = os.getenv("GROQ_API_KEY", "")
     if provider_lower == "groq" and groq_key and not groq_key.startswith("gsk_"):
         logger.warning(
@@ -88,7 +99,12 @@ def get_llm(
         logger.warning(f"GROQ_API_KEY is not set. Falling back to {_FALLBACK_PROVIDER}/{_FALLBACK_MODEL}.")
         return _create_llm(_FALLBACK_MODEL, _FALLBACK_PROVIDER, temperature)
 
-    # --- Attempt primary provider ---
+    nvidia_key = os.getenv("NVIDIA_API_KEY", "")
+    if provider_lower == "nvidia" and not nvidia_key:
+        logger.warning(f"NVIDIA_API_KEY is not set. Falling back to {_FALLBACK_PROVIDER}/{_FALLBACK_MODEL}.")
+        return _create_llm(_FALLBACK_MODEL, _FALLBACK_PROVIDER, temperature)
+
+    # Attempt primary provider
     try:
         llm = _create_llm(model_name, provider_lower, temperature)
         logger.info(f"LLM Factory: Initialized {model_name} via {provider_lower}")

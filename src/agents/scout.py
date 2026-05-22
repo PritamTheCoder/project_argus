@@ -14,6 +14,7 @@ from src.tools.search import search_ddg
 from src.tools.scraper import scrape_urls
 from src.utils.embeddings import get_embeddings
 from src.utils.rerank import rerank_chunks
+from src.utils.source_scoring import evaluate_source
 from src.config import MAX_CHUNK_TOKENS, TOP_K_CHUNKS
 
 logger = logging.getLogger(__name__)
@@ -50,14 +51,28 @@ async def scout_node(state: AgentState) -> dict:
     # For robust production, we might want to parallelize this further, 
     # but let's go linear-by-query, parallel-within-query (run_scout does this) for now.
     
-    for q in queries:
-        logger.info(f"Scout: Processing query '{q}'")
+    for intent in queries:
+        if isinstance(intent, dict):
+            q = intent.get("query", str(intent))
+            mode_str = intent.get("mode", "MIXED")
+        else:
+            q = str(intent)
+            mode_str = "MIXED"
+            
+        logger.info(f"Scout: Processing query '{q}' with mode '{mode_str}'")
+        
+        try:
+            from src.tools.search import DomainPolicy
+            policy = DomainPolicy[mode_str]
+        except (KeyError, ValueError):
+            from src.tools.search import DomainPolicy
+            policy = DomainPolicy.MIXED
         
         # We need to extract the search+scrape steps from run_scout so we can intercept 
         # the URLs before scraping to apply the Global Seen-Set.
         
         # 1. Search
-        urls = await search_ddg(q)
+        urls = await search_ddg(q, policy=policy)
         if not urls:
             continue
             
@@ -89,17 +104,17 @@ async def scout_node(state: AgentState) -> dict:
                 
             content = res["content"]
             
-            # --- 1. Synthesize Coarse Document Summary ---
+            # 1. Synthesize Coarse Document Summary
             from src.utils.chunking import extract_summary, chunk_document
             summary = extract_summary(content)
             
-            # --- 2. Chunking to <= MAX_CHUNK_TOKENS (~300) ---
+            # 2. Chunking to <= MAX_CHUNK_TOKENS (~300)
             chunks = chunk_document(content)
 
             if not chunks:
                 continue
 
-            # --- 3. Embed & Store in Hierarchical Index ---
+            # 3. Embed & Store in Hierarchical Index
             if query_emb is not None:
                 try:
                     summary_emb = get_embeddings([summary])[0]
@@ -119,11 +134,11 @@ async def scout_node(state: AgentState) -> dict:
             else:
                 logger.warning("Skipping indexing due to missing query embedding.")
 
-        # --- 4. Hierarchical Retrieval (cross-document) ---
+        # 4. Hierarchical Retrieval (cross-document)
         if query_emb is not None:
             logger.info("Scout: Performing Hierarchical Retrieval...")
             # Step A: Top N Docs (Coarse)
-            top_doc_ids = kg_store.retrieve_top_docs(query_emb, k=3)
+            top_doc_ids = kg_store.retrieve_top_docs(query_emb, k=10)
             
             # Step B: Top M Chunks from those Docs (Fine)
             top_retrieved = kg_store.retrieve_top_chunks(query_emb, top_doc_ids, k=TOP_K_CHUNKS * 2) # Fetch extra for reranker
@@ -162,10 +177,15 @@ async def scout_node(state: AgentState) -> dict:
             for url, matched_chunks in source_content_map.items():
                 best_content = "\n\n".join(matched_chunks)
                 
+                # Evaluate source credibility
+                cred_info = evaluate_source(url)
+
                 source_id = f"[{next_id}]"
                 source_map[source_id] = {
                     "url": url,
-                    "snippet": best_content[:200] + "..." 
+                    "snippet": best_content[:200] + "...",
+                    "credibility_score": cred_info["score"],
+                    "source_type": cred_info["type"]
                 }
                 next_id += 1
                 
@@ -179,6 +199,11 @@ async def scout_node(state: AgentState) -> dict:
             logger.warning("Query embedding missing, skipping retrieval phase.")
             
     logger.info(f"Scout: Collected {len(all_scraped_data)} highly relevant chunk sets across queries.")
+    
+    # Audit log the source_map before propagating to the state
+    logger.info(f"Scout: Source map has {len(source_map)} entries:")
+    for sid, data in source_map.items():
+        logger.info(f"  {sid}: {data.get('url', '?')} (cred={data.get('credibility_score', '?')}, type={data.get('source_type', '?')})")
     
     return {
         "scraped_data": all_scraped_data,

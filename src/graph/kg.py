@@ -25,7 +25,9 @@ class KnowledgeGraph:
             source_url TEXT,
             source_excerpt TEXT,
             support_level TEXT,
-            confidence REAL
+            confidence REAL,
+            credibility_score REAL,
+            source_type TEXT
         )
         """)
         # Create virtual table for vector embeddings (all-MiniLM-L6-v2 is 384 dims)
@@ -76,9 +78,9 @@ class KnowledgeGraph:
         cursor = self.db.cursor()
         for fact in facts_with_embeddings:
             cursor.execute("""
-            INSERT INTO facts (claim, source_url, source_excerpt, support_level, confidence)
-            VALUES (?, ?, ?, ?, ?)
-            """, (fact["claim"], fact["source_url"], fact["source_excerpt"], fact["support_level"], fact["confidence"]))
+            INSERT INTO facts (claim, source_url, source_excerpt, support_level, confidence, credibility_score, source_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (fact["claim"], fact["source_url"], fact["source_excerpt"], fact["support_level"], fact["confidence"], fact.get("credibility_score", 0.4), fact.get("source_type", "Unverified/Web")))
             
             fact_id = cursor.lastrowid
             
@@ -100,6 +102,8 @@ class KnowledgeGraph:
                 f.source_excerpt,
                 f.support_level,
                 f.confidence,
+                f.credibility_score,
+                f.source_type,
                 DISTANCE
             FROM vec_facts v
             JOIN facts f ON f.id = v.rowid
@@ -116,7 +120,9 @@ class KnowledgeGraph:
                 "source_excerpt": row[3],
                 "support_level": row[4],
                 "confidence": row[5],
-                "distance": row[6]
+                "credibility_score": row[6],
+                "source_type": row[7],
+                "distance": row[8]
             })
         return results
 
@@ -211,5 +217,41 @@ class KnowledgeGraph:
             
         return results
 
+    def find_gaps(self, query_embedding: List[float], k: int = 20) -> List[str]:
+        """
+        Return claims near the query vector that have weak or no evidential support.
+        These represent concrete knowledge gaps the Reflector should fill.
+        """
+        cursor = self.db.cursor()
+        try:
+            cursor.execute("""
+                SELECT f.claim, f.support_level, f.confidence
+                FROM vec_facts v
+                JOIN facts f ON f.id = v.rowid
+                WHERE embedding MATCH ? AND k = ?
+                ORDER BY distance ASC
+            """, (self._serialize_f32(query_embedding), k))
+        except Exception as e:
+            logger.warning(f"find_gaps query failed: {e}")
+            return []
+
+        gaps = []
+        for row in cursor.fetchall():
+            claim, support_level, confidence = row
+            if support_level in ("NOT_SUPPORTED", "UNCERTAIN") or (confidence is not None and confidence < 0.4):
+                gaps.append(claim)
+        return gaps
+
+    def clear_scratchpad(self):
+        """Clear out temporary documents and chunks from the vector database. Keeps verified facts."""
+        cursor = self.db.cursor()
+        cursor.execute("DELETE FROM docs")
+        cursor.execute("DELETE FROM vec_docs")
+        cursor.execute("DELETE FROM chunks")
+        cursor.execute("DELETE FROM vec_chunks")
+        self.db.commit()
+        logger.info("Cleared Vector DB scratchpad (docs and chunks).")
+
 # Global singleton KG instance
 kg_store = KnowledgeGraph()
+
