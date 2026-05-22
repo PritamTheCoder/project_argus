@@ -1,2 +1,0 @@
-SOURCE FILTERING AND API FOR THE SOURCES scraping AND A PDF VIWERER/SCRAPER + other format of scraping so that it doesnt return wrong value when scraped.
-# How to access the web url for the websites that block the bots or needs navigation, should we use browser-use ? or is there another technique to do what we really need.
