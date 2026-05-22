@@ -40,6 +40,10 @@ def librarian_node(state: AgentState) -> dict:
         "Break the user's query into 3-5 highly specific, independent search queries "
         "that will cover different aspects of the topic (e.g., technical specs, "
         "market data, challenges, key players).\n\n"
+        "For each query, assign the most appropriate `mode`:\n"
+        "- `TRUSTED_ONLY`: For hard science, academic metrics, and technical specifications.\n"
+        "- `TRUSTED_FIRST`: For broad analysis, industry reports, or general overviews.\n"
+        "- `MIXED`: For market data, latest news, company announcements, or commercial pricing.\n\n"
         "Avoid generic queries. Be precise."
     )
     
@@ -52,10 +56,12 @@ def librarian_node(state: AgentState) -> dict:
     chain = prompt | structured_llm
     result: ResearchPlan = retry_on_rate_limit(chain.invoke, {"input": query})
     
-    logger.info(f"Librarian: Generated {len(result.search_queries)} queries: {result.search_queries}")
+    logger.info(f"Librarian: Generated {len(result.search_queries)} queries.")
+    
+    plan_dicts = [intent.model_dump() for intent in result.search_queries]
     
     return {
-        "plan": result.search_queries,
+        "plan": plan_dicts,
         "active_node": "librarian"
     }
 

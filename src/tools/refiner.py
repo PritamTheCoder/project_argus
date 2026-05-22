@@ -76,7 +76,7 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
                 })
         return facts
 
-    # --- Attempt primary model ---
+    # Attempt primary model
     try:
         logger.info(f"Refiner: Attempting extraction with {REFINER_MODEL} via {REFINER_PROVIDER}...")
         facts = _invoke_extraction(REFINER_MODEL, REFINER_PROVIDER)
@@ -85,7 +85,7 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
     except Exception as primary_err:
         logger.warning(f"Refiner: Primary model failed ({primary_err}). Trying Gemini fallback...")
 
-        # --- Fallback to Gemini (1M context, handles large payloads) ---
+        # Fallback to Gemini (1M context, handles large payloads)
         try:
             facts = _invoke_extraction("gemini-2.5-flash", "gemini")
             logger.info(f"Refiner: Gemini fallback succeeded — extracted {len(facts)} facts.")

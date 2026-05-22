@@ -240,7 +240,7 @@ async def _scrape_single(
         if result.success:
             content = result.markdown or ""
 
-            # --- Robustness: Retry if suspiciously small ---
+            # Robustness: Retry if suspiciously small
             if len(content) < 1000:
                 logger.info(f"[!] Scrape of {url} yielded only {len(content)} chars. Retrying with headless=False...")
                 try:

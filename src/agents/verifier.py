@@ -32,14 +32,18 @@ def _build_batch_prompt(facts: list[dict]) -> str:
             "claim": fact.get("claim", ""),
             "source_url": fact.get("source_url", ""),
             "source_excerpt": fact.get("source_excerpt", ""),
+            "source_type": fact.get("source_type", "Unknown"),
+            "credibility_score": fact.get("credibility_score", 0.5)
         })
 
     return (
-        "You are an expert fact verifier. You will receive a list of facts, each with an index, claim, source URL, and source excerpt.\n"
+        "You are an expert fact verifier. You will receive a list of facts, each with an index, claim, source URL, source excerpt, and explicitly calculated credibility scores.\n"
         "For EACH fact, you must:\n"
-        "1. Write a `reasoning` string explaining how and why the excerpt proves or disproves the claim.\n"
+        "1. Write a `reasoning` string explaining how and why the excerpt proves or disproves the claim. You MUST mention the source credibility in your reasoning.\n"
         "2. Determine the `support_level`: SUPPORTED, PARTIALLY_SUPPORTED, NOT_SUPPORTED, or UNCERTAIN.\n"
-        "3. Assign a `confidence` score (0.0 to 1.0) based on how well the excerpt supports the claim.\n"
+        "3. Assign a `confidence` score (0.0 to 1.0) based on how well the excerpt supports the claim AND the `credibility_score` of the source.\n"
+        "   - CRITICAL: If a claim comes from an 'Unverified/Web' source (credibility < 0.5), you MUST assign a severely lowered confidence, even if the text matches perfectly.\n"
+        "   - If a claim comes from 'Academic/Scientific' or 'Government' sources (credibility > 0.8), assign a higher baseline confidence.\n"
         "4. Include the exact same `index` from the input to map the result back.\n\n"
         "Return ALL results.\n\n"
         f"Facts to verify:\n{json.dumps(facts_json, indent=2)}"
@@ -79,8 +83,21 @@ def verifier_node(state: AgentState) -> dict:
     Also stores verified and supported facts into the Knowledge Graph.
     """
     structured_evidence = state.get("structured_evidence", [])
+    source_map = state.get("source_map", {})
+    
     if not structured_evidence:
-        return {"verified_facts": [], "active_node": "verifier"}
+        return {"verified_facts": [], "knowledge_gap_detected": False, "knowledge_gaps": [], "active_node": "verifier"}
+        
+    # Inject credibility scores from the source_map into the facts before verification
+    for fact in structured_evidence:
+        source_id = fact.get("source_id", "")
+        if source_id in source_map:
+            s_map = source_map[source_id]
+            fact["credibility_score"] = s_map.get("credibility_score", 0.4)
+            fact["source_type"] = s_map.get("source_type", "Unverified/Web")
+        else:
+            fact["credibility_score"] = 0.4
+            fact["source_type"] = "Unverified/Web"
 
     # Filter out facts missing required fields
     valid_facts = [
@@ -90,7 +107,7 @@ def verifier_node(state: AgentState) -> dict:
 
     if not valid_facts:
         logger.warning("Verifier: All facts were missing claim or excerpt.")
-        return {"verified_facts": [], "active_node": "verifier"}
+        return {"verified_facts": [], "knowledge_gap_detected": True, "knowledge_gaps": [], "active_node": "verifier"}
 
     from src.config import VERIFIER_MODEL, VERIFIER_PROVIDER
     
@@ -157,4 +174,21 @@ def verifier_node(state: AgentState) -> dict:
     except Exception as e:
         logger.error(f"Error embedding/storing facts into KG: {e}")
 
-    return {"verified_facts": verified_facts, "active_node": "verifier"}
+    # Extract unsupported/uncertain claims as explicit knowledge gaps
+    knowledge_gaps = [
+        f.get("claim", "")
+        for f in verified_facts
+        if f.get("support_level") in ("NOT_SUPPORTED", "UNCERTAIN") and f.get("claim")
+    ]
+
+    knowledge_gap_detected = len(knowledge_gaps) > 0
+
+    if knowledge_gap_detected:
+        logger.info(f"Verifier: {len(knowledge_gaps)} knowledge gap(s) detected.")
+
+    return {
+        "verified_facts": verified_facts,
+        "knowledge_gap_detected": knowledge_gap_detected,
+        "knowledge_gaps": knowledge_gaps,
+        "active_node": "verifier"
+    }

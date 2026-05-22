@@ -8,16 +8,17 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ── Load .env from project root ──────────────────────────────────────────────
+# Load .env from project root
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-# ── API Keys ─────────────────────────────────────────────────────────────────
+# API Keys
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
 
-# ── Agent LLM Settings ──────────────────────────────────────────────────────
+# Agent LLM Settings
 LIBRARIAN_MODEL: str = os.getenv("LIBRARIAN_MODEL", "llama-3.3-70b-versatile")
 LIBRARIAN_PROVIDER: str = os.getenv("LIBRARIAN_PROVIDER", "groq")
 
@@ -30,13 +31,13 @@ VERIFIER_PROVIDER: str = os.getenv("VERIFIER_PROVIDER", "gemini")
 WRITER_MODEL: str    = os.getenv("WRITER_MODEL", "gemini-2.5-flash")
 WRITER_PROVIDER: str = os.getenv("WRITER_PROVIDER", "gemini")
 
-# ── Embedding Settings ───────────────────────────────────────────────────────
+# Embedding Settings
 EMBEDDING_MODE: str = os.getenv("EMBEDDING_MODE", "local") # "local" or "openai"
 LOCAL_EMBEDDING_MODEL: str = os.getenv("LOCAL_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 MAX_CHUNK_TOKENS: int = int(os.getenv("MAX_CHUNK_TOKENS", "300"))
-TOP_K_CHUNKS: int = int(os.getenv("TOP_K_CHUNKS", "8"))
+TOP_K_CHUNKS: int = int(os.getenv("TOP_K_CHUNKS", "15"))
 
-# ── Refiner Settings ────────────────────────────────────────────────────────
+# Refiner Settings
 # Refiner sends entire scraped documents (~40K+ tokens). Groq free tier caps
 # at 12K TPM, so Gemini (1M context) is the correct default here.
 REFINER_MODEL: str = os.getenv("REFINER_MODEL", "gemini-2.5-flash")
@@ -44,16 +45,16 @@ REFINER_PROVIDER: str = os.getenv("REFINER_PROVIDER", "gemini")
 REFINER_FALLBACK_MODEL: str = os.getenv("REFINER_FALLBACK_MODEL", "llama3-8b-8192")
 REFINER_FALLBACK_PROVIDER: str = os.getenv("REFINER_FALLBACK_PROVIDER", "groq")
 
-# ── Search Settings ──────────────────────────────────────────────────────────
+# Search Settings
 MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "5"))
 
-# ── Scraper Settings ────────────────────────────────────────────────────────
+# Scraper Settings
 SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", "15"))
 
-# ── Graph Orchestration ─────────────────────────────────────────────────────
+# Graph Orchestration
 MAX_RESEARCH_LOOPS: int = int(os.getenv("MAX_RESEARCH_LOOPS", "2"))
 
-# ── Junk Domain Blocklist ────────────────────────────────────────────────────
+# Junk Domain Blocklist
 # These domains return low-quality, opinion-heavy, or paywalled content
 # that degrades research output.
 JUNK_DOMAINS: set[str] = {
@@ -72,7 +73,35 @@ JUNK_DOMAINS: set[str] = {
     "researchgate.net",  # often paywalled
 }
 
-# ── Data Directories ────────────────────────────────────────────────────────
+# Trusted Domain Allowlist
+# Environments with extremely high signal-to-noise ratios.
+TRUSTED_DOMAINS: set[str] = {
+    "nature.com",
+    "science.org",
+    "ieee.org",
+    "sciencedirect.com",
+    "springer.com",
+    "arxiv.org",
+    "ncbi.nlm.nih.gov",
+    "pubmed.ncbi.nlm.nih.gov",
+    "iop.org", # Institute of Physics
+    "acs.org", # American Chemical Society
+    "rsc.org", # Royal Society of Chemistry
+    "cell.com",
+    "pnas.org", 
+    "nejm.org",
+    "bmj.com",
+    "thelancet.com",
+    "tandfonline.com",
+    "sagepub.com",
+    "wiley.com",
+    "mit.edu",
+    "stanford.edu",
+    "harvard.edu",
+    # Note: .gov and .edu top-level domains will be handled via regex/endswith in the filter logic
+}
+
+# Data Directories
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_SCRAPES_DIR = DATA_DIR / "raw_scrapes"
 DB_DIR = DATA_DIR / "db"
