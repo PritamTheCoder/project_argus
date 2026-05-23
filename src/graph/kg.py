@@ -222,8 +222,8 @@ class KnowledgeGraph:
         Return claims near the query vector that have weak or no evidential support.
         These represent concrete knowledge gaps the Reflector should fill.
         """
-        cursor = self.db.cursor()
         try:
+            cursor = self.db.cursor()
             cursor.execute("""
                 SELECT f.claim, f.support_level, f.confidence
                 FROM vec_facts v
@@ -231,16 +231,16 @@ class KnowledgeGraph:
                 WHERE embedding MATCH ? AND k = ?
                 ORDER BY distance ASC
             """, (self._serialize_f32(query_embedding), k))
-        except Exception as e:
-            logger.warning(f"find_gaps query failed: {e}")
-            return []
 
-        gaps = []
-        for row in cursor.fetchall():
-            claim, support_level, confidence = row
-            if support_level in ("NOT_SUPPORTED", "UNCERTAIN") or (confidence is not None and confidence < 0.4):
-                gaps.append(claim)
-        return gaps
+            gaps = []
+            for row in cursor.fetchall():
+                claim, support_level, confidence = row
+                if support_level in ("NOT_SUPPORTED", "UNCERTAIN") or (confidence is not None and confidence < 0.4):
+                    gaps.append(claim)
+            return gaps
+        except Exception as e:
+            logger.warning(f"find_gaps() failed: {e}")
+            return []
 
     def clear_scratchpad(self):
         """Clear out temporary documents and chunks from the vector database. Keeps verified facts."""
