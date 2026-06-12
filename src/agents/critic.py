@@ -12,7 +12,6 @@ from src.schema.state import AgentState, FactCheckResult
 from src.config import CRITIC_MODEL, CRITIC_PROVIDER
 from src.utils.llm_factory import get_llm
 from src.utils.embeddings import get_embeddings
-from src.graph.kg import kg_store
 
 logger = logging.getLogger(__name__)
 
@@ -28,10 +27,12 @@ def critic_node(state: AgentState) -> dict:
         dict: Updates `critique`, `re_search_required`, `plan` (with new queries), and `active_node`.
     """
     logger.info("Critic (Reflector): Reviewing evidence and analyzing Knowledge Graph for gaps...")
-    
+
+    from src.graph.kg import kg_store
+
     query = state["query"]
     gap_detected = state.get("knowledge_gap_detected", False)
-    
+
     # 1. Fetch relevant existing facts from the KG
     kg_facts = ""
     source_stats = {}

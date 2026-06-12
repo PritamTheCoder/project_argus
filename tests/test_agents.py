@@ -1,45 +1,101 @@
 """
-Project Argus - Agent Logic Tests
+Project Argus - Agent Node Tests
 
-Unit tests for the Phase 2 agent nodes.
+Unit tests for each agent node. All external calls (LLMs, KG, search,
+scrape) are mocked — no API keys or network access required.
 """
 
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
-from src.schema.state import AgentState, ResearchPlan, FactCheckResult
+
+from src.schema.state import AgentState, ResearchPlan, SearchIntent, FactCheckResult
 from src.agents.librarian import librarian_node
 from src.agents.scout import scout_node
 from src.agents.refiner import refiner_node
 from src.agents.critic import critic_node
 from src.agents.writer import writer_node
 
-# ── Librarian Tests ──────────────────────────────────────────────────────────
 
-@patch("src.agents.librarian.ChatGoogleGenerativeAI")
-@patch("src.agents.librarian.ChatPromptTemplate")
-def test_librarian_generates_plan(mock_prompt_cls, mock_chat_cls):
-    """Librarian should return a list of queries and update active_node."""
-    # Build the chain mock manually
-    mock_prompt = MagicMock()
-    mock_prompt_cls.from_messages.return_value = mock_prompt
-    
-    mock_chain = MagicMock()
-    # prompt | structured_llm returns the chain or structured_llm depending on how it's mocked
-    # Since structured_llm is also a mock, prompt | structured_llm -> MagicMock
-    mock_prompt.__or__.return_value = mock_chain
-    
-    expected_plan = ResearchPlan(search_queries=["query 1", "query 2"])
-    mock_chain.invoke.return_value = expected_plan
-    
-    state: AgentState = {"query": "test topic", "plan": [], "scraped_data": [], "structured_evidence": [], "source_map": {}, "critique": "", "report": "", "re_search_required": False, "active_node": "", "iteration_count": 0, "verified_facts": []}
-    
-    result = librarian_node(state)
-    
+# ── Shared state builder ──────────────────────────────────────────────────────
+
+def _base_state(**overrides) -> dict:
+    base = {
+        "query": "test topic",
+        "plan": [],
+        "scraped_data": [],
+        "structured_evidence": [],
+        "source_map": {},
+        "critique": "",
+        "report": "",
+        "re_search_required": False,
+        "knowledge_gap_detected": False,
+        "knowledge_gaps": [],
+        "gap_queries": [],
+        "verified_facts": [],
+        "iteration_count": 0,
+        "active_node": "",
+    }
+    base.update(overrides)
+    return base
+
+
+# ── Librarian Tests ───────────────────────────────────────────────────────────
+
+@patch("src.agents.librarian.get_llm")
+def test_librarian_generates_plan(mock_get_llm):
+    """Librarian should decompose the query and return a list of search-intent dicts."""
+    expected_plan = ResearchPlan(search_queries=[
+        SearchIntent(query="solid state battery energy density 2026", mode="TRUSTED_ONLY"),
+        SearchIntent(query="QuantumScape QSE-5 cycle life results", mode="TRUSTED_FIRST"),
+    ])
+    # LangChain wraps MagicMock as RunnableLambda; the chain calls mock(input) → .return_value
+    mock_get_llm.return_value.with_structured_output.return_value.return_value = expected_plan
+
+    result = librarian_node(_base_state())
+
     assert "plan" in result
-    assert result["plan"] == ["query 1", "query 2"]
+    assert len(result["plan"]) == 2
+    assert result["plan"][0]["query"] == "solid state battery energy density 2026"
+    assert result["plan"][0]["mode"] == "TRUSTED_ONLY"
     assert result["active_node"] == "librarian"
 
-# ── Scout Tests ──────────────────────────────────────────────────────────────
+
+@patch("src.agents.librarian.get_llm")
+def test_librarian_injects_critique_on_iteration(mock_get_llm):
+    """On iteration > 0, the system prompt must contain the previous critique."""
+    expected_plan = ResearchPlan(search_queries=[
+        SearchIntent(query="gap-filling query for missing data", mode="MIXED"),
+    ])
+    mock_get_llm.return_value.with_structured_output.return_value.return_value = expected_plan
+
+    state = _base_state(
+        iteration_count=1,
+        critique="Missing: specific manufacturing cost data for 2025.",
+    )
+    result = librarian_node(state)
+
+    assert "plan" in result
+    assert len(result["plan"]) == 1
+    mock_get_llm.assert_called_once()
+
+
+@patch("src.agents.librarian.get_llm")
+def test_librarian_no_critique_injection_on_first_iteration(mock_get_llm):
+    """On iteration 0, critique should NOT be injected even if state has a stale value."""
+    expected_plan = ResearchPlan(search_queries=[
+        SearchIntent(query="general query", mode="MIXED"),
+    ])
+    mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = expected_plan
+
+    # iteration_count=0, critique is non-empty (shouldn't be injected)
+    state = _base_state(iteration_count=0, critique="old critique from prior run")
+    result = librarian_node(state)
+
+    assert result["active_node"] == "librarian"
+    mock_get_llm.assert_called_once()
+
+
+# ── Scout Tests ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 @patch("src.agents.scout.search_ddg", new_callable=AsyncMock)
@@ -47,136 +103,180 @@ def test_librarian_generates_plan(mock_prompt_cls, mock_chat_cls):
 @patch("src.agents.scout.get_embeddings")
 @patch("src.agents.scout.rerank_chunks")
 async def test_scout_execution(mock_rerank, mock_embeddings, mock_scrape, mock_search):
-    """Scout should iterate plan, call tool, and build source_map via hierarchical retrieval."""
-    from unittest.mock import patch as sync_patch
-    
-    # Mock scout tool output
-    mock_search.side_effect = [["http://a.com", "http://c.com"], ["http://b.com"]]
-    # Return 384-dim vectors (matching all-MiniLM-L6-v2 output)
+    """Scout should search, scrape, index, and build source_map via hierarchical retrieval."""
+    long_content = (
+        "This is a detailed paragraph about solid state batteries that exceeds fifty characters.\n\n"
+        "Another paragraph providing technical details about energy density improvements in research."
+    )
+
+    mock_search.side_effect = [["http://a.com"], ["http://b.com"]]
     mock_embeddings.return_value = [[0.1] * 384]
-    mock_rerank.side_effect = lambda q, c, top_k: c[:top_k]
-    
-    # Content must have paragraphs > 50 chars for chunking to work
-    long_content = "This is a detailed paragraph about solid state batteries that exceeds fifty characters easily.\n\nAnother paragraph providing technical details about energy density improvements in the latest research."
+    mock_rerank.side_effect = lambda q, chunks, top_k: chunks[:top_k]
     mock_scrape.side_effect = [
-        [{"url": "http://a.com", "content": long_content, "success": True}, {"url": "http://c.com", "content": long_content, "success": True}],
-        [{"url": "http://b.com", "content": long_content, "success": True}]
+        [{"url": "http://a.com", "content": long_content, "success": True}],
+        [{"url": "http://b.com", "content": long_content, "success": True}],
     ]
-    
-    # Mock the kg_store that scout imports at runtime
+
     mock_kg = MagicMock()
     mock_kg.store_document_and_chunks.return_value = 1
     mock_kg.retrieve_top_docs.return_value = [1]
     mock_kg.retrieve_top_chunks.return_value = [(1, "chunk from a.com")]
-    mock_kg.get_doc_metadata.return_value = {"url": "http://a.com", "query": "q1", "summary": "test summary"}
-    
-    state: AgentState = {
-        "query": "test",
-        "plan": ["q1", "q2"],
-        "source_map": {}
-    }
-    
-    with sync_patch("src.graph.kg.kg_store", mock_kg):
+    mock_kg.get_doc_metadata.return_value = {"url": "http://a.com", "query": "q1", "summary": "summary"}
+    mock_kg.get_all_chunks_for_docs.return_value = {1: ["chunk from a.com"]}
+
+    state = _base_state(plan=["q1", "q2"])
+
+    with patch("src.graph.kg.kg_store", mock_kg):
         result = await scout_node(state)
-    
+
     assert "scraped_data" in result
     assert len(result["scraped_data"]) > 0
     assert result["active_node"] == "scout"
-    
-    # Verify kg_store was called for indexing and retrieval
+    assert len(result["source_map"]) > 0
     assert mock_kg.store_document_and_chunks.called
     assert mock_kg.retrieve_top_docs.called
     assert mock_kg.retrieve_top_chunks.called
-    
-    # Verify source map was populated
-    source_map = result["source_map"]
-    assert len(source_map) > 0
+    assert mock_kg.get_all_chunks_for_docs.called
 
-# ── Refiner Tests ────────────────────────────────────────────────────────────
 
-@patch("src.agents.refiner.ChatGoogleGenerativeAI")
+# ── Refiner Tests ─────────────────────────────────────────────────────────────
+
 @patch("src.agents.refiner.extract_facts")
-def test_refiner_extraction(mock_extract, mock_chat_cls):
-    """Refiner should generate schema and extract facts per doc."""
-    # Mock Schema Gen LLM
-    mock_llm = MagicMock()
-    mock_chat_cls.return_value = mock_llm
-    mock_llm.invoke.return_value.content = '{"dates": "dates"}'
-    
-    # Mock Extraction Tool
+@patch("src.agents.refiner.get_llm")
+def test_refiner_extraction(mock_get_llm, mock_extract):
+    """Refiner should call extract_facts and return structured_evidence."""
+    from src.tools.refiner import ExtractedFact, FactExtractionResult
+    from src.agents.refiner import ExtractionSchema
+
+    # _generate_dynamic_schema uses get_llm → structured_llm.invoke → ExtractionSchema
+    mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+        ExtractionSchema(schema_dict={"dates": "date", "metrics": "numeric value"})
+    )
+
     mock_extract.return_value = {
-        "facts": [{"class": "dates", "text": "2026", "attributes": {}, "source_id": "[1]"}]
+        "facts": [
+            {
+                "class": "dates",
+                "claim": "Announced January 2026",
+                "source_excerpt": "announced on January 15, 2026",
+                "source_id": "[1]",
+                "source_span": {"start": None, "end": None},
+                "attributes": {},
+            }
+        ]
     }
-    
-    state: AgentState = {
-        "scraped_data": [{"content": "text", "source_id": "[1]"}],
-        "plan": ["q1"]
-    }
-    
+
+    state = _base_state(
+        scraped_data=[{"content": "some text about batteries", "source_id": "[1]"}],
+        plan=["q1"],
+        source_map={"[1]": {"url": "http://a.com"}},
+    )
+
     result = refiner_node(state)
-    
+
     assert "structured_evidence" in result
-    evidence = result["structured_evidence"]
-    assert len(evidence) == 1
-    assert evidence[0]["text"] == "2026"
+    assert len(result["structured_evidence"]) == 1
+    assert result["structured_evidence"][0]["claim"] == "Announced January 2026"
+    assert result["structured_evidence"][0]["source_url"] == "http://a.com"
     assert result["active_node"] == "refiner"
 
-# ── Critic Tests ─────────────────────────────────────────────────────────────
 
-@patch("src.agents.critic.ChatGoogleGenerativeAI")
-@patch("src.agents.critic.ChatPromptTemplate")
-def test_critic_evaluation(mock_prompt_cls, mock_chat_cls):
-    """Critic should return boolean re_search_required."""
-    # Build the chain mock manually
-    mock_prompt = MagicMock()
-    mock_prompt_cls.from_messages.return_value = mock_prompt
-    
-    mock_chain = MagicMock()
-    # prompt | structured_llm returns the chain
-    mock_prompt.__or__.return_value = mock_chain
-    
-    # Configure chain output
-    mock_chain.invoke.return_value = FactCheckResult(
-        re_search_required=True,
-        critique="Missing data."
+# ── Critic Tests ──────────────────────────────────────────────────────────────
+
+@patch("src.agents.critic.get_llm")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_evaluation_gaps_found(mock_kg, mock_embeddings, mock_get_llm):
+    """When the critic finds gaps, re_search_required should be True."""
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = []
+
+    # Chain calls mock as callable → .return_value (not .invoke.return_value)
+    mock_get_llm.return_value.with_structured_output.return_value.return_value = FactCheckResult(
+        status="gaps_found",
+        new_queries=[SearchIntent(query="follow-up query", mode="MIXED")],
+        critique="Missing manufacturing cost data.",
     )
-    
-    state: AgentState = {"query": "test", "verified_facts": []}
-    
-    result = critic_node(state)
-    
+
+    result = critic_node(_base_state())
+
     assert result["re_search_required"] is True
-    assert result["critique"] == "Missing data."
+    assert result["critique"] == "Missing manufacturing cost data."
     assert result["active_node"] == "critic"
 
-# ── Writer Tests ─────────────────────────────────────────────────────────────
 
-@patch("src.agents.writer.ChatGoogleGenerativeAI")
-@patch("src.agents.writer.ChatPromptTemplate")
-def test_writer_report_generation(mock_prompt_cls, mock_chat_cls):
-    """Writer should produce report and append references from source_map."""
-    # Build the chain mock
-    mock_prompt = MagicMock()
-    mock_prompt_cls.from_messages.return_value = mock_prompt
-    
-    mock_chain = MagicMock()
-    mock_prompt.__or__.return_value = mock_chain
-    
-    # Configure chain output (AIMessage-like object)
-    mock_response = MagicMock()
-    mock_response.content = "This is the report."
-    mock_chain.invoke.return_value = mock_response
-    
-    state: AgentState = {
-        "query": "test",
-        "verified_facts": [{"text": "fact", "source_id": "[1]", "support_level": "SUPPORTED"}],
-        "source_map": {"[1]": {"url": "http://a.com"}}
-    }
-    
+@patch("src.agents.critic.get_llm")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_evaluation_sufficient(mock_kg, mock_embeddings, mock_get_llm):
+    """When evidence is sufficient, re_search_required should be False."""
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = []
+
+    mock_get_llm.return_value.with_structured_output.return_value.return_value = FactCheckResult(
+        status="sufficient",
+        new_queries=[],
+        critique="All key questions are answered.",
+    )
+
+    result = critic_node(_base_state())
+
+    assert result["re_search_required"] is False
+    assert result["active_node"] == "critic"
+
+
+# ── Writer Tests ──────────────────────────────────────────────────────────────
+
+@patch("src.agents.writer.get_llm")
+def test_writer_report_generation(mock_get_llm):
+    """Writer should produce a report body and append a References section."""
+    # chain = prompt | llm → LangChain wraps llm as RunnableLambda
+    # chain.invoke(...) calls llm(messages) → llm.return_value; then .content is read
+    mock_get_llm.return_value.return_value.content = "This is the synthesized report body."
+
+    state = _base_state(
+        query="What is the state of solid-state batteries?",
+        verified_facts=[{
+            "claim": "QuantumScape achieved 500 Wh/kg",
+            "source_id": "[1]",
+            "source_url": "http://a.com",
+            "support_level": "SUPPORTED",
+            "credibility_score": 0.9,
+            "source_type": "Academic/Scientific",
+        }],
+        source_map={"[1]": {"url": "http://a.com", "credibility_score": 0.9, "source_type": "Academic/Scientific"}},
+        critique="",
+    )
+
     result = writer_node(state)
-    
+
     report = result["report"]
-    assert "This is the report." in report
+    assert "This is the synthesized report body." in report
     assert "References" in report
-    assert "http://a.com" in report # Check citation appending
+    assert "http://a.com" in report
+    assert result["active_node"] == "writer"
+
+
+@patch("src.agents.writer.get_llm")
+def test_writer_filters_unsupported_facts(mock_get_llm):
+    """Writer should exclude NOT_SUPPORTED facts from the evidence block."""
+    mock_get_llm.return_value.return_value.content = "Report with only supported facts."
+
+    state = _base_state(
+        query="test",
+        verified_facts=[
+            {"claim": "Good fact", "source_id": "[1]", "source_url": "http://a.com",
+             "support_level": "SUPPORTED", "credibility_score": 0.8, "source_type": "Academic/Scientific"},
+            {"claim": "Bad fact", "source_id": "[2]", "source_url": "http://b.com",
+             "support_level": "NOT_SUPPORTED", "credibility_score": 0.3, "source_type": "Unverified/Web"},
+        ],
+        source_map={
+            "[1]": {"url": "http://a.com", "credibility_score": 0.8, "source_type": "Academic/Scientific"},
+        },
+    )
+
+    result = writer_node(state)
+
+    # NOT_SUPPORTED fact should not appear in report
+    assert "Bad fact" not in result["report"]
     assert result["active_node"] == "writer"
