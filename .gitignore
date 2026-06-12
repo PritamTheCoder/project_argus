@@ -20,3 +20,5 @@ src/ui/
 knowledge_graph.db
 embedding_cache_local.json
 upd.md
+
+eval/*

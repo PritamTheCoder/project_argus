@@ -28,11 +28,17 @@ class KnowledgeGraph:
             confidence REAL,
             credibility_score REAL,
             source_type TEXT,
-            session_id TEXT
+            session_id TEXT,
+            support_quote TEXT,
+            corroboration_count INTEGER,
+            as_of_date TEXT
         )
         """)
-        # Migrate older DBs that pre-date the session_id column.
+        # Migrate older DBs that pre-date newer columns (idempotent).
         self._ensure_column("facts", "session_id", "TEXT")
+        self._ensure_column("facts", "support_quote", "TEXT")
+        self._ensure_column("facts", "corroboration_count", "INTEGER")
+        self._ensure_column("facts", "as_of_date", "TEXT")
         # Index to keep per-session retrieval fast as the fact store grows.
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_facts_session ON facts(session_id)")
         # Create virtual table for vector embeddings (all-MiniLM-L6-v2 is 384 dims)
@@ -93,9 +99,9 @@ class KnowledgeGraph:
         cursor = self.db.cursor()
         for fact in facts_with_embeddings:
             cursor.execute("""
-            INSERT INTO facts (claim, source_url, source_excerpt, support_level, confidence, credibility_score, source_type, session_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (fact["claim"], fact["source_url"], fact["source_excerpt"], fact["support_level"], fact["confidence"], fact.get("credibility_score", 0.4), fact.get("source_type", "Unverified/Web"), session_id or fact.get("session_id", "")))
+            INSERT INTO facts (claim, source_url, source_excerpt, support_level, confidence, credibility_score, source_type, session_id, support_quote, corroboration_count, as_of_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (fact["claim"], fact["source_url"], fact["source_excerpt"], fact["support_level"], fact["confidence"], fact.get("credibility_score", 0.4), fact.get("source_type", "Unverified/Web"), session_id or fact.get("session_id", ""), fact.get("support_quote", ""), fact.get("corroboration_count"), fact.get("as_of_date", "")))
 
             fact_id = cursor.lastrowid
 

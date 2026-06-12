@@ -8,6 +8,15 @@ from typing import Literal, List
 class LLMVerificationResult(BaseModel):
     index: int = Field(description="The exact index matching the input fact.")
     reasoning: str = Field(description="Briefly explain why the excerpt does or does not support the claim.")
+    support_quote: str = Field(
+        default="",
+        description=(
+            "The EXACT verbatim sentence/phrase copied character-for-character from the "
+            "source excerpt that directly supports the claim. Copy it literally — do not "
+            "paraphrase, summarize, or fix typos. If no span of the excerpt supports the "
+            "claim, leave this empty and set support_level to NOT_SUPPORTED."
+        ),
+    )
     support_level: Literal["SUPPORTED", "PARTIALLY_SUPPORTED", "NOT_SUPPORTED", "UNCERTAIN"] = Field(description="Level of support the excerpt provides for the claim.")
     confidence: float = Field(description="Confidence score between 0.0 and 1.0.")
 
@@ -86,11 +95,12 @@ def _build_batch_prompt(facts: list[dict]) -> str:
         "You are an expert fact verifier. You will receive a list of facts, each with an index, claim, source URL, source excerpt, and explicitly calculated credibility scores.\n"
         "For EACH fact, you must:\n"
         "1. Write a `reasoning` string explaining how and why the excerpt proves or disproves the claim. You MUST mention the source credibility in your reasoning.\n"
-        "2. Determine the `support_level`: SUPPORTED, PARTIALLY_SUPPORTED, NOT_SUPPORTED, or UNCERTAIN.\n"
-        "3. Assign a `confidence` score (0.0 to 1.0) based on how well the excerpt supports the claim AND the `credibility_score` of the source.\n"
+        "2. Extract a `support_quote`: the EXACT verbatim span copied character-for-character from the `source_excerpt` that supports the claim. Do NOT paraphrase. If the excerpt contains no span that directly supports the claim, leave `support_quote` empty.\n"
+        "3. Determine the `support_level`: SUPPORTED, PARTIALLY_SUPPORTED, NOT_SUPPORTED, or UNCERTAIN. If you could not find a verbatim `support_quote`, you MUST NOT mark it SUPPORTED.\n"
+        "4. Assign a `confidence` score (0.0 to 1.0) based on how well the excerpt supports the claim AND the `credibility_score` of the source.\n"
         "   - CRITICAL: If a claim comes from an 'Unverified/Web' source (credibility < 0.5), you MUST assign a severely lowered confidence, even if the text matches perfectly.\n"
         "   - If a claim comes from 'Academic/Scientific' or 'Government' sources (credibility > 0.8), assign a higher baseline confidence.\n"
-        "4. Include the exact same `index` from the input to map the result back.\n\n"
+        "5. Include the exact same `index` from the input to map the result back.\n\n"
         "Return ALL results.\n\n"
         f"Facts to verify:\n{json.dumps(facts_json, indent=2)}"
     )
@@ -110,11 +120,13 @@ def _verify_batch(structured_llm, facts: list[dict]) -> list[dict]:
         v_dict = fact.copy()
         if i in result_map:
             v_dict["reasoning"] = result_map[i].reasoning
+            v_dict["support_quote"] = result_map[i].support_quote
             v_dict["support_level"] = result_map[i].support_level
             v_dict["confidence"] = result_map[i].confidence
         else:
             # Fallback if LLM missed this index
             v_dict["reasoning"] = "LLM missed this index during batch processing."
+            v_dict["support_quote"] = ""
             v_dict["support_level"] = "UNCERTAIN"
             v_dict["confidence"] = 0.0
         verified.append(v_dict)
@@ -197,14 +209,22 @@ def verifier_node(state: AgentState) -> dict:
 
     logger.info(f"Verified {len(verified_facts)} facts total.")
 
+    # Chain-of-Verification grounding: drop any "supported" fact whose verbatim
+    # quote is not actually present in the source excerpt.
+    from src.utils.grounding import apply_quote_grounding, annotate_corroboration
+    apply_quote_grounding(verified_facts)
+    dropped = sum(1 for f in verified_facts if f.get("grounding_failed"))
+    if dropped:
+        logger.info(f"Verifier: Dropped {dropped} fact(s) lacking a grounded verbatim quote.")
+
     # Store SUPPORTED/PARTIALLY_SUPPORTED facts into the Knowledge Graph,
     # scoped to this run so downstream gap analysis stays uncontaminated.
     session_id = state.get("session_id", "")
+    supported_facts = [
+        f for f in verified_facts
+        if f.get("support_level") in ("SUPPORTED", "PARTIALLY_SUPPORTED")
+    ]
     try:
-        supported_facts = [
-            f for f in verified_facts
-            if f.get("support_level") in ("SUPPORTED", "PARTIALLY_SUPPORTED")
-        ]
         if supported_facts:
             from src.utils.embeddings import get_embeddings
             from src.graph.kg import kg_store
@@ -214,9 +234,18 @@ def verifier_node(state: AgentState) -> dict:
             for i, fp in enumerate(supported_facts):
                 fp["embedding"] = embeddings[i]
 
+            # Cross-source corroboration: flag single-source claims and cap their
+            # confidence so the Writer hedges them rather than asserting them.
+            annotate_corroboration(supported_facts)
+            singles = sum(1 for f in supported_facts if f.get("single_source_warning"))
+            logger.info(
+                f"Verifier: {len(supported_facts) - singles}/{len(supported_facts)} supported "
+                f"claims corroborated by >=2 sources ({singles} single-source)."
+            )
+
             kg_store.store_facts(supported_facts, session_id=session_id)
     except Exception as e:
-        logger.error(f"Error embedding/storing facts into KG: {e}")
+        logger.error(f"Error embedding/corroborating/storing facts into KG: {e}")
 
     # Extract unsupported/uncertain claims as explicit knowledge gaps
     knowledge_gaps = [

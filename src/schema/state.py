@@ -46,6 +46,9 @@ class AgentState(TypedDict):
     knowledge_gaps: List[str]
     gap_queries: List[dict]
     verified_facts: Annotated[List[dict], operator.add]
+    consensus_findings: List[dict]   # Cross-source agreements (from Consensus node)
+    contradictions: List[dict]       # Cross-source conflicts (from Consensus node)
+    quality_score: dict              # Per-run quality metrics (from Consensus node)
     iteration_count: int  # Loop-safety counter for fact-checker re-search cycles
     active_node: str
 

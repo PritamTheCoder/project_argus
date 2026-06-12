@@ -17,6 +17,14 @@ class ExtractedFact(BaseModel):
     claim: str = Field(description="A clear, standalone factual claim extracted from the document.")
     source_excerpt: str = Field(description="The exact text quote from the document that explicitly supports the claim.")
     source_id: str = Field(description="The source_id of the document where this fact was found. MUST exactly match the source_id in the <document source_id=\"...\"> tag.")
+    as_of_date: str = Field(
+        default="",
+        description=(
+            "The date this fact pertains to or was published, if explicitly stated in the "
+            "source (ISO 'YYYY-MM-DD' or just a year like '2024'). Empty string if no date is stated. "
+            "Do NOT guess or infer a date that is not present in the text."
+        ),
+    )
     attributes: Dict[str, Any] = Field(description="Additional attributes summarizing the fact based on the schema.", default_factory=dict)
 
 class FactExtractionResult(BaseModel):
@@ -48,8 +56,9 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
                     1. Provide a clear, standalone factual `claim` based on the document.
                     2. Provide the `source_excerpt` containing the exact text quote that supports the claim.
                     3. Provide the `extraction_class` based on the Target Schema.
-                    3. Critically: You must provide the exact `source_id` of the document where you found the fact.
-                    4. Add meaningful `attributes` to provide context.
+                    4. Critically: You must provide the exact `source_id` of the document where you found the fact.
+                    5. If the source explicitly states a date for this fact (publication date or the date it pertains to), put it in `as_of_date` (ISO format or year). Never invent a date.
+                    6. Add meaningful `attributes` to provide context.
 
                     Documents to Analyze:
                     ====================
@@ -71,6 +80,7 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
                     "claim": fact.claim,
                     "source_excerpt": fact.source_excerpt,
                     "source_id": fact.source_id,
+                    "as_of_date": fact.as_of_date or "",
                     "attributes": fact.attributes or {},
                     "source_span": {"start": None, "end": None}
                 })

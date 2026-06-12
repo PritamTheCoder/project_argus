@@ -68,30 +68,73 @@ def test_build_batch_prompt():
 @patch("src.utils.embeddings.get_embeddings")
 @patch("src.graph.kg.kg_store")
 def test_verifier_batch_path(mock_kg, mock_embeddings, mock_get_llm):
-    """All facts should be verified in a single batched LLM call."""
+    """Two same-batch facts with grounded quotes from two sources are corroborated."""
     mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
         LLMBatchVerification(results=[
-            LLMVerificationResult(index=0, reasoning="source confirms", support_level="SUPPORTED", confidence=0.95),
-            LLMVerificationResult(index=1, reasoning="source contradicts", support_level="NOT_SUPPORTED", confidence=0.3),
+            LLMVerificationResult(
+                index=0, reasoning="source confirms",
+                support_quote="reached 400 Wh/kg in 2024 lab trials",
+                support_level="SUPPORTED", confidence=0.95,
+            ),
+            LLMVerificationResult(
+                index=1, reasoning="source confirms",
+                support_quote="reported 800 cycles at 80 percent capacity",
+                support_level="SUPPORTED", confidence=0.80,
+            ),
         ])
     )
-    mock_embeddings.return_value = [[0.1] * 384]
+    # Identical embeddings → the two claims cluster; distinct URLs → corroborated.
+    mock_embeddings.return_value = [[0.1] * 384, [0.1] * 384]
     mock_kg.store_facts = MagicMock()
 
     state = _make_state(structured_evidence=[
-        {"claim": "Claim 1", "source_excerpt": "excerpt 1", "source_url": "http://a.com", "source_id": "[1]"},
-        {"claim": "Claim 2", "source_excerpt": "excerpt 2", "source_url": "http://b.com", "source_id": "[2]"},
+        {"claim": "Reached 400 Wh/kg", "source_excerpt": "Solid-state batteries reached 400 Wh/kg in 2024 lab trials.", "source_url": "http://a.com", "source_id": "[1]"},
+        {"claim": "800 cycles", "source_excerpt": "QuantumScape reported 800 cycles at 80 percent capacity.", "source_url": "http://b.com", "source_id": "[2]"},
     ])
 
     result = verifier_node(state)
 
-    # Single LLM call for the full batch
+    # Single LLM call for the single (combined) batch.
     assert mock_get_llm.return_value.with_structured_output.return_value.invoke.call_count == 1
     assert len(result["verified_facts"]) == 2
     assert result["verified_facts"][0]["support_level"] == "SUPPORTED"
+    # Corroborated by 2 sources → confidence not capped.
     assert result["verified_facts"][0]["confidence"] == 0.95
-    assert result["verified_facts"][1]["support_level"] == "NOT_SUPPORTED"
+    assert result["verified_facts"][0]["corroboration_count"] == 2
+    assert result["verified_facts"][0]["single_source_warning"] is False
     assert result["active_node"] == "verifier"
+
+
+@patch("src.agents.verifier.get_llm")
+@patch("src.utils.embeddings.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_verifier_drops_ungrounded_supported_fact(mock_kg, mock_embeddings, mock_get_llm):
+    """A 'SUPPORTED' verdict with a quote absent from the excerpt is dropped to NOT_SUPPORTED."""
+    mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+        LLMBatchVerification(results=[
+            LLMVerificationResult(
+                index=0, reasoning="claims support but quote fabricated",
+                support_quote="achieved 900 Wh/kg world record breakthrough",
+                support_level="SUPPORTED", confidence=0.95,
+            ),
+        ])
+    )
+    mock_embeddings.return_value = []  # nothing survives as supported → no embedding needed
+    mock_kg.store_facts = MagicMock()
+
+    state = _make_state(structured_evidence=[
+        {"claim": "Reached 900 Wh/kg", "source_excerpt": "The cell reached 400 Wh/kg in lab testing.", "source_url": "http://a.com", "source_id": "[1]"},
+    ])
+
+    result = verifier_node(state)
+
+    fact = result["verified_facts"][0]
+    assert fact["support_level"] == "NOT_SUPPORTED"
+    assert fact["grounding_failed"] is True
+    # And it becomes a knowledge gap.
+    assert "Reached 900 Wh/kg" in result["knowledge_gaps"]
+    # Nothing ungrounded was stored in the KG.
+    mock_kg.store_facts.assert_not_called()
 
 
 # ── Per-Batch Model Fallback Path ────────────────────────────────────────────
@@ -102,7 +145,11 @@ def test_verifier_batch_path(mock_kg, mock_embeddings, mock_get_llm):
 def test_verifier_model_fallback_within_batch(mock_kg, mock_embeddings, mock_get_llm):
     """If the primary model fails on a batch, that batch falls back to Gemini."""
     success_result = LLMBatchVerification(results=[
-        LLMVerificationResult(index=0, reasoning="ok", support_level="SUPPORTED", confidence=0.9),
+        LLMVerificationResult(
+            index=0, reasoning="ok",
+            support_quote="reached 400 Wh/kg in lab testing",
+            support_level="SUPPORTED", confidence=0.9,
+        ),
     ])
 
     invoke_mock = mock_get_llm.return_value.with_structured_output.return_value.invoke
@@ -115,7 +162,7 @@ def test_verifier_model_fallback_within_batch(mock_kg, mock_embeddings, mock_get
     mock_kg.store_facts = MagicMock()
 
     state = _make_state(structured_evidence=[
-        {"claim": "Claim 1", "source_excerpt": "excerpt 1", "source_url": "http://a.com", "source_id": "[1]"},
+        {"claim": "Reached 400 Wh/kg", "source_excerpt": "The cell reached 400 Wh/kg in lab testing.", "source_url": "http://a.com", "source_id": "[1]"},
     ])
 
     result = verifier_node(state)
@@ -124,6 +171,8 @@ def test_verifier_model_fallback_within_batch(mock_kg, mock_embeddings, mock_get
     assert invoke_mock.call_count == 2
     assert len(result["verified_facts"]) == 1
     assert result["verified_facts"][0]["support_level"] == "SUPPORTED"
+    # Single source → confidence capped by corroboration pass.
+    assert result["verified_facts"][0]["confidence"] == 0.7
 
 
 # ── Batch Failure Isolation ──────────────────────────────────────────────────
