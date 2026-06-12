@@ -32,13 +32,15 @@ def critic_node(state: AgentState) -> dict:
 
     query = state["query"]
     gap_detected = state.get("knowledge_gap_detected", False)
+    session_id = state.get("session_id", "")
 
-    # 1. Fetch relevant existing facts from the KG
+    # 1. Fetch relevant existing facts from the KG (scoped to THIS run to avoid
+    #    cross-session contamination of the gap analysis).
     kg_facts = ""
     source_stats = {}
     try:
         query_emb = get_embeddings([query])[0]
-        retrieved_facts = kg_store.retrieve_relevant_facts(query_emb, k=20)
+        retrieved_facts = kg_store.retrieve_relevant_facts(query_emb, k=20, session_id=session_id or None)
         
         for i, fact in enumerate(retrieved_facts):
             support = fact.get("support_level", "UNCERTAIN")

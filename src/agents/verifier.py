@@ -20,7 +20,53 @@ class LLMBatchVerification(BaseModel):
 
 logger = logging.getLogger(__name__)
 
-MINI_BATCH_SIZE = 10
+# Facts are verified in source-grouped batches of this size. Verifying every
+# fact in one giant call invites "lost in the middle" degradation and uniformly
+# inflated confidence, so we batch by default rather than only on failure.
+VERIFY_BATCH_SIZE = 15
+
+
+def _group_facts_into_batches(facts: list[dict], batch_size: int = VERIFY_BATCH_SIZE) -> list[list[dict]]:
+    """
+    Partition facts into batches of at most ``batch_size``, keeping facts from
+    the same source adjacent so the model has related context together.
+
+    A single source with more facts than ``batch_size`` is split across batches.
+    Order of facts within a source is preserved.
+    """
+    if batch_size < 1:
+        batch_size = 1
+
+    # Preserve first-seen source order for deterministic, readable batches.
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for fact in facts:
+        sid = fact.get("source_id", "") or ""
+        if sid not in groups:
+            groups[sid] = []
+            order.append(sid)
+        groups[sid].append(fact)
+
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    for sid in order:
+        group = groups[sid]
+        # Oversized single source: flush current, then chunk the group.
+        if len(group) > batch_size:
+            if current:
+                batches.append(current)
+                current = []
+            for i in range(0, len(group), batch_size):
+                batches.append(group[i:i + batch_size])
+            continue
+        if len(current) + len(group) > batch_size:
+            batches.append(current)
+            current = []
+        current.extend(group)
+
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _build_batch_prompt(facts: list[dict]) -> str:
@@ -127,35 +173,33 @@ def verifier_node(state: AgentState) -> dict:
                 logger.error(f"Verifier: Gemini fallback failed: {fallback_err}")
                 raise fallback_err
 
+    # Verify in source-grouped batches. Each batch independently falls back to
+    # Gemini on model failure, and only that batch is marked UNCERTAIN if it
+    # fails outright — a single bad batch never discards the whole run.
+    batches = _group_facts_into_batches(valid_facts, VERIFY_BATCH_SIZE)
+    logger.info(
+        f"Verifier: Verifying {len(valid_facts)} facts across {len(batches)} "
+        f"source-grouped batch(es) (max {VERIFY_BATCH_SIZE}/batch)..."
+    )
+
     verified_facts = []
-
-    # Try full-batch first
-    try:
-        logger.info(f"Verifier: Batch-verifying {len(valid_facts)} facts...")
-        verified_facts = _run_with_fallback(valid_facts, VERIFIER_MODEL, VERIFIER_PROVIDER)
-        logger.info(f"Verifier: Successfully verified {len(verified_facts)} facts in full batch.")
-    except Exception as e:
-        logger.warning(f"Verifier: Full-batch failed ({e}). Falling back to mini-batches of {MINI_BATCH_SIZE}...")
-
-        # Mini-batch fallback: split into chunks of MINI_BATCH_SIZE
-        verified_facts = []
-        for start in range(0, len(valid_facts), MINI_BATCH_SIZE):
-            batch = valid_facts[start:start + MINI_BATCH_SIZE]
-            try:
-                batch_results = _run_with_fallback(batch, VERIFIER_MODEL, VERIFIER_PROVIDER)
-                verified_facts.extend(batch_results)
-                logger.info(f"Verifier: Mini-batch {start // MINI_BATCH_SIZE + 1} verified {len(batch_results)} facts.")
-            except Exception as batch_err:
-                logger.error(f"Verifier: Mini-batch failed completely: {batch_err}")
-                # Mark remaining facts as UNCERTAIN
-                for fact in batch:
-                    fact["support_level"] = "UNCERTAIN"
-                    fact["confidence"] = 0.0
-                    verified_facts.append(fact)
+    for i, batch in enumerate(batches, start=1):
+        try:
+            batch_results = _run_with_fallback(batch, VERIFIER_MODEL, VERIFIER_PROVIDER)
+            verified_facts.extend(batch_results)
+            logger.info(f"Verifier: Batch {i}/{len(batches)} verified {len(batch_results)} facts.")
+        except Exception as batch_err:
+            logger.error(f"Verifier: Batch {i}/{len(batches)} failed completely: {batch_err}")
+            for fact in batch:
+                fact["support_level"] = "UNCERTAIN"
+                fact["confidence"] = 0.0
+                verified_facts.append(fact)
 
     logger.info(f"Verified {len(verified_facts)} facts total.")
 
-    # Store SUPPORTED/PARTIALLY_SUPPORTED facts into the Knowledge Graph
+    # Store SUPPORTED/PARTIALLY_SUPPORTED facts into the Knowledge Graph,
+    # scoped to this run so downstream gap analysis stays uncontaminated.
+    session_id = state.get("session_id", "")
     try:
         supported_facts = [
             f for f in verified_facts
@@ -170,7 +214,7 @@ def verifier_node(state: AgentState) -> dict:
             for i, fp in enumerate(supported_facts):
                 fp["embedding"] = embeddings[i]
 
-            kg_store.store_facts(supported_facts)
+            kg_store.store_facts(supported_facts, session_id=session_id)
     except Exception as e:
         logger.error(f"Error embedding/storing facts into KG: {e}")
 

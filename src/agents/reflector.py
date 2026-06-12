@@ -36,13 +36,14 @@ def reflector_node(state: AgentState) -> dict:
       3. Critic's existing plan — pass-through if neither source yields gaps
     """
     query = state["query"]
+    session_id = state.get("session_id", "")
     knowledge_gaps: List[str] = state.get("knowledge_gaps", [])
 
-    # Fallback: pull directly from KG if state has no gaps yet
+    # Fallback: pull directly from KG if state has no gaps yet (scoped to this run)
     if not knowledge_gaps:
         try:
             query_emb = get_embeddings([query])[0]
-            knowledge_gaps = kg_store.find_gaps(query_emb)
+            knowledge_gaps = kg_store.find_gaps(query_emb, session_id=session_id or None)
             logger.info(f"Reflector: Retrieved {len(knowledge_gaps)} gap(s) from KG.")
         except Exception as e:
             logger.warning(f"Reflector: KG find_gaps fallback failed: {e}")

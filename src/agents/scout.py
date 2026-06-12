@@ -19,6 +19,34 @@ from src.config import MAX_CHUNK_TOKENS, TOP_K_CHUNKS
 
 logger = logging.getLogger(__name__)
 
+# When the embedding model is unavailable we cannot rank chunks, so we fall back
+# to passing raw scraped text straight to the Refiner. Cap it to avoid flooding
+# the extraction context when many documents take the degraded path at once.
+DEGRADED_MAX_CHARS = 12000
+
+
+def _align_reranked_to_docs(
+    ranked_chunks: list[str],
+    candidate_pairs: list[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """
+    Map reranked chunk strings back to their originating ``(doc_id, chunk)`` pairs.
+
+    Each candidate pair is consumed at most once, so when the same chunk text
+    appears in multiple documents it is never silently collapsed to a single
+    (arbitrary) document — each ranked occurrence resolves to a distinct source.
+    Preserves the order of ``ranked_chunks``.
+    """
+    remaining = list(candidate_pairs)
+    aligned: list[tuple[int, str]] = []
+    for rc in ranked_chunks:
+        for i, (doc_id, chunk) in enumerate(remaining):
+            if chunk == rc:
+                aligned.append((doc_id, chunk))
+                remaining.pop(i)
+                break
+    return aligned
+
 
 async def scout_node(state: AgentState) -> dict:
     """
@@ -45,8 +73,27 @@ async def scout_node(state: AgentState) -> dict:
         if k.startswith("[") and k.endswith("]") and k.strip("[]").isdigit()
     ]
     next_id = max(current_ids) + 1 if current_ids else 1
-    
-    # Execute searches concurrently for speed, but sequentially per query to avoid 
+
+    def _register_source(url: str, content: str, query: str) -> None:
+        """Add a single source to the source_map + scraped_data payload."""
+        nonlocal next_id
+        cred_info = evaluate_source(url)
+        source_id = f"[{next_id}]"
+        source_map[source_id] = {
+            "url": url,
+            "snippet": (content[:200] + "...") if content else "",
+            "credibility_score": cred_info["score"],
+            "source_type": cred_info["type"],
+        }
+        all_scraped_data.append({
+            "source_id": source_id,
+            "url": url,
+            "content": content,
+            "query": query,
+        })
+        next_id += 1
+
+    # Execute searches concurrently for speed, but sequentially per query to avoid
     # hitting rate limits too hard or overwhelming the scraper.
     # For robust production, we might want to parallelize this further, 
     # but let's go linear-by-query, parallel-within-query (run_scout does this) for now.
@@ -139,15 +186,12 @@ async def scout_node(state: AgentState) -> dict:
             logger.info("Scout: Performing Hierarchical Retrieval...")
             # Step A: Top N Docs (Coarse)
             top_doc_ids = kg_store.retrieve_top_docs(query_emb, k=10)
-            
+
             # Step B: Top M Chunks from those Docs (Fine)
-            top_retrieved = kg_store.retrieve_top_chunks(query_emb, top_doc_ids, k=TOP_K_CHUNKS * 2) # Fetch extra for reranker
-            
+            top_retrieved = kg_store.retrieve_top_chunks(query_emb, top_doc_ids, k=TOP_K_CHUNKS * 2)  # Fetch extra for reranker
+
             top_stage2_chunks = [chunk for doc_id, chunk in top_retrieved]
-            chunk_to_doc_map = {}
-            for doc_id, chunk in top_retrieved:
-                chunk_to_doc_map.setdefault(chunk, doc_id)
-            
+
             # Step C: Cross Encoder Reranking
             best_chunks = top_stage2_chunks[:TOP_K_CHUNKS]
             try:
@@ -156,14 +200,16 @@ async def scout_node(state: AgentState) -> dict:
                     best_chunks = top_stage3
             except Exception as e:
                 logger.error(f"Reranking failed: {e}")
-            
-            # Parent Document Retrieval
-            # Identify which documents contained the best chunks
-            best_doc_ids = list({chunk_to_doc_map[chunk] for chunk in best_chunks if chunk in chunk_to_doc_map})
-            
+
+            # Parent Document Retrieval — map ranked chunks back to their exact
+            # source docs (consuming each occurrence so duplicate chunk text across
+            # documents is never misattributed to a single arbitrary source).
+            best_pairs = _align_reranked_to_docs(best_chunks, top_retrieved)
+            best_doc_ids = list({doc_id for doc_id, _ in best_pairs})
+
             # Retrieve the full text (all chunks) for these highly relevant documents
             doc_all_chunks = kg_store.get_all_chunks_for_docs(best_doc_ids)
-            
+
             # Compile full document arrays back to their source URLs
             source_content_map = {}
             for doc_id in best_doc_ids:
@@ -171,35 +217,28 @@ async def scout_node(state: AgentState) -> dict:
                 url = meta.get("url", "unknown")
                 if url not in source_content_map:
                     source_content_map[url] = []
-                
+
                 # Expand the extraction context to the entire document
                 source_content_map[url].extend(doc_all_chunks.get(doc_id, []))
 
             # Build Source Map and Scraped Data Payload
             for url, matched_chunks in source_content_map.items():
                 best_content = "\n\n".join(matched_chunks)
-                
-                # Evaluate source credibility
-                cred_info = evaluate_source(url)
-
-                source_id = f"[{next_id}]"
-                source_map[source_id] = {
-                    "url": url,
-                    "snippet": best_content[:200] + "...",
-                    "credibility_score": cred_info["score"],
-                    "source_type": cred_info["type"]
-                }
-                next_id += 1
-                
-                all_scraped_data.append({
-                    "source_id": source_id,
-                    "url": url,
-                    "content": best_content,
-                    "query": q
-                })
+                _register_source(url, best_content, q)
         else:
-            logger.warning("Query embedding missing, skipping retrieval phase.")
-            
+            # Graceful degradation: embeddings are unavailable so we cannot rank
+            # or index. Rather than dropping every scraped page for this query,
+            # pass the (already pre-filtered) raw content straight to the Refiner.
+            logger.warning(
+                "Scout: Query embedding unavailable — degrading to raw-content "
+                "extraction for this query (no ranking/indexing)."
+            )
+            for res in results:
+                if not res.get("success") or not res.get("content"):
+                    continue
+                content = res["content"][:DEGRADED_MAX_CHARS]
+                _register_source(res["url"], content, q)
+
     logger.info(f"Scout: Collected {len(all_scraped_data)} highly relevant chunk sets across queries.")
     
     # Audit log the source_map before propagating to the state

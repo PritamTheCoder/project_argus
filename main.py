@@ -49,6 +49,7 @@ async def run_demo(query: str):
 
         # ── 3. Prepare initial state ────────────────────────────────────────────
         initial_state = {
+            "session_id": thread_id,
             "query": query,
             "plan": [],
             "scraped_data": [],

@@ -41,3 +41,63 @@ def test_kg_store_and_retrieve():
         os.rmdir(tmp_dir)
     except PermissionError:
         pass
+
+
+def _make_fact(claim, support="SUPPORTED", confidence=0.9):
+    return {
+        "claim": claim,
+        "source_url": "http://test.com",
+        "source_excerpt": "excerpt",
+        "support_level": support,
+        "confidence": confidence,
+        "embedding": [0.1] * 384,
+    }
+
+
+def test_kg_session_scoping():
+    """Scoped retrieval returns only the requested session; global retrieval sees all."""
+    tmp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(tmp_dir, "test_kg_session.db")
+    kg = KnowledgeGraph(db_path)
+
+    kg.store_facts([_make_fact("Fact A")], session_id="sessA")
+    kg.store_facts([_make_fact("Fact B")], session_id="sessB")
+
+    emb = [0.1] * 384
+    scoped = kg.retrieve_relevant_facts(emb, k=10, session_id="sessA")
+    assert {r["claim"] for r in scoped} == {"Fact A"}
+
+    full = kg.retrieve_relevant_facts(emb, k=10)
+    assert {r["claim"] for r in full} == {"Fact A", "Fact B"}
+
+    kg.db.close()
+    del kg
+    gc.collect()
+    try:
+        os.remove(db_path)
+        os.rmdir(tmp_dir)
+    except PermissionError:
+        pass
+
+
+def test_kg_find_gaps_session_scoping():
+    """find_gaps only surfaces weakly-supported claims from the requested session."""
+    tmp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(tmp_dir, "test_kg_gaps.db")
+    kg = KnowledgeGraph(db_path)
+
+    kg.store_facts([_make_fact("Gap A", support="NOT_SUPPORTED", confidence=0.2)], session_id="sessA")
+    kg.store_facts([_make_fact("Gap B", support="NOT_SUPPORTED", confidence=0.2)], session_id="sessB")
+
+    emb = [0.1] * 384
+    gaps_a = kg.find_gaps(emb, session_id="sessA")
+    assert gaps_a == ["Gap A"]
+
+    kg.db.close()
+    del kg
+    gc.collect()
+    try:
+        os.remove(db_path)
+        os.rmdir(tmp_dir)
+    except PermissionError:
+        pass
