@@ -163,7 +163,7 @@ class TestRunScout:
 # ── Refiner Tests (LangExtract) ─────────────────────────────────────────────
 
 
-from src.tools.refiner import extract_facts
+from src.tools.refiner import extract_facts, ExtractedFact, FactExtractionResult
 from unittest.mock import patch, MagicMock
 
 
@@ -175,112 +175,91 @@ _REFINER_SAMPLE = (
     "electrolyte with a solid material."
 )
 
-# Helper to build a mock structured LLM response
-def _build_mock_extraction_result():
-    """Returns a mock FactExtractionResult-like object for mocking."""
-    mock_result = MagicMock()
-    mock_result.facts = [
-        MagicMock(
-            **{
-                "model_dump.return_value": {
-                    "class": "metrics",
-                    "claim": "500 Wh/kg",
-                    "source_excerpt": "achieved an energy density of 500 Wh/kg",
-                    "source_span": {"start": 80, "end": 89},
-                    "attributes": {"unit": "Wh/kg", "value": "500"},
-                    "source_id": "[1]"
-                }
-            }
+
+def _build_mock_extraction_result() -> FactExtractionResult:
+    """Returns a real FactExtractionResult for use as a mock LLM response."""
+    return FactExtractionResult(facts=[
+        ExtractedFact(
+            extraction_class="metrics",
+            claim="500 Wh/kg energy density",
+            source_excerpt="achieved an energy density of 500 Wh/kg",
+            source_id="[1]",
+            attributes={"unit": "Wh/kg", "value": "500"},
         )
-    ]
-    mock_result.model_dump.return_value = {
-        "facts": [f.model_dump() for f in mock_result.facts]
-    }
-    return mock_result
+    ])
 
 
 class TestExtractFacts:
-    """Tests for the LangExtract refiner tool."""
+    """Tests for the refiner tool."""
 
     def test_import_works(self):
         """The refiner module should import without errors."""
         assert callable(extract_facts)
 
-    @patch("src.tools.refiner.ChatGoogleGenerativeAI")
-    def test_extract_returns_facts_key(self, mock_chat_cls):
+    @patch("src.tools.refiner.get_llm")
+    def test_extract_returns_facts_key(self, mock_get_llm):
         """extract_facts should return a dict with a 'facts' list."""
-        mock_llm = MagicMock()
-        mock_chat_cls.return_value = mock_llm
-        mock_llm.with_structured_output.return_value.invoke.return_value = _build_mock_extraction_result()
-        
-        schema = {"metrics": "numeric value"}
-        result = extract_facts(_REFINER_SAMPLE, schema)
+        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+            _build_mock_extraction_result()
+        )
+        result = extract_facts(_REFINER_SAMPLE, {"metrics": "numeric value"})
 
         assert isinstance(result, dict)
         assert "facts" in result
         assert isinstance(result["facts"], list)
 
-    @patch("src.tools.refiner.ChatGoogleGenerativeAI")
-    def test_fact_structure(self, mock_chat_cls):
-        """Each fact should have class, text, source_span, and attributes."""
-        mock_llm = MagicMock()
-        mock_chat_cls.return_value = mock_llm
-        mock_llm.with_structured_output.return_value.invoke.return_value = _build_mock_extraction_result()
-        
-        schema = {"metrics": "numeric value", "dates": "date"}
-        result = extract_facts(_REFINER_SAMPLE, schema)
+    @patch("src.tools.refiner.get_llm")
+    def test_fact_structure(self, mock_get_llm):
+        """Each fact should have class, claim, source_excerpt, source_span, and attributes."""
+        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+            _build_mock_extraction_result()
+        )
+        result = extract_facts(_REFINER_SAMPLE, {"metrics": "numeric value"})
 
+        assert len(result["facts"]) > 0
         for fact in result["facts"]:
-            assert "class" in fact, "Missing 'class' key"
-            assert "claim" in fact, "Missing 'claim' key"
-            assert "source_excerpt" in fact, "Missing 'source_excerpt' key"
-            assert "source_span" in fact, "Missing 'source_span' key"
+            assert "class" in fact
+            assert "claim" in fact
+            assert "source_excerpt" in fact
+            assert "source_span" in fact
             assert "start" in fact["source_span"]
             assert "end" in fact["source_span"]
-            assert "attributes" in fact, "Missing 'attributes' key"
+            assert "attributes" in fact
 
-    @patch("src.tools.refiner.ChatGoogleGenerativeAI")
-    def test_source_span_points_to_text(self, mock_chat_cls):
-        """source_span should reference real positions in the input text."""
-        mock_llm = MagicMock()
-        mock_chat_cls.return_value = mock_llm
-        mock_llm.with_structured_output.return_value.invoke.return_value = _build_mock_extraction_result()
-        
-        schema = {"metrics": "numeric value"}
-        result = extract_facts(_REFINER_SAMPLE, schema)
+    @patch("src.tools.refiner.get_llm")
+    def test_source_span_points_to_text(self, mock_get_llm):
+        """source_span indices, when not None, should be valid offsets."""
+        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+            _build_mock_extraction_result()
+        )
+        result = extract_facts(_REFINER_SAMPLE, {"metrics": "numeric value"})
 
         for fact in result["facts"]:
             start = fact["source_span"]["start"]
             end = fact["source_span"]["end"]
             if start is not None and end is not None:
-                assert start >= 0, f"Negative start index: {start}"
-                assert end >= start, f"end ({end}) < start ({start})"
+                assert start >= 0
+                assert end >= start
 
-    @patch("src.tools.refiner.ChatGoogleGenerativeAI")
-    def test_empty_text_does_not_crash(self, mock_chat_cls):
+    @patch("src.tools.refiner.get_llm")
+    def test_empty_text_does_not_crash(self, mock_get_llm):
         """Passing empty text should return a result, not raise."""
-        mock_llm = MagicMock()
-        mock_chat_cls.return_value = mock_llm
-        mock_empty = MagicMock()
-        mock_empty.facts = []
-        mock_empty.model_dump.return_value = {"facts": []}
-        mock_llm.with_structured_output.return_value.invoke.return_value = mock_empty
-        
-        schema = {"dates": "date"}
-        result = extract_facts("", schema)
+        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+            FactExtractionResult(facts=[])
+        )
+        result = extract_facts("", {"dates": "date"})
 
         assert isinstance(result, dict)
         assert "facts" in result
+        assert result["facts"] == []
 
-    @patch("src.tools.refiner.ChatGoogleGenerativeAI")
-    def test_raw_jsonl_present(self, mock_chat_cls):
-        """Result should include a raw_jsonl string for archiving."""
-        mock_llm = MagicMock()
-        mock_chat_cls.return_value = mock_llm
-        mock_llm.with_structured_output.return_value.invoke.return_value = _build_mock_extraction_result()
-        
-        schema = {"metrics": "numeric value"}
-        result = extract_facts(_REFINER_SAMPLE, schema)
+    @patch("src.tools.refiner.get_llm")
+    def test_raw_jsonl_present(self, mock_get_llm):
+        """Result should include a raw_jsonl key."""
+        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+            _build_mock_extraction_result()
+        )
+        result = extract_facts(_REFINER_SAMPLE, {"metrics": "numeric value"})
 
         assert "raw_jsonl" in result
         assert isinstance(result["raw_jsonl"], str)

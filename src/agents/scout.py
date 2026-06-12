@@ -144,7 +144,9 @@ async def scout_node(state: AgentState) -> dict:
             top_retrieved = kg_store.retrieve_top_chunks(query_emb, top_doc_ids, k=TOP_K_CHUNKS * 2) # Fetch extra for reranker
             
             top_stage2_chunks = [chunk for doc_id, chunk in top_retrieved]
-            chunk_to_doc_map = {chunk: doc_id for doc_id, chunk in top_retrieved}
+            chunk_to_doc_map = {}
+            for doc_id, chunk in top_retrieved:
+                chunk_to_doc_map.setdefault(chunk, doc_id)
             
             # Step C: Cross Encoder Reranking
             best_chunks = top_stage2_chunks[:TOP_K_CHUNKS]

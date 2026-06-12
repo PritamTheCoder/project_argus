@@ -26,14 +26,14 @@ def librarian_node(state: AgentState) -> dict:
         dict: Updates `plan` and `active_node`.
     """
     logger.info("Librarian: Analyzing query...")
-    
+
     query = state["query"]
-    
-    # Initialize LLM
+    iteration = state.get("iteration_count", 0)
+    critique = state.get("critique", "")
+
     llm = get_llm(LIBRARIAN_MODEL, LIBRARIAN_PROVIDER, temperature=0)
     structured_llm = llm.with_structured_output(ResearchPlan)
-    
-    # System prompt to guide the planning
+
     system_prompt = (
         "You are an expert technical researcher. Your goal is to plan a deep-dive "
         "investigation into the user's topic.\n\n"
@@ -46,7 +46,15 @@ def librarian_node(state: AgentState) -> dict:
         "- `MIXED`: For market data, latest news, company announcements, or commercial pricing.\n\n"
         "Avoid generic queries. Be precise."
     )
-    
+
+    if iteration > 0 and critique:
+        system_prompt += (
+            f"\n\nPREVIOUS CRITIC ASSESSMENT:\n{critique}\n\n"
+            "Generate queries that SPECIFICALLY address the identified gaps above. "
+            "Do NOT repeat queries from the previous iteration."
+        )
+        logger.info(f"Librarian: Iteration {iteration} — injecting critique for targeted gap-fill queries.")
+
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         ("human", "{input}")
