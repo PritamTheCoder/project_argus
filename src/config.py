@@ -48,6 +48,25 @@ REFINER_FALLBACK_PROVIDER: str = os.getenv("REFINER_FALLBACK_PROVIDER", "groq")
 # Search Settings
 MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "5"))
 
+# ── Phase 2: Tool layer / multi-backend search ──────────────────────────────
+# Brave Search API (optional). If unset, web_search falls back to DuckDuckGo.
+BRAVE_API_KEY: str = os.getenv("BRAVE_API_KEY", "")
+# Semantic Scholar API key (optional). Unset still works but is rate-limited.
+SEMANTIC_SCHOLAR_API_KEY: str = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+# Crossref "polite pool" contact (recommended by Crossref ToS).
+CROSSREF_MAILTO: str = os.getenv("CROSSREF_MAILTO", "research@project-argus.local")
+# Shared HTTP timeout (seconds) for tool/provider network calls.
+TOOL_HTTP_TIMEOUT: int = int(os.getenv("TOOL_HTTP_TIMEOUT", "20"))
+# Default result count for academic backends.
+ACADEMIC_MAX_RESULTS: int = int(os.getenv("ACADEMIC_MAX_RESULTS", "8"))
+
+# Acquisition agent (the tool-calling source gatherer). Must be a model that
+# supports tool/function calling.
+GATHERER_MODEL: str = os.getenv("GATHERER_MODEL", "gemini-2.5-flash")
+GATHERER_PROVIDER: str = os.getenv("GATHERER_PROVIDER", "gemini")
+# Max tool-calling rounds per sub-query before we stop (cost/loop safety).
+GATHER_MAX_STEPS: int = int(os.getenv("GATHER_MAX_STEPS", "3"))
+
 # Scraper Settings
 SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", "15"))
 

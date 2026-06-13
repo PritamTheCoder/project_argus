@@ -98,23 +98,29 @@ def test_librarian_no_critique_injection_on_first_iteration(mock_get_llm):
 # ── Scout Tests ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-@patch("src.agents.scout.search_ddg", new_callable=AsyncMock)
+@patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock)
 @patch("src.agents.scout.scrape_urls", new_callable=AsyncMock)
 @patch("src.agents.scout.get_embeddings")
 @patch("src.agents.scout.rerank_chunks")
-async def test_scout_execution(mock_rerank, mock_embeddings, mock_scrape, mock_search):
-    """Scout should search, scrape, index, and build source_map via hierarchical retrieval."""
+async def test_scout_execution(mock_rerank, mock_embeddings, mock_scrape, mock_gather):
+    """Scout should gather (web + academic), scrape web ones, index, and build source_map."""
     long_content = (
         "This is a detailed paragraph about solid state batteries that exceeds fifty characters.\n\n"
         "Another paragraph providing technical details about energy density improvements in research."
     )
 
-    mock_search.side_effect = [["http://a.com"], ["http://b.com"]]
+    # q1 → a web candidate needing scrape; q2 → an academic candidate with a prefetched abstract.
+    mock_gather.side_effect = [
+        [{"url": "http://a.com", "content": "", "needs_scrape": True, "source": "web"}],
+        [{"url": "http://b.com", "content": long_content, "needs_scrape": False,
+          "source": "semantic_scholar", "credibility_hint": 0.9,
+          "source_type_hint": "Academic/Scientific", "as_of_date": "2024"}],
+    ]
     mock_embeddings.return_value = [[0.1] * 384]
     mock_rerank.side_effect = lambda q, chunks, top_k: chunks[:top_k]
+    # Only the web candidate (q1) is scraped; q2 has no scrape targets.
     mock_scrape.side_effect = [
         [{"url": "http://a.com", "content": long_content, "success": True}],
-        [{"url": "http://b.com", "content": long_content, "success": True}],
     ]
 
     mock_kg = MagicMock()
@@ -137,6 +143,8 @@ async def test_scout_execution(mock_rerank, mock_embeddings, mock_scrape, mock_s
     assert mock_kg.retrieve_top_docs.called
     assert mock_kg.retrieve_top_chunks.called
     assert mock_kg.get_all_chunks_for_docs.called
+    # Academic candidate was used without scraping (only the web URL was scraped).
+    assert mock_scrape.call_count == 1
 
 
 # ── Refiner Tests ─────────────────────────────────────────────────────────────

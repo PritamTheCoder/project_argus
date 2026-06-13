@@ -12,3 +12,4 @@ sentence-transformers
 openai
 PyMuPDF
 aiohttp
+httpx

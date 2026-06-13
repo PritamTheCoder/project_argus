@@ -7,11 +7,9 @@ and builds the raw data payload.
 """
 
 import logging
-import numpy as np
 from src.schema.state import AgentState
-from src.tools.scout import run_scout
-from src.tools.search import search_ddg
 from src.tools.scraper import scrape_urls
+from src.agents.acquisition import gather_sources_for_query
 from src.utils.embeddings import get_embeddings
 from src.utils.rerank import rerank_chunks
 from src.utils.source_scoring import evaluate_source
@@ -74,16 +72,37 @@ async def scout_node(state: AgentState) -> dict:
     ]
     next_id = max(current_ids) + 1 if current_ids else 1
 
+    # url -> candidate metadata gathered by the acquisition agent (credibility
+    # hints from academic backends, publication dates, etc.).
+    candidate_meta: dict[str, dict] = {}
+
     def _register_source(url: str, content: str, query: str) -> None:
         """Add a single source to the source_map + scraped_data payload."""
         nonlocal next_id
-        cred_info = evaluate_source(url)
+        base = evaluate_source(url)
+        score = base["score"]
+        stype = base["type"]
+        as_of = ""
+
+        # Prefer the backend's credibility hint when it is higher than the
+        # domain heuristic (e.g. a Semantic Scholar paper at a generic .org host).
+        meta = candidate_meta.get(url)
+        if meta:
+            hint_score = meta.get("credibility_hint")
+            hint_type = meta.get("source_type_hint")
+            if hint_score is not None and hint_score > score:
+                score = hint_score
+                if hint_type:
+                    stype = hint_type
+            as_of = meta.get("as_of_date", "") or ""
+
         source_id = f"[{next_id}]"
         source_map[source_id] = {
             "url": url,
             "snippet": (content[:200] + "...") if content else "",
-            "credibility_score": cred_info["score"],
-            "source_type": cred_info["type"],
+            "credibility_score": score,
+            "source_type": stype,
+            "as_of_date": as_of,
         }
         all_scraped_data.append({
             "source_id": source_id,
@@ -93,11 +112,8 @@ async def scout_node(state: AgentState) -> dict:
         })
         next_id += 1
 
-    # Execute searches concurrently for speed, but sequentially per query to avoid
-    # hitting rate limits too hard or overwhelming the scraper.
-    # For robust production, we might want to parallelize this further, 
-    # but let's go linear-by-query, parallel-within-query (run_scout does this) for now.
-    
+    # Process each sub-query sequentially: gather sources (model picks the tools),
+    # scrape the web ones, then index + hierarchically retrieve per query.
     for intent in queries:
         if isinstance(intent, dict):
             q = intent.get("query", str(intent))
@@ -105,37 +121,40 @@ async def scout_node(state: AgentState) -> dict:
         else:
             q = str(intent)
             mode_str = "MIXED"
-            
+
         logger.info(f"Scout: Processing query '{q}' with mode '{mode_str}'")
-        
-        try:
-            from src.tools.search import DomainPolicy
-            policy = DomainPolicy[mode_str]
-        except (KeyError, ValueError):
-            from src.tools.search import DomainPolicy
-            policy = DomainPolicy.MIXED
-        
-        # We need to extract the search+scrape steps from run_scout so we can intercept 
-        # the URLs before scraping to apply the Global Seen-Set.
-        
-        # 1. Search
-        urls = await search_ddg(q, policy=policy)
-        if not urls:
-            continue
-            
-        # 2. Apply Global Seen-Set Deduplication
+
+        # 1. Gather candidate sources via model-driven tool selection (web vs.
+        #    academic vs. memory), deduped against everything already seen.
         seen_urls = {v["url"] for v in source_map.values()}
-        new_urls = [u for u in urls if u not in seen_urls]
-        
-        if not new_urls:
-            logger.info(f"Scout: All {len(urls)} URLs for query '{q}' were already seen.")
+        candidates = await gather_sources_for_query(q, mode_str, seen_urls=seen_urls)
+        if not candidates:
+            logger.info(f"Scout: No new candidate sources for query '{q}'.")
             continue
-            
-        logger.info(f"Scout: Found {len(urls)} URLs, {len(new_urls)} are new. Scraping...")
-        
-        # 3. Scrape ONLY the new URLs
-        results = await scrape_urls(new_urls, query=q)
-        
+
+        # Record candidate metadata (credibility/source hints, dates) for later.
+        for c in candidates:
+            candidate_meta[c["url"]] = c
+
+        # 2. Academic backends already supply abstracts (no scrape needed);
+        #    web candidates must be scraped for full text.
+        scrape_targets = [c["url"] for c in candidates if c.get("needs_scrape")]
+        prefetched = [c for c in candidates if not c.get("needs_scrape") and (c.get("content") or "").strip()]
+
+        logger.info(
+            f"Scout: {len(candidates)} candidate(s) for '{q}' "
+            f"({len(prefetched)} prefetched, {len(scrape_targets)} to scrape)."
+        )
+
+        scraped = await scrape_urls(scrape_targets, query=q) if scrape_targets else []
+
+        # 3. Unify prefetched abstracts and freshly scraped pages into one stream.
+        results = [
+            {"url": c["url"], "content": c["content"], "success": True}
+            for c in prefetched
+        ]
+        results.extend(scraped)
+
 
         # Get query embedding for Stage 2 & 3
         try:
