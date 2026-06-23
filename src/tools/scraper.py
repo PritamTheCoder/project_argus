@@ -1,11 +1,6 @@
 import sqlite3
 import os
-"""
-Project Argus - Crawl4AI Web Scraper
-
-Async scraper that fetches full page content, strips boilerplate,
-and returns clean Markdown. Zero dependency on LLMs.
-"""
+"""Async scraper that fetches full page content, strips boilerplate, and returns clean Markdown."""
 
 import asyncio
 import logging
@@ -37,18 +32,15 @@ def _filter_long_content(content: str, query: str, max_length: int = 50000, intr
         return content
         
     logger.info(f"    [!] Document length {len(content)} exceeds {max_length}. Applying pre-filter against query: '{query}'")
-    
-    # 1. Always keep the intro
+
     intro = content[:intro_length]
     remaining_budget = max_length - intro_length
-    
-    # 2. Extract keywords from query (ignoring common stop words roughly via length)
+
+    # Filter words >3 chars as a cheap stop-word heuristic (avoids a stop-word list).
     keywords = [w.lower() for w in re.findall(r'\b\w+\b', query) if len(w) > 3]
     if not keywords:
-        # If no good keywords, just truncate
         return intro + "\n\n... [CONTENT TRUNCATED FOR LENGTH] ..."
-        
-    # 3. Score paragraphs by keyword density
+
     rest_of_content = content[intro_length:]
     paragraphs = rest_of_content.split('\n\n')
     
@@ -64,24 +56,20 @@ def _filter_long_content(content: str, query: str, max_length: int = 50000, intr
         if keyword_count > 0:
             density = keyword_count / len(words)
             scored_paragraphs.append((density, i, p))
-            
-    # Sort by density (highest first)
+
     scored_paragraphs.sort(key=lambda x: x[0], reverse=True)
-    
-    # Pick top paragraphs that fit in the budget
+
     selected_indices = []
     current_length = 0
-    
+
     for density, original_idx, p in scored_paragraphs:
-        # +2 for newlines
-        if current_length + len(p) + 2 > remaining_budget:
-            # Look for smaller paragraphs that might still fit
+        if current_length + len(p) + 2 > remaining_budget:  # +2 for the joining newlines
             continue
-            
+
         selected_indices.append(original_idx)
         current_length += len(p) + 2
-        
-    # Sort selected indices back to original reading order for coherence
+
+    # Restore original reading order so the result stays coherent.
     selected_indices.sort()
     filtered_paragraphs = [paragraphs[i] for i in selected_indices]
             
@@ -107,23 +95,20 @@ async def _download_and_parse_pdf_in_memory(url: str, session: aiohttp.ClientSes
                 error_msg = f"Failed to download PDF, status code {response.status}"
                 logger.warning(f"[X] {error_msg}")
                 return {"url": url, "content": "", "success": False, "error": error_msg}
-            
-            # Read entire byte stream into memory
+
             pdf_bytes = await response.read()
-            
+
         logger.info(f"    [PDF Route] Parsing {len(pdf_bytes)} bytes of PDF in memory...")
-        # Open PDF from memory stream
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        
+
         pdf_text = []
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            text = page.get_text("text")  # basic text extraction
+            text = page.get_text("text")
             pdf_text.append(text)
-            
+
         full_text = "\n\n".join(pdf_text)
-        
-        # Free memory associated with the document
+
         doc.close()
         del pdf_bytes
         
@@ -175,12 +160,10 @@ async def _scrape_single(
             "error": str | None
         }
     """
-    # 1. Check persistent cache
     cached_content = get_cached_markdown(url)
     if cached_content:
         logger.info(f"[CACHE HIT] Loaded {url} from local DB ({len(cached_content)} chars)")
 
-        # apply query pre-filter to cached content for the specific query
         if query and cached_content:
             cached_content = _filter_long_content(cached_content, query)
 
@@ -191,25 +174,21 @@ async def _scrape_single(
             "error": None,
         }
 
-    # 2. Scrape live if not in cache
     try:
-        # Pre-flight check via aiohttp to route PDFs and standard HTML
+        # Pre-flight via aiohttp to route PDFs vs. HTML before invoking Playwright.
         async with aiohttp.ClientSession() as session:
             try:
-                # First try lightweight HEAD request
                 async with session.head(url, allow_redirects=True, timeout=10) as head_resp:
                     content_type = head_resp.headers.get("Content-Type", "").lower()
-                    
-                # If HEAD fails or content-type is empty, some servers require GET
+
+                # Some servers don't respond properly to HEAD; fall back to GET.
                 if not content_type or head_resp.status != 200:
                     async with session.get(url, allow_redirects=True, timeout=10) as get_resp:
                         content_type = get_resp.headers.get("Content-Type", "").lower()
-                        # We don't read the body yet unless we know what it is
             except Exception as e:
                 logger.warning(f"    [!] Pre-flight check failed for {url} ({e}). Defaulting to HTML crawler.")
-                content_type = "text/html" # assume standard web page on failure
+                content_type = "text/html"
 
-        # Route 1: PDF Handling
         if "application/pdf" in content_type or url.lower().endswith(".pdf"):
             logger.info(f"    [!] Detected PDF artifact at {url}. Bypassing Playwright crawler.")
             async with aiohttp.ClientSession() as session:
@@ -229,9 +208,8 @@ async def _scrape_single(
                         "error": None,
                     }
                 else:
-                    return pdf_result # error structure already built
+                    return pdf_result
 
-        # Route 2: Default HTML Handling via Crawl4AI
         # Let Playwright handle the timeout natively — avoids orphaned
         # Futures that asyncio.wait_for would create when it cancels
         # the coroutine while Playwright navigation is still in-flight.
@@ -240,7 +218,7 @@ async def _scrape_single(
         if result.success:
             content = result.markdown or ""
 
-            # Robustness: Retry if suspiciously small
+            # Some pages render near-empty on first load; retry headed.
             if len(content) < 1000:
                 logger.info(f"[!] Scrape of {url} yielded only {len(content)} chars. Retrying with headless=False...")
                 try:
@@ -331,9 +309,6 @@ async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
     and returns clean Markdown for each page. Failed URLs return
     structured errors instead of crashing the pipeline.
 
-    Args:
-        urls: List of URLs to scrape.
-
     Returns:
         List of result dicts, each with keys:
         - url (str): The original URL
@@ -352,14 +327,13 @@ async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
     )
 
     run_config = CrawlerRunConfig(
-        word_count_threshold=10,       # Skip pages with very little text
+        word_count_threshold=10,
         excluded_tags=["nav", "footer", "header", "aside", "script", "style"],
-        exclude_external_links=True,   # Keep output clean
+        exclude_external_links=True,
         page_timeout=SCRAPE_TIMEOUT * 1000,  # ms — Playwright-native timeout
     )
 
     async with AsyncWebCrawler(config=browser_config) as crawler:
-        # Fire all scrapes concurrently with asyncio.gather
         tasks = [
             _scrape_single(crawler, url, run_config, query)
             for url in urls

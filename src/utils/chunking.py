@@ -1,16 +1,11 @@
-"""
-Project Argus - Chunking & Summarization Utilities
-
-Extracts the chunking and summarization logic from scout.py into
-testable, reusable functions.
-"""
+"""Chunking and summarization utilities for splitting scraped documents."""
 
 import logging
 from src.config import MAX_CHUNK_TOKENS
 
 logger = logging.getLogger(__name__)
 
-# Rough token estimate: 1 word ~ 1.3 tokens
+# 1 word ~ 1.3 tokens
 DEFAULT_MAX_WORDS = int(MAX_CHUNK_TOKENS / 1.3)  # ~230 words for 300 tokens
 
 
@@ -28,16 +23,12 @@ def extract_summary(content: str, max_len: int = 400) -> str:
     """
     if not content or not content.strip():
         return ""
-    
-    # Normalize whitespace
+
     cleaned = content.replace("  ", " ").strip()
-    
-    # Split on sentence boundaries
     sentences = cleaned.split(". ")
-    
     summary = sentences[0].rstrip(".") + "." if sentences else cleaned[:200]
-    
-    # If the first "sentence" is too short (e.g., a header or URL), extend
+
+    # Extend if the first "sentence" is too short (e.g. a header or URL)
     if len(summary.split()) < 5 and len(sentences) > 1:
         summary = sentences[0] + ". " + sentences[1] + "."
     
@@ -67,15 +58,14 @@ def chunk_document(content: str, max_words: int = DEFAULT_MAX_WORDS, min_paragra
     """
     if not content or not content.strip():
         return []
-    
-    # Step 1: Try splitting on double-newline
+
     paragraphs = [p.strip() for p in content.split('\n\n') if len(p.strip()) > min_paragraph_chars]
-    
-    # Step 2: Fallback — if no paragraphs survived, try single newlines
+
+    # Fallback: no double-newline paragraphs found, try single newlines
     if not paragraphs:
         paragraphs = [p.strip() for p in content.split('\n') if len(p.strip()) > min_paragraph_chars]
-    
-    # Step 3: Last resort — treat entire content as one block
+
+    # Last resort: treat entire content as one block
     if not paragraphs and len(content.strip()) > min_paragraph_chars:
         paragraphs = [content.strip()]
     
@@ -88,23 +78,19 @@ def chunk_document(content: str, max_words: int = DEFAULT_MAX_WORDS, min_paragra
     
     for p in paragraphs:
         p_words = len(p.split())
-        
-        # If a single paragraph exceeds max_words, hard-split it
+
         if p_words > max_words:
-            # Flush any accumulated chunk first
             if current_chunk:
                 chunks.append(current_chunk.strip())
                 current_chunk = ""
                 current_words = 0
-            
-            # Hard-split the oversized paragraph
+
             words = p.split()
             for i in range(0, len(words), max_words):
                 sub_chunk = " ".join(words[i:i + max_words])
                 chunks.append(sub_chunk)
             continue
-        
-        # Normal accumulation
+
         if current_words + p_words > max_words and current_chunk:
             chunks.append(current_chunk.strip())
             current_chunk = p + " "

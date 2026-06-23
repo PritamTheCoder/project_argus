@@ -1,9 +1,4 @@
-"""
-Project Argus - Librarian Agent
-
-Role: Planner / Decomposer
-Responsibility: Takes a high-level query and breaks it down into specific search terms.
-"""
+"""Librarian agent: decomposes a high-level query into specific search terms."""
 
 import logging
 from langchain_core.prompts import ChatPromptTemplate
@@ -16,15 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 def librarian_node(state: AgentState) -> dict:
-    """
-    Decompose the user's query into a precise research plan (list of search queries).
-    
-    Args:
-        state: AgentState containing `query`.
-        
-    Returns:
-        dict: Updates `plan` and `active_node`.
-    """
+    """Decompose the user's query into a precise research plan (list of search queries)."""
     logger.info("Librarian: Analyzing query...")
 
     query = state["query"]
@@ -60,7 +47,6 @@ def librarian_node(state: AgentState) -> dict:
         ("human", "{input}")
     ])
     
-    # Execute the chain with retry logic for rate-limit errors
     chain = prompt | structured_llm
     result: ResearchPlan = retry_on_rate_limit(chain.invoke, {"input": query})
     

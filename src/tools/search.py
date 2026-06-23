@@ -1,9 +1,4 @@
-"""
-Project Argus - DuckDuckGo Search Tool
-
-Async wrapper around duckduckgo-search(ddgs) that returns clean URLs,
-filtering out known junk domains.
-"""
+"""Async wrapper around duckduckgo-search (ddgs) that returns clean URLs, filtering out known junk domains."""
 
 import logging
 from urllib.parse import urlparse
@@ -33,12 +28,10 @@ def _is_trusted_domain(url: str) -> bool:
     try:
         hostname = urlparse(url).hostname or ""
         hostname = hostname.lower().removeprefix("www.")
-        
-        # Government and universities almost always contain high-signal facts
+
         if hostname.endswith(".gov") or hostname.endswith(".edu"):
             return True
-            
-        # Specific peer-reviewed / academic sources
+
         for trusted in TRUSTED_DOMAINS:
             if hostname == trusted or hostname.endswith("." + trusted):
                 return True
@@ -53,29 +46,19 @@ async def search_ddg(
     max_results: int | None = None,
     policy: DomainPolicy = DomainPolicy.MIXED
 ) -> list[str]:
-    """
-    Search DuckDuckGo and return a list of clean URLs.
-
-    Args:
-        query: The search query string.
-        max_results: Maximum number of URLs to return (default from config).
-
-    Returns:
-        A list of URL strings, filtered to exclude junk domains.
-    """
+    """Search DuckDuckGo and return a list of clean URLs, filtered to exclude junk domains."""
     if max_results is None:
         max_results = MAX_SEARCH_RESULTS
 
     logger.info(f"Searching DDG for: '{query}' (max {max_results} results)")
 
     try:
-        # Fetch more results than needed to account for junk filtering
+        # Over-fetch since junk-domain filtering will drop some results.
         fetch_count = max_results * 3
 
         with DDGS() as ddgs:
             raw_results = list(ddgs.text(query, max_results=fetch_count))
 
-        # Extract URLs and apply domain policies
         trusted_urls: list[str] = []
         mixed_urls: list[str] = []
         
@@ -99,8 +82,7 @@ async def search_ddg(
             if len(urls) < max_results:
                 urls.extend(mixed_urls[:max_results - len(urls)])
             urls = urls[:max_results]
-        else: # MIXED
-            # Original behavior, strictly preserve DDG rank order
+        else:  # MIXED: preserve DDG's rank order, no trusted-domain reordering
             urls = []
             for result in raw_results:
                  url = result.get("href", "")
