@@ -1,10 +1,5 @@
-"""
-Project Argus - Refiner Agent
-
-Role: Fact Extractor
-Responsibility: Takes raw scraped text and extracts structured, source-linked facts.
-Dynamically generates a schema based on the plan.
-"""
+"""Refiner agent: extracts structured, source-linked facts from raw scraped text,
+using an extraction schema generated dynamically from the research plan."""
 
 import logging
 from typing import Dict
@@ -23,10 +18,7 @@ class ExtractionSchema(BaseModel):
 
 
 def _generate_dynamic_schema(plan: list[str]) -> dict:
-    """
-    Use an LLM to generate an extraction schema based on the research plan.
-    Uses Pydantic structured output to guarantee valid formatting.
-    """
+    """Use an LLM to generate an extraction schema based on the research plan."""
     try:
         llm = get_llm(LIBRARIAN_MODEL, LIBRARIAN_PROVIDER, temperature=0)
         structured_llm = llm.with_structured_output(ExtractionSchema)
@@ -53,10 +45,8 @@ def _generate_dynamic_schema(plan: list[str]) -> dict:
 
 
 def refiner_node(state: AgentState) -> dict:
-    """
-    Batch extracts facts from scraped data.
-    Takes all scraped_data, packs them into a single string with source tags, and invokes the Refiner Tool.
-    """
+    """Batch-extract facts from scraped data: packs scraped_data into a single
+    string with source tags and invokes the refiner tool."""
     logger.info("Refiner: Starting batched fact extraction...")
     
     scraped_data = state.get("scraped_data", [])
@@ -65,12 +55,10 @@ def refiner_node(state: AgentState) -> dict:
         return {"structured_evidence": [], "active_node": "refiner"}
         
     plan = state.get("plan", [])
-    
-    # 1. Generate schema
     schema = _generate_dynamic_schema(plan)
     logger.info(f"Refiner: Generated schema: {schema}")
     
-    # Track which source_ids have already been processed to avoid re-extracting
+    # Avoid re-extracting facts from documents already processed in a prior iteration.
     already_processed_sids = {
         f.get("source_id") for f in state.get("verified_facts", [])
     }
@@ -83,12 +71,10 @@ def refiner_node(state: AgentState) -> dict:
         logger.warning("Refiner: No new documents to process.")
         return {"structured_evidence": [], "active_node": "refiner"}
         
-    # 2. Pack the context using only new documents
     batched_text = ""
     for doc in new_docs:
         text = doc.get("content", "")
         source_id = doc.get("source_id", "[?]")
-        # Trim very long docs to prevent overflow if necessary, otherwise rely on 1M token limit
         if text.strip():
             batched_text += f"\n<document source_id=\"{source_id}\">\n{text}\n</document>\n"
             
@@ -97,15 +83,12 @@ def refiner_node(state: AgentState) -> dict:
         return {"structured_evidence": [], "active_node": "refiner"}
         
     source_map = state.get("source_map", {})
-    
-    # 3. Call the Batch Tool
+
     all_facts = []
     try:
-        logger.info(f"Refiner: Passing massive batched payload to natively extract facts...")
         extraction_result = extract_facts(batched_text, schema)
         all_facts = extraction_result.get("facts", [])
-        
-        # Inject source_url from source_map
+
         for fact in all_facts:
             s_id = fact.get("source_id")
             if s_id and s_id in source_map:

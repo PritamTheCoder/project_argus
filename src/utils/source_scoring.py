@@ -69,9 +69,7 @@ def evaluate_source(url: str) -> dict:
         if hostname == ind_domain or hostname.endswith("." + ind_domain):
             return {"score": 0.65, "type": "Industry/Market Research"}
 
-    # Tier 4: Reputable Industry/News (Score 0.6)
-    # We apply a slight boost to .org (non-profits) and .io / standard reputable domains
-    # In a full production system, this would explicitly list Bloomberg, Reuters, etc.
+    # Tier 4: .org domains (non-profits) get a slight credibility boost
     if hostname.endswith(".org"):
         return {"score": 0.6, "type": "News/Industry"}
         

@@ -1,5 +1,5 @@
 """
-Project Argus - Persistence Layer (Phase 3)
+Project Argus - Persistence Layer
 
 Provides SQLite-backed state persistence for the LangGraph graph,
 enabling "time travel" (rewinding to any previous state checkpoint).

@@ -1,8 +1,4 @@
-"""
-Project Argus - Batch Refiner Tool
-
-Extracts structured facts from concatenated raw Markdown using Gemini Guided JSON Output.
-"""
+"""Extracts structured facts from concatenated raw Markdown via LLM structured output."""
 
 import logging
 from typing import List, Dict, Any, Optional
@@ -13,10 +9,24 @@ from src.utils.llm_factory import get_llm
 logger = logging.getLogger(__name__)
 
 class ExtractedFact(BaseModel):
-    extraction_class: str = Field(description="The category of the extracted fact (e.g., 'dates', 'metrics').")
-    claim: str = Field(description="A clear, standalone factual claim extracted from the document.")
-    source_excerpt: str = Field(description="The exact text quote from the document that explicitly supports the claim.")
-    source_id: str = Field(description="The source_id of the document where this fact was found. MUST exactly match the source_id in the <document source_id=\"...\"> tag.")
+    extraction_class: str = Field(default="", description="The category of the extracted fact (e.g., 'dates', 'metrics').")
+    claim: str = Field(default="", description="A clear, standalone factual claim extracted from the document.")
+    source_excerpt: str = Field(
+        default="",
+        description="The exact text quote from the document that explicitly supports the claim.",
+    )
+    source_id: str = Field(
+        default="",
+        description="The source_id of the document where this fact was found. MUST exactly match the source_id in the <document source_id=\"...\"> tag.",
+    )
+    as_of_date: str = Field(
+        default="",
+        description=(
+            "The date this fact pertains to or was published, if explicitly stated in the "
+            "source (ISO 'YYYY-MM-DD' or just a year like '2024'). Empty string if no date is stated. "
+            "Do NOT guess or infer a date that is not present in the text."
+        ),
+    )
     attributes: Dict[str, Any] = Field(description="Additional attributes summarizing the fact based on the schema.", default_factory=dict)
 
 class FactExtractionResult(BaseModel):
@@ -48,8 +58,9 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
                     1. Provide a clear, standalone factual `claim` based on the document.
                     2. Provide the `source_excerpt` containing the exact text quote that supports the claim.
                     3. Provide the `extraction_class` based on the Target Schema.
-                    3. Critically: You must provide the exact `source_id` of the document where you found the fact.
-                    4. Add meaningful `attributes` to provide context.
+                    4. Critically: You must provide the exact `source_id` of the document where you found the fact.
+                    5. If the source explicitly states a date for this fact (publication date or the date it pertains to), put it in `as_of_date` (ISO format or year). Never invent a date.
+                    6. Add meaningful `attributes` to provide context.
 
                     Documents to Analyze:
                     ====================
@@ -64,19 +75,26 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
         result: FactExtractionResult = structured_llm.invoke(prompt)
 
         facts = []
+        dropped = 0
         if result and result.facts:
             for fact in result.facts:
+                # Drop records missing mandatory fields the LLM failed to populate.
+                if not fact.claim or not fact.source_id:
+                    dropped += 1
+                    continue
                 facts.append({
                     "class": fact.extraction_class,
                     "claim": fact.claim,
                     "source_excerpt": fact.source_excerpt,
                     "source_id": fact.source_id,
+                    "as_of_date": fact.as_of_date or "",
                     "attributes": fact.attributes or {},
                     "source_span": {"start": None, "end": None}
                 })
+        if dropped:
+            logger.warning(f"Refiner: dropped {dropped} fact(s) missing claim/source_id from LLM output.")
         return facts
 
-    # Attempt primary model
     try:
         logger.info(f"Refiner: Attempting extraction with {REFINER_MODEL} via {REFINER_PROVIDER}...")
         facts = _invoke_extraction(REFINER_MODEL, REFINER_PROVIDER)
@@ -85,9 +103,10 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
     except Exception as primary_err:
         logger.warning(f"Refiner: Primary model failed ({primary_err}). Trying Gemini fallback...")
 
-        # Fallback to Gemini (1M context, handles large payloads)
+        # Gemini's 1M context handles large payloads the primary model may reject.
         try:
-            facts = _invoke_extraction("gemini-2.5-flash", "gemini")
+            from src.config import GEMINI_DEFAULT_MODEL
+            facts = _invoke_extraction(GEMINI_DEFAULT_MODEL, "gemini")
             logger.info(f"Refiner: Gemini fallback succeeded — extracted {len(facts)} facts.")
             return {"facts": facts, "raw_jsonl": ""}
         except Exception as fallback_err:

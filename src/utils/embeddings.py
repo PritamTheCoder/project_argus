@@ -8,7 +8,6 @@ from src.config import EMBEDDING_MODE, LOCAL_EMBEDDING_MODEL
 
 logger = logging.getLogger(__name__)
 
-# Local cache file
 CACHE_FILE = "embedding_cache_local.json"
 
 _local_model = None
@@ -54,10 +53,9 @@ def get_embeddings(texts: List[str], model="text-embedding-3-large") -> List[Lis
     to_embed_texts = []
     
     for i, text in enumerate(texts):
-        # Remove linebreaks to follow best practices
         cleaned_text = text.replace("\n", " ")
-        
-        # Include mode/model in hash to avoid collision between local and openai caches
+
+        # Mode/model in the hash avoids collisions between local and OpenAI caches
         hash_input = f"{EMBEDDING_MODE}:{model}:{LOCAL_EMBEDDING_MODEL}:{cleaned_text}"
         h = _get_hash(hash_input)
         if h in cache:
@@ -95,16 +93,15 @@ def get_embeddings(texts: List[str], model="text-embedding-3-large") -> List[Lis
 def _get_local_embeddings(to_embed_texts, to_embed_indices, embeddings, cache):
     try:
         local_model = get_local_model()
-        # sentence-transformers encodes in batches automatically
         encoded_embs = local_model.encode(to_embed_texts, show_progress_bar=False, convert_to_numpy=True)
-        
+
         for i, emb in enumerate(encoded_embs):
             idx = to_embed_indices[i]
             emb_list = emb.tolist()
             embeddings[idx] = emb_list
-            
-            # Using same hash schema as above, default embedding target "text-embedding-3-large" for cache compat
-            # We mock the model name here just for the cache key to remain consistent if passed
+
+            # Hardcode the OpenAI model name in the cache key so it stays
+            # compatible with entries written by the OpenAI embedding path.
             hash_input = f"{EMBEDDING_MODE}:text-embedding-3-large:{LOCAL_EMBEDDING_MODEL}:{to_embed_texts[i]}"
             cache[_get_hash(hash_input)] = emb_list
             

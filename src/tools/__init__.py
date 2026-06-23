@@ -1,8 +1,4 @@
-"""
-Project Argus - Tools Package
-
-Search, scrape, and refine. The refiner uses LangExtract (LLM-powered).
-"""
+"""Search, scrape, and refine. The refiner uses an LLM for structured extraction."""
 
 from src.tools.search import search_ddg
 from src.tools.scraper import scrape_urls

@@ -8,7 +8,6 @@ logger = logging.getLogger(__name__)
 
 def init_db():
     """Initializes the SQLite database and creates the url_cache table if it doesn't exist."""
-    # Ensure the directory exists
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     
     conn = sqlite3.connect(DB_PATH)
