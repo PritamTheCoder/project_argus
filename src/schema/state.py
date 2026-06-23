@@ -1,7 +1,5 @@
 """
-Project Argus - State Definitions
-
-Defines the `AgentState` TypedDict (the "nervous system") and 
+Defines the `AgentState` TypedDict shared across graph nodes and the
 Pydantic models for structured LLM outputs.
 """
 
@@ -52,8 +50,6 @@ class AgentState(TypedDict):
     iteration_count: int  # Loop-safety counter for fact-checker re-search cycles
     active_node: str
 
-
-# Pydantic Models for Structured Output
 
 class VerifiedFact(BaseModel):
     claim: str

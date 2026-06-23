@@ -1,7 +1,5 @@
 """
-Project Argus - Research Tools (Phase 2)
-
-LangChain structured tools the acquisition agent can call, wrapping the real
+LangChain structured tools the acquisition agent can call, wrapping the
 provider backends plus two utility tools (KG memory lookup, calculator). Each
 tool is registered in the shared `registry` with tags so the agent can be given
 the right subset and so new tools are pluggable without touching the graph.

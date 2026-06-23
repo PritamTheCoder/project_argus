@@ -1,4 +1,5 @@
-langgraph 
+langgraph
+streamlit
 langchain-openai
 langchain-groq
 ddgs
@@ -13,3 +14,6 @@ openai
 PyMuPDF
 aiohttp
 httpx
+# Optional: enables loading tools from external MCP servers (Phase 3).
+# The system runs fine without it (MCP simply stays disabled).
+langchain-mcp-adapters

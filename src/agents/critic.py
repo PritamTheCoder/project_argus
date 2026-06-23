@@ -1,9 +1,7 @@
 """
-Project Argus - Critic Agent
-
-Role: Fact Checker / Validator / Reflector
-Responsibility: Reviews extracted evidence and existing Knowledge Graph facts against the original query.
-Performs Gap Analysis and generates dynamic follow-up queries if necessary.
+Critic agent: reviews extracted evidence and existing Knowledge Graph facts
+against the original query, performs gap analysis, and generates dynamic
+follow-up queries if necessary.
 """
 
 import logging
@@ -17,15 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 def critic_node(state: AgentState) -> dict:
-    """
-    Review the gathered evidence (and existing KG facts) to determine if more research is needed.
-    
-    Args:
-        state: AgentState containing `query` and `knowledge_gap_detected`.
-        
-    Returns:
-        dict: Updates `critique`, `re_search_required`, `plan` (with new queries), and `active_node`.
-    """
+    """Review the gathered evidence (and existing KG facts) to determine if more research is needed."""
     logger.info("Critic (Reflector): Reviewing evidence and analyzing Knowledge Graph for gaps...")
 
     from src.graph.kg import kg_store
@@ -34,8 +24,7 @@ def critic_node(state: AgentState) -> dict:
     gap_detected = state.get("knowledge_gap_detected", False)
     session_id = state.get("session_id", "")
 
-    # 1. Fetch relevant existing facts from the KG (scoped to THIS run to avoid
-    #    cross-session contamination of the gap analysis).
+    # Scoped to THIS run to avoid cross-session contamination of the gap analysis.
     kg_facts = ""
     source_stats = {}
     try:
@@ -49,7 +38,6 @@ def critic_node(state: AgentState) -> dict:
             stype = fact.get("source_type", "Unknown")
             source_url = fact.get("source_url", "No URL")
             
-            # Track source diversity
             if source_url not in source_stats:
                 source_stats[source_url] = {"count": 1, "type": stype, "credibility": cred}
             else:
@@ -63,7 +51,6 @@ def critic_node(state: AgentState) -> dict:
     if not kg_facts.strip():
         kg_facts = "(No relevant facts found in the Knowledge Graph.)"
         
-    # Build diversity summary
     diversity_str = "Diversity of Sources Available in KG:\n"
     for url, stats in source_stats.items():
         diversity_str += f"- {url} (Type: {stats['type']}, Credibility: {stats['credibility']}, Mentions: {stats['count']})\n"

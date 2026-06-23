@@ -1,6 +1,4 @@
 """
-Project Argus - Graph Package 
-
 Orchestrates the multi-agent research pipeline via LangGraph
 with SQLite-backed persistence for time-travel.
 """

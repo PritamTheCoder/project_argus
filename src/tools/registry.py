@@ -1,15 +1,11 @@
 """
-Project Argus - Tool Registry (Phase 2)
+Project Argus - Tool Registry
 
-A small, dynamic registry of agent tools. Tools register themselves with
-metadata (tags, "when to use", whether they yield retrieval candidates), and
-consumers fetch a subset — by name or tag — as LangChain tool objects ready to
-`bind_tools(...)`.
-
-This is the seam that makes the toolset pluggable: adding a new backend is a
-matter of writing a tool and registering it (no graph or prompt edits), and it
-is the foundation for Phase 3 tool-search (retrieving relevant tools by
-embedding their descriptions).
+A dynamic registry of agent tools. Tools register themselves with metadata
+(tags, "when to use", whether they yield retrieval candidates), and consumers
+fetch a subset — by name or tag — as LangChain tool objects ready to
+``bind_tools(...)``. Adding a new backend is a matter of writing a tool and
+registering it, with no graph or prompt changes.
 """
 
 from __future__ import annotations

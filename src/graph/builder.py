@@ -16,7 +16,6 @@ from langgraph.graph import StateGraph, START, END
 from src.schema.state import AgentState
 from src.config import MAX_RESEARCH_LOOPS
 
-# Agent Node Imports
 from src.agents.librarian import librarian_node
 from src.agents.scout import scout_node
 from src.agents.refiner import refiner_node
@@ -28,8 +27,6 @@ from src.agents.writer import writer_node
 
 logger = logging.getLogger(__name__)
 
-
-# Conditional Routing
 
 def route_after_critic(state: AgentState) -> str:
     """
@@ -66,20 +63,13 @@ def route_after_critic(state: AgentState) -> str:
     return "consensus"
 
 
-# Wrapper to increment iteration_count
-
 def _critic_with_counter(state: AgentState) -> dict:
-    """
-    Wraps the real critic_node and bumps iteration_count
-    so the router knows how many loops we've done.
-    """
+    """Wraps critic_node and bumps iteration_count so the router can track loop count."""
     result = critic_node(state)
     current_count = state.get("iteration_count", 0)
     result["iteration_count"] = current_count + 1
     return result
 
-
-# Graph Construction
 
 def build_graph(checkpointer=None):
     """
@@ -94,9 +84,8 @@ def build_graph(checkpointer=None):
     """
     builder = StateGraph(AgentState)
 
-    # Register Nodes
     builder.add_node("librarian", librarian_node)
-    builder.add_node("scout", scout_node)            # async — LangGraph handles it
+    builder.add_node("scout", scout_node)
     builder.add_node("refiner", refiner_node)
     builder.add_node("verifier", verifier_node)
     builder.add_node("fact_checker", _critic_with_counter)
@@ -104,7 +93,6 @@ def build_graph(checkpointer=None):
     builder.add_node("consensus", consensus_node)
     builder.add_node("ghostwriter", writer_node)
 
-    # Linear Edges
     builder.add_edge(START, "librarian")
     builder.add_edge("librarian", "scout")
     builder.add_edge("scout", "refiner")
@@ -114,7 +102,6 @@ def build_graph(checkpointer=None):
     # Reflector feeds back into Scout with targeted queries
     builder.add_edge("reflector", "scout")
 
-    # Conditional Edge (the Research Loop)
     builder.add_conditional_edges(
         "fact_checker",
         route_after_critic,
@@ -127,11 +114,8 @@ def build_graph(checkpointer=None):
 
     # Consensus runs once on the final evidence, then the Writer synthesizes.
     builder.add_edge("consensus", "ghostwriter")
-
-    # Terminal Edge
     builder.add_edge("ghostwriter", END)
 
-    # Compile
     compile_kwargs = {}
     if checkpointer is not None:
         compile_kwargs["checkpointer"] = checkpointer

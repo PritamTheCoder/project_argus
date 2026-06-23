@@ -1,10 +1,5 @@
-"""
-Project Argus - Writer Agent
-
-Role: Ghostwriter
-Responsibility: Synthesizes the final report using ONLY the provided evidence.
-Ensures rigorous citation.
-"""
+"""Writer agent: synthesizes the final report using only the provided evidence,
+with rigorous per-claim citation."""
 
 import logging
 from langchain_core.prompts import ChatPromptTemplate
@@ -16,26 +11,18 @@ logger = logging.getLogger(__name__)
 
 
 def writer_node(state: AgentState) -> dict:
-    """
-    Write the final report.
-    
-    Args:
-        state: AgentState with `query`, `structured_evidence`, `source_map`.
-        
-    Returns:
-        dict: Updates `report`.
-    """
+    """Write the final report."""
     logger.info("Writer: Synthesizing report...")
-    
+
     query = state["query"]
     evidence = state.get("verified_facts", [])
     source_map = state.get("source_map", {})
-    
-    # Citation Deduplication & Mapping Layer
+
+    # Collapse duplicate URLs from source_map into a single renumbered citation ID.
     unique_urls = {}       # url -> new_source_id (e.g. "[1]")
     new_source_map = {}    # new_source_id -> {"url": url, ...}
     old_to_new_id_map = {} # old_source_id (e.g. "[4]") -> new_source_id (e.g. "[1]")
-    
+
     next_id = 1
     for old_id, data in source_map.items():
         url = data.get("url")
@@ -47,14 +34,12 @@ def writer_node(state: AgentState) -> dict:
         
         old_to_new_id_map[old_id] = unique_urls[url]
 
-    # Build a url-to-newid fallback map
     url_to_new_id = {}
     for old_id, data in source_map.items():
         url = data.get("url")
         if url and url in unique_urls:
             url_to_new_id[url] = unique_urls[url]
 
-    # Format evidence using the deduplicated IDs
     evidence_text = ""
     for fact in evidence:
         if fact.get("support_level") not in ["SUPPORTED", "PARTIALLY_SUPPORTED"]:
@@ -63,12 +48,10 @@ def writer_node(state: AgentState) -> dict:
         new_sid = old_to_new_id_map.get(old_sid)
         
         if new_sid is None:
-            # Fallback: try to resolve by source_url
             fact_url = fact.get("source_url", "")
             new_sid = url_to_new_id.get(fact_url, None)
-            
+
         if new_sid is None:
-            # Last resort fallback if completely unmatched
             new_sid = old_sid
             logger.warning(f"Writer: Unresolvable source_id={old_sid}")
             
@@ -115,8 +98,6 @@ def writer_node(state: AgentState) -> dict:
     logger.info(f"Writer: Total unique sources in source_map: {len(source_map)}")
     logger.info(f"Writer: Total unique URLs after dedup: {len(new_source_map)}")
         
-    llm = get_llm(WRITER_MODEL, WRITER_PROVIDER, temperature=0.7)
-    
     system_prompt = (
         "You are an elite technical Ghostwriter. Your objective is to write a highly detailed, comprehensive, and exhaustive report answering the user's query.\n\n"
         "IMPORTANT GUIDELINES FOR LENGTH & STRUCTURE:\n"
@@ -154,14 +135,31 @@ def writer_node(state: AgentState) -> dict:
          "Evidence:\n{evidence}")
     ])
 
-    chain = prompt | llm
-    response = chain.invoke({
+    invoke_payload = {
         "query": query,
         "critique": critique,
         "consensus": consensus_text,
         "contradictions": contradiction_text,
         "evidence": evidence_text,
-    })
+    }
+
+    def _invoke_writer(model: str, provider: str):
+        llm = get_llm(model, provider, temperature=0.7)
+        return (prompt | llm).invoke(invoke_payload)
+
+    # The Writer may be configured to use a heavier model (e.g. Nemotron). Guard
+    # the call so a provider/rate-limit error never blocks report generation —
+    # fall back to the default Gemini model.
+    try:
+        response = _invoke_writer(WRITER_MODEL, WRITER_PROVIDER)
+    except Exception as e:
+        from src.config import GEMINI_DEFAULT_MODEL
+        logger.warning(
+            f"Writer: primary model {WRITER_PROVIDER}/{WRITER_MODEL} failed ({e}). "
+            f"Falling back to gemini/{GEMINI_DEFAULT_MODEL}."
+        )
+        response = _invoke_writer(GEMINI_DEFAULT_MODEL, "gemini")
+
     report_content = response.content
 
     # Prepend a compact research-quality banner so the trust signals are visible
@@ -178,7 +176,6 @@ def writer_node(state: AgentState) -> dict:
         )
         report_content = banner + report_content
 
-    # Append References Section from Source Map using new deduplicated mapping
     if new_source_map:
         report_content += "\n\n---\n### References\n"
         sorted_ids = sorted(new_source_map.keys(), key=lambda x: int(x.strip("[]")) if x.strip("[]").isdigit() else 0)

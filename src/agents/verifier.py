@@ -1,7 +1,11 @@
 import json
 import logging
+import unicodedata
+import re
+from difflib import SequenceMatcher
 from src.schema.state import AgentState
 from src.utils.llm_factory import get_llm
+from src.config import VERIFY_BATCH_SIZE, MAX_FACTS_TO_VERIFY
 from pydantic import BaseModel, Field
 from typing import Literal, List
 
@@ -29,10 +33,52 @@ class LLMBatchVerification(BaseModel):
 
 logger = logging.getLogger(__name__)
 
-# Facts are verified in source-grouped batches of this size. Verifying every
-# fact in one giant call invites "lost in the middle" degradation and uniformly
-# inflated confidence, so we batch by default rather than only on failure.
-VERIFY_BATCH_SIZE = 15
+
+def _normalize_claim(text: str) -> str:
+    """Lowercase, strip punctuation and extra whitespace for similarity comparison."""
+    text = unicodedata.normalize("NFKD", text).lower()
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _deduplicate_facts(facts: list[dict], sim_threshold: float = 0.88) -> list[dict]:
+    """
+    Remove near-duplicate claims using difflib ratio comparison.
+
+    Two claims are considered duplicates when their normalised text similarity
+    exceeds ``sim_threshold``. The first occurrence (highest-credibility source
+    is sorted to the front before comparison) is kept; later near-duplicates
+    are dropped.  O(n²) but fast enough for the typical 200-500 fact range.
+    """
+    # Sort so higher-credibility facts are seen first and kept as the canonical copy.
+    sorted_facts = sorted(facts, key=lambda f: -f.get("credibility_score", 0.4))
+    seen_norms: list[str] = []
+    unique: list[dict] = []
+    for fact in sorted_facts:
+        norm = _normalize_claim(fact.get("claim", ""))
+        if not norm:
+            continue
+        duplicate = any(
+            SequenceMatcher(None, norm, s).ratio() >= sim_threshold
+            for s in seen_norms
+        )
+        if not duplicate:
+            seen_norms.append(norm)
+            unique.append(fact)
+    return unique
+
+
+def _cap_facts(facts: list[dict], max_facts: int) -> list[dict]:
+    """
+    Enforce a hard ceiling on the number of facts entering the verifier.
+
+    Sorts by credibility descending so that if we must drop, we drop the
+    lowest-quality sources first.
+    """
+    if len(facts) <= max_facts:
+        return facts
+    sorted_facts = sorted(facts, key=lambda f: -f.get("credibility_score", 0.4))
+    return sorted_facts[:max_facts]
 
 
 def _group_facts_into_batches(facts: list[dict], batch_size: int = VERIFY_BATCH_SIZE) -> list[list[dict]]:
@@ -112,8 +158,6 @@ def _verify_batch(structured_llm, facts: list[dict]) -> list[dict]:
     result: LLMBatchVerification = structured_llm.invoke(prompt)
 
     verified = []
-    
-    # Create a mapping from index to verification result
     result_map = {res.index: res for res in result.results}
     
     for i, fact in enumerate(facts):
@@ -124,7 +168,6 @@ def _verify_batch(structured_llm, facts: list[dict]) -> list[dict]:
             v_dict["support_level"] = result_map[i].support_level
             v_dict["confidence"] = result_map[i].confidence
         else:
-            # Fallback if LLM missed this index
             v_dict["reasoning"] = "LLM missed this index during batch processing."
             v_dict["support_quote"] = ""
             v_dict["support_level"] = "UNCERTAIN"
@@ -136,17 +179,16 @@ def _verify_batch(structured_llm, facts: list[dict]) -> list[dict]:
 
 def verifier_node(state: AgentState) -> dict:
     """
-    Verifies the extracted facts from the refiner node.
-    Uses a single batched LLM call (with mini-batch fallback) to avoid 429 rate limits.
-    Also stores verified and supported facts into the Knowledge Graph.
+    Verify the extracted facts from the refiner node using a single batched LLM
+    call (with mini-batch fallback to stay under rate limits), then store
+    verified/supported facts into the Knowledge Graph.
     """
     structured_evidence = state.get("structured_evidence", [])
     source_map = state.get("source_map", {})
-    
+
     if not structured_evidence:
         return {"verified_facts": [], "knowledge_gap_detected": False, "knowledge_gaps": [], "active_node": "verifier"}
-        
-    # Inject credibility scores from the source_map into the facts before verification
+
     for fact in structured_evidence:
         source_id = fact.get("source_id", "")
         if source_id in source_map:
@@ -157,7 +199,6 @@ def verifier_node(state: AgentState) -> dict:
             fact["credibility_score"] = 0.4
             fact["source_type"] = "Unverified/Web"
 
-    # Filter out facts missing required fields
     valid_facts = [
         f for f in structured_evidence
         if f.get("claim") and f.get("source_excerpt")
@@ -167,10 +208,27 @@ def verifier_node(state: AgentState) -> dict:
         logger.warning("Verifier: All facts were missing claim or excerpt.")
         return {"verified_facts": [], "knowledge_gap_detected": True, "knowledge_gaps": [], "active_node": "verifier"}
 
+    # Deduplicate near-identical claims before batching. A single scrape pass
+    # often yields the same measurement stated across several pages; verifying
+    # duplicates burns RPM without adding information.
+    before_dedup = len(valid_facts)
+    valid_facts = _deduplicate_facts(valid_facts)
+    dedup_dropped = before_dedup - len(valid_facts)
+    if dedup_dropped:
+        logger.info(f"Verifier: dedup dropped {dedup_dropped} near-duplicate fact(s) ({before_dedup} → {len(valid_facts)}).")
+
+    # Hard cap: if still above limit, keep the highest-credibility facts.
+    valid_facts = _cap_facts(valid_facts, MAX_FACTS_TO_VERIFY)
+    if len(valid_facts) < before_dedup - dedup_dropped:
+        logger.warning(
+            f"Verifier: capped at {MAX_FACTS_TO_VERIFY} facts "
+            f"(set MAX_FACTS_TO_VERIFY env var to raise the limit)."
+        )
+
     from src.config import VERIFIER_MODEL, VERIFIER_PROVIDER
     
     def _run_with_fallback(batch: list[dict], model: str, provider: str) -> list[dict]:
-        """Attempt to verify the batch using the primary model. If it fails, fallback to Gemini."""
+        """Verify with the primary model; fall back to Gemini on failure."""
         try:
             llm = get_llm(model, provider, temperature=0)
             structured_llm = llm.with_structured_output(LLMBatchVerification)
@@ -178,7 +236,8 @@ def verifier_node(state: AgentState) -> dict:
         except Exception as primary_err:
             logger.warning(f"Verifier: Primary model failed ({primary_err}). Falling back to Gemini...")
             try:
-                fallback_llm = get_llm("gemini-2.5-flash", "gemini", temperature=0)
+                from src.config import GEMINI_DEFAULT_MODEL
+                fallback_llm = get_llm(GEMINI_DEFAULT_MODEL, "gemini", temperature=0)
                 fallback_structured = fallback_llm.with_structured_output(LLMBatchVerification)
                 return _verify_batch(fallback_structured, batch)
             except Exception as fallback_err:
@@ -247,7 +306,6 @@ def verifier_node(state: AgentState) -> dict:
     except Exception as e:
         logger.error(f"Error embedding/corroborating/storing facts into KG: {e}")
 
-    # Extract unsupported/uncertain claims as explicit knowledge gaps
     knowledge_gaps = [
         f.get("claim", "")
         for f in verified_facts

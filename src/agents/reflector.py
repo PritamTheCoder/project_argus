@@ -1,8 +1,5 @@
 """
-Project Argus - Reflector Agent
-
-Role: Targeted Gap-Filling Sub-Query Generator
-Responsibility: Analyses knowledge_gaps (unsupported/uncertain claims from the
+Reflector agent: analyses knowledge_gaps (unsupported/uncertain claims from the
 Verifier) and generates highly specific follow-up search queries to fill only
 those gaps — rather than triggering a broad full re-search via the Librarian.
 """

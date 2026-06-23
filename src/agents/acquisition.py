@@ -1,16 +1,11 @@
 """
-Project Argus - Acquisition Agent (Phase 2)
+Project Argus - Acquisition Agent
 
 The model-driven source gatherer. Given a research sub-question and its search
-`mode`, it lets a tool-calling LLM choose which backends to query (web vs.
-academic vs. memory) and collects the resulting candidate documents.
-
-This is the "tool utilization" core: tool *selection* is decided by the model
-per query, not hard-coded. A deterministic, mode-aware fallback guarantees the
-pipeline still gathers sources if tool-calling is unavailable or yields nothing.
-
-Only the *acquisition* boundary is agentic — the downstream spine
-(Refiner → Verifier → Consensus → Critic → Writer) stays deterministic.
+``mode``, a tool-calling LLM chooses which backends to query (web vs. academic
+vs. memory) and the resulting candidate documents are collected. Tool selection
+is decided by the model per query; a deterministic, mode-aware fallback gathers
+sources if tool-calling is unavailable or yields nothing.
 """
 
 from __future__ import annotations
@@ -20,9 +15,14 @@ from typing import Any, Dict, List, Optional, Set
 
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
-from src.config import GATHERER_MODEL, GATHERER_PROVIDER, GATHER_MAX_STEPS
+from src.config import (
+    GATHERER_MODEL, GATHERER_PROVIDER, GATHER_MAX_STEPS, TOOL_SEARCH_MAX_TOOLS,
+)
 from src.tools import providers
 from src.tools.research_tools import registry  # importing also registers the tools
+from src.tools.tool_search import select_tools
+from src.tools.tool_telemetry import ToolCallTracer, timed_tool_call
+from src.tools.mcp_loader import ensure_mcp_loaded
 from src.utils.llm_factory import get_llm
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,10 @@ def _dedup_candidates(candidates: List[Dict[str, Any]], seen_urls: Set[str]) -> 
     return out
 
 
-async def _run_tool_loop(query: str, mode: str, llm_tools, tools, max_steps: int) -> List[Dict[str, Any]]:
+async def _run_tool_loop(
+    query: str, mode: str, llm_tools, tools, max_steps: int,
+    tracer: Optional[ToolCallTracer] = None,
+) -> List[Dict[str, Any]]:
     """Bounded bind_tools loop. Returns candidate dicts collected from tool calls."""
     candidate_names = set(registry.candidate_tool_names())
     tool_map = {t.name: t for t in tools}
@@ -105,8 +108,12 @@ async def _run_tool_loop(query: str, mode: str, llm_tools, tools, max_steps: int
             if tool is None:
                 messages.append(ToolMessage(content=f"Unknown tool '{name}'.", tool_call_id=tcid))
                 continue
+
             try:
-                result = await tool.ainvoke(args)
+                async with timed_tool_call(tracer, name, args) as call:
+                    result = await tool.ainvoke(args)
+                    if isinstance(result, list):
+                        call.set_result(result_count=len(result))
             except Exception as e:  # noqa: BLE001
                 logger.warning("Acquisition: tool '%s' failed: %s", name, e)
                 messages.append(ToolMessage(content=f"{name} error: {e}", tool_call_id=tcid))
@@ -152,12 +159,18 @@ async def gather_sources_for_query(
     seen_urls = seen_urls or set()
     max_steps = max_steps or GATHER_MAX_STEPS
 
+    await ensure_mcp_loaded()
+
+    tracer = ToolCallTracer()
     candidates: List[Dict[str, Any]] = []
     try:
-        tools = registry.tools(tags=_GATHER_TOOL_TAGS)
+        # Tool search: bind only the most relevant tools (RAG-over-tools). With a
+        # small catalog this returns all of them unchanged; it scales selection
+        # once MCP servers add many tools.
+        tools = select_tools(query, tags=_GATHER_TOOL_TAGS, max_tools=TOOL_SEARCH_MAX_TOOLS)
         llm = get_llm(GATHERER_MODEL, GATHERER_PROVIDER, temperature=0)
         llm_tools = llm.bind_tools(tools)
-        candidates = await _run_tool_loop(query, mode, llm_tools, tools, max_steps)
+        candidates = await _run_tool_loop(query, mode, llm_tools, tools, max_steps, tracer=tracer)
         if not candidates:
             logger.info("Acquisition: tool loop yielded no candidates for '%s'; using fallback.", query)
             candidates = await _fallback_gather(query, mode)
@@ -166,5 +179,7 @@ async def gather_sources_for_query(
         candidates = await _fallback_gather(query, mode)
 
     deduped = _dedup_candidates(candidates, seen_urls)
+    if tracer.records:
+        logger.info("Acquisition: tool-call telemetry for '%s': %s", query, tracer.summary())
     logger.info("Acquisition: gathered %d candidate source(s) for '%s' (mode=%s).", len(deduped), query, mode)
     return deduped

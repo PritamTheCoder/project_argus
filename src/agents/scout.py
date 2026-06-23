@@ -1,10 +1,5 @@
-"""
-Project Argus - Scout Agent
-
-Role: Research Execution
-Responsibility: Iterates through the plan, calls the search/scrape tools,
-and builds the raw data payload.
-"""
+"""Scout agent: iterates through the plan, calls the search/scrape tools, and
+builds the raw data payload."""
 
 import logging
 from src.schema.state import AgentState
@@ -47,15 +42,7 @@ def _align_reranked_to_docs(
 
 
 async def scout_node(state: AgentState) -> dict:
-    """
-    Execute the research plan by searching and scraping for each query.
-    
-    Args:
-        state: AgentState containing `plan` (list of strings).
-        
-    Returns:
-        dict: Updates `scraped_data` and `source_map`.
-    """
+    """Execute the research plan by searching and scraping for each query."""
     logger.info("Scout: Starting research execution...")
     from src.graph.kg import kg_store
     
@@ -63,8 +50,7 @@ async def scout_node(state: AgentState) -> dict:
     all_scraped_data = []
     source_map = state.get("source_map", {}).copy()
     
-    # Determine the next available source ID (e.g. 1, 2, 3...)
-    # We parse keys like "[1]" to find the max integer.
+    # Parse keys like "[1]" to find the max integer and continue numbering from there.
     current_ids = [
         int(k.strip("[]")) 
         for k in source_map.keys() 
@@ -77,7 +63,6 @@ async def scout_node(state: AgentState) -> dict:
     candidate_meta: dict[str, dict] = {}
 
     def _register_source(url: str, content: str, query: str) -> None:
-        """Add a single source to the source_map + scraped_data payload."""
         nonlocal next_id
         base = evaluate_source(url)
         score = base["score"]
@@ -124,8 +109,8 @@ async def scout_node(state: AgentState) -> dict:
 
         logger.info(f"Scout: Processing query '{q}' with mode '{mode_str}'")
 
-        # 1. Gather candidate sources via model-driven tool selection (web vs.
-        #    academic vs. memory), deduped against everything already seen.
+        # Gather candidate sources via model-driven tool selection (web vs.
+        # academic vs. memory), deduped against everything already seen.
         seen_urls = {v["url"] for v in source_map.values()}
         candidates = await gather_sources_for_query(q, mode_str, seen_urls=seen_urls)
         if not candidates:
@@ -136,8 +121,8 @@ async def scout_node(state: AgentState) -> dict:
         for c in candidates:
             candidate_meta[c["url"]] = c
 
-        # 2. Academic backends already supply abstracts (no scrape needed);
-        #    web candidates must be scraped for full text.
+        # Academic backends already supply abstracts (no scrape needed);
+        # web candidates must be scraped for full text.
         scrape_targets = [c["url"] for c in candidates if c.get("needs_scrape")]
         prefetched = [c for c in candidates if not c.get("needs_scrape") and (c.get("content") or "").strip()]
 
@@ -148,15 +133,12 @@ async def scout_node(state: AgentState) -> dict:
 
         scraped = await scrape_urls(scrape_targets, query=q) if scrape_targets else []
 
-        # 3. Unify prefetched abstracts and freshly scraped pages into one stream.
         results = [
             {"url": c["url"], "content": c["content"], "success": True}
             for c in prefetched
         ]
         results.extend(scraped)
 
-
-        # Get query embedding for Stage 2 & 3
         try:
             query_emb = get_embeddings([q])[0]
         except Exception as e:
@@ -170,23 +152,17 @@ async def scout_node(state: AgentState) -> dict:
                 
             content = res["content"]
             
-            # 1. Synthesize Coarse Document Summary
             from src.utils.chunking import extract_summary, chunk_document
             summary = extract_summary(content)
-            
-            # 2. Chunking to <= MAX_CHUNK_TOKENS (~300)
-            chunks = chunk_document(content)
+            chunks = chunk_document(content)  # <= MAX_CHUNK_TOKENS (~300)
 
             if not chunks:
                 continue
 
-            # 3. Embed & Store in Hierarchical Index
             if query_emb is not None:
                 try:
                     summary_emb = get_embeddings([summary])[0]
                     chunk_embs = get_embeddings(chunks)
-                    
-                    # Store in Local Vector DB
                     doc_id = kg_store.store_document_and_chunks(
                         url=res["url"], 
                         query=q, 
@@ -200,18 +176,12 @@ async def scout_node(state: AgentState) -> dict:
             else:
                 logger.warning("Skipping indexing due to missing query embedding.")
 
-        # 4. Hierarchical Retrieval (cross-document)
         if query_emb is not None:
             logger.info("Scout: Performing Hierarchical Retrieval...")
-            # Step A: Top N Docs (Coarse)
             top_doc_ids = kg_store.retrieve_top_docs(query_emb, k=10)
-
-            # Step B: Top M Chunks from those Docs (Fine)
-            top_retrieved = kg_store.retrieve_top_chunks(query_emb, top_doc_ids, k=TOP_K_CHUNKS * 2)  # Fetch extra for reranker
-
+            top_retrieved = kg_store.retrieve_top_chunks(query_emb, top_doc_ids, k=TOP_K_CHUNKS * 2)  # extra for reranker
             top_stage2_chunks = [chunk for doc_id, chunk in top_retrieved]
 
-            # Step C: Cross Encoder Reranking
             best_chunks = top_stage2_chunks[:TOP_K_CHUNKS]
             try:
                 top_stage3 = rerank_chunks(q, top_stage2_chunks, top_k=TOP_K_CHUNKS)
@@ -226,21 +196,16 @@ async def scout_node(state: AgentState) -> dict:
             best_pairs = _align_reranked_to_docs(best_chunks, top_retrieved)
             best_doc_ids = list({doc_id for doc_id, _ in best_pairs})
 
-            # Retrieve the full text (all chunks) for these highly relevant documents
             doc_all_chunks = kg_store.get_all_chunks_for_docs(best_doc_ids)
 
-            # Compile full document arrays back to their source URLs
             source_content_map = {}
             for doc_id in best_doc_ids:
                 meta = kg_store.get_doc_metadata(doc_id)
                 url = meta.get("url", "unknown")
                 if url not in source_content_map:
                     source_content_map[url] = []
-
-                # Expand the extraction context to the entire document
                 source_content_map[url].extend(doc_all_chunks.get(doc_id, []))
 
-            # Build Source Map and Scraped Data Payload
             for url, matched_chunks in source_content_map.items():
                 best_content = "\n\n".join(matched_chunks)
                 _register_source(url, best_content, q)
@@ -259,8 +224,6 @@ async def scout_node(state: AgentState) -> dict:
                 _register_source(res["url"], content, q)
 
     logger.info(f"Scout: Collected {len(all_scraped_data)} highly relevant chunk sets across queries.")
-    
-    # Audit log the source_map before propagating to the state
     logger.info(f"Scout: Source map has {len(source_map)} entries:")
     for sid, data in source_map.items():
         logger.info(f"  {sid}: {data.get('url', '?')} (cred={data.get('credibility_score', '?')}, type={data.get('source_type', '?')})")

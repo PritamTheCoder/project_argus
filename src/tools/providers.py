@@ -1,7 +1,5 @@
 """
-Project Argus - Search Provider Backends (Phase 2)
-
-Real, usable search backends behind a single normalized result type
+Search provider backends behind a single normalized result type
 (`SearchResult`). Each backend has:
 
   - an async network function (httpx, timeouts, retries, graceful empty on error)
@@ -96,7 +94,7 @@ async def _request(method: str, url: str, *, retries: int = 2, **kwargs) -> Opti
                 continue
             resp.raise_for_status()
             return resp
-        except Exception as e:  # noqa: BLE001 - we want to swallow and degrade
+        except Exception as e:  # swallow and degrade to None on persistent failure
             last_err = e
             if attempt < retries:
                 await asyncio.sleep(0.5 * (attempt + 1))

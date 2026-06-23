@@ -17,7 +17,6 @@ class KnowledgeGraph:
         self._init_db()
 
     def _init_db(self):
-        # Create metadata table for facts
         self.db.execute("""
         CREATE TABLE IF NOT EXISTS facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,14 +40,14 @@ class KnowledgeGraph:
         self._ensure_column("facts", "as_of_date", "TEXT")
         # Index to keep per-session retrieval fast as the fact store grows.
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_facts_session ON facts(session_id)")
-        # Create virtual table for vector embeddings (all-MiniLM-L6-v2 is 384 dims)
+        # all-MiniLM-L6-v2 embeddings are 384-dim
         self.db.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
             embedding float[384]
         );
         """)
-        
-        # New tables for Scout hierarchical retrieval
+
+        # docs/chunks support Scout's hierarchical (doc -> chunk) retrieval
         self.db.execute("""
         CREATE TABLE IF NOT EXISTS docs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,7 +104,6 @@ class KnowledgeGraph:
 
             fact_id = cursor.lastrowid
 
-            # Insert embedding into vec table
             cursor.execute("""
             INSERT INTO vec_facts(rowid, embedding) VALUES (?, ?)
             """, (fact_id, self._serialize_f32(fact["embedding"])))
@@ -214,7 +212,7 @@ class KnowledgeGraph:
               AND v.embedding MATCH ? AND v.k = ?
             ORDER BY v.distance ASC
         """
-        params = tuple(doc_ids) + (self._serialize_f32(query_embedding), k * 3) # overfetch slightly to account for doc_id filter selectivity
+        params = tuple(doc_ids) + (self._serialize_f32(query_embedding), k * 3)  # overfetch: doc_id filter is applied after the KNN MATCH
         cursor.execute(query, params)
         
         results = []
@@ -298,6 +296,5 @@ class KnowledgeGraph:
         self.db.commit()
         logger.info("Cleared Vector DB scratchpad (docs and chunks).")
 
-# Global singleton KG instance
 kg_store = KnowledgeGraph()
 
