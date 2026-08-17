@@ -23,3 +23,4 @@ upd.md
 
 eval/*
 SETUP.md
+tests/test_eval_metrics.py
