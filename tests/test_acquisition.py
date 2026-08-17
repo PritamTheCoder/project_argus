@@ -48,7 +48,7 @@ def test_dedup_drops_seen_and_duplicate_urls():
 # ── Tool-calling loop ────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-@patch("src.agents.acquisition.get_llm")
+@patch("src.agents.acquisition.get_llm_with_fallbacks")
 @patch("src.tools.providers.web_search", new_callable=AsyncMock)
 async def test_gather_executes_model_chosen_tool(mock_web, mock_get_llm):
     """The model emits a web_search tool call; its results become candidates."""
@@ -59,20 +59,19 @@ async def test_gather_executes_model_chosen_tool(mock_web, mock_get_llm):
     ai2 = AIMessage(content="done")
     llm_tools = MagicMock()
     llm_tools.ainvoke = AsyncMock(side_effect=[ai1, ai2])
-    mock_llm = MagicMock()
-    mock_llm.bind_tools.return_value = llm_tools
-    mock_get_llm.return_value = mock_llm
+    # The ladder builder returns the tool-bound runnable directly.
+    mock_get_llm.return_value = llm_tools
 
     candidates = await gather_sources_for_query("q", "MIXED")
 
     assert any(c["url"] == "http://x" for c in candidates)
     mock_web.assert_awaited()
-    # bind_tools was given a non-empty tool list.
-    assert mock_llm.bind_tools.call_args[0][0]
+    # A non-empty tool list was passed to the ladder builder.
+    assert mock_get_llm.call_args.kwargs["tools"]
 
 
 @pytest.mark.asyncio
-@patch("src.agents.acquisition.get_llm")
+@patch("src.agents.acquisition.get_llm_with_fallbacks")
 @patch("src.tools.providers.semantic_scholar_search", new_callable=AsyncMock)
 async def test_gather_falls_back_when_no_tool_calls(mock_ss, mock_get_llm):
     """If the model returns no tool calls, the deterministic fallback runs."""
@@ -81,9 +80,7 @@ async def test_gather_falls_back_when_no_tool_calls(mock_ss, mock_get_llm):
     ai = AIMessage(content="I won't call tools")  # no tool_calls
     llm_tools = MagicMock()
     llm_tools.ainvoke = AsyncMock(return_value=ai)
-    mock_llm = MagicMock()
-    mock_llm.bind_tools.return_value = llm_tools
-    mock_get_llm.return_value = mock_llm
+    mock_get_llm.return_value = llm_tools
 
     with patch("src.tools.providers.web_search", new_callable=AsyncMock) as mock_web:
         mock_web.return_value = []
@@ -93,7 +90,7 @@ async def test_gather_falls_back_when_no_tool_calls(mock_ss, mock_get_llm):
 
 
 @pytest.mark.asyncio
-@patch("src.agents.acquisition.get_llm", side_effect=Exception("model has no tool calling"))
+@patch("src.agents.acquisition.get_llm_with_fallbacks", side_effect=Exception("model has no tool calling"))
 @patch("src.tools.providers.web_search", new_callable=AsyncMock)
 @patch("src.tools.providers.semantic_scholar_search", new_callable=AsyncMock)
 async def test_gather_fallback_on_llm_failure(mock_ss, mock_web, mock_get_llm):
@@ -107,7 +104,7 @@ async def test_gather_fallback_on_llm_failure(mock_ss, mock_web, mock_get_llm):
 
 
 @pytest.mark.asyncio
-@patch("src.agents.acquisition.get_llm", side_effect=Exception("down"))
+@patch("src.agents.acquisition.get_llm_with_fallbacks", side_effect=Exception("down"))
 @patch("src.tools.providers.semantic_scholar_search", new_callable=AsyncMock)
 @patch("src.tools.providers.arxiv_search", new_callable=AsyncMock)
 @patch("src.tools.providers.web_search", new_callable=AsyncMock)

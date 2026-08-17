@@ -12,17 +12,35 @@ informational payloads the model reasons over but that don't produce documents.
 from __future__ import annotations
 
 import ast
+import contextvars
 import logging
 import operator as _op
 from typing import Any, Dict, List
 
 from langchain_core.tools import tool
 
-from src.config import ACADEMIC_MAX_RESULTS
+from src.config import ACADEMIC_MAX_RESULTS, KG_LOOKUP_GLOBAL
 from src.tools import providers
 from src.tools.registry import ToolSpec, registry
 
 logger = logging.getLogger(__name__)
+
+# The current run's session id, set by the acquisition flow before the model may
+# invoke kg_lookup. A contextvar (task-local) is used because kg_lookup is called
+# indirectly by the LLM and can't take session_id as an argument. Default "" ⇒ no
+# scope available (kg_lookup then returns nothing rather than leaking global facts).
+_current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "kg_lookup_session_id", default=""
+)
+
+
+def set_kg_session(session_id: str) -> contextvars.Token:
+    """Bind the session id kg_lookup should scope to. Returns a token for reset."""
+    return _current_session_id.set(session_id or "")
+
+
+def reset_kg_session(token: contextvars.Token) -> None:
+    _current_session_id.reset(token)
 
 
 # ── Search tools (yield retrieval candidates) ────────────────────────────────
@@ -71,10 +89,20 @@ def kg_lookup(query: str, k: int = 5) -> List[Dict[str, Any]]:
     Call this FIRST to check what is already known before searching the web, to
     avoid redundant research. Returns previously verified claims with their sources."""
     try:
+        # Resolve scope first (before the embedding cost). Session-scoped by
+        # default — consistent with the Critic/Reflector retrieval — so kg_lookup
+        # can't leak prior runs' facts. `global` opt-in enables cross-run memory.
+        if KG_LOOKUP_GLOBAL:
+            session_id = None
+        else:
+            session_id = _current_session_id.get()
+            if not session_id:
+                return []  # no run scope bound → nothing this run knows yet
+
         from src.utils.embeddings import get_embeddings
         from src.graph.kg import kg_store
         emb = get_embeddings([query])[0]
-        facts = kg_store.retrieve_relevant_facts(emb, k=k)
+        facts = kg_store.retrieve_relevant_facts(emb, k=k, session_id=session_id)
         return [
             {
                 "claim": f.get("claim", ""),

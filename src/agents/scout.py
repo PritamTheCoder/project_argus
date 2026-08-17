@@ -1,6 +1,7 @@
 """Scout agent: iterates through the plan, calls the search/scrape tools, and
 builds the raw data payload."""
 
+import asyncio
 import logging
 from src.schema.state import AgentState
 from src.tools.scraper import scrape_urls
@@ -8,7 +9,7 @@ from src.agents.acquisition import gather_sources_for_query
 from src.utils.embeddings import get_embeddings
 from src.utils.rerank import rerank_chunks
 from src.utils.source_scoring import evaluate_source
-from src.config import MAX_CHUNK_TOKENS, TOP_K_CHUNKS
+from src.config import MAX_CHUNK_TOKENS, TOP_K_CHUNKS, SCOUT_CONCURRENCY
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,13 @@ logger = logging.getLogger(__name__)
 # to passing raw scraped text straight to the Refiner. Cap it to avoid flooding
 # the extraction context when many documents take the degraded path at once.
 DEGRADED_MAX_CHARS = 12000
+
+
+def _parse_intent(intent) -> tuple[str, str]:
+    """Extract (query, mode) from a plan entry (dict or bare string)."""
+    if isinstance(intent, dict):
+        return intent.get("query", str(intent)), intent.get("mode", "MIXED")
+    return str(intent), "MIXED"
 
 
 def _align_reranked_to_docs(
@@ -47,6 +55,7 @@ async def scout_node(state: AgentState) -> dict:
     from src.graph.kg import kg_store
     
     queries = state["plan"]
+    session_id = state.get("session_id", "")
     all_scraped_data = []
     source_map = state.get("source_map", {}).copy()
     
@@ -62,8 +71,15 @@ async def scout_node(state: AgentState) -> dict:
     # hints from academic backends, publication dates, etc.).
     candidate_meta: dict[str, dict] = {}
 
+    # URLs already turned into sources. Seeded with anything from a prior round so
+    # a URL is registered once even though parallel gathers share a seen snapshot.
+    registered_urls: set[str] = {v["url"] for v in source_map.values()}
+
     def _register_source(url: str, content: str, query: str) -> None:
         nonlocal next_id
+        if url in registered_urls:
+            return  # first occurrence wins (matches the old per-query seen_urls dedup)
+        registered_urls.add(url)
         base = evaluate_source(url)
         score = base["score"]
         stype = base["type"]
@@ -97,47 +113,51 @@ async def scout_node(state: AgentState) -> dict:
         })
         next_id += 1
 
-    # Process each sub-query sequentially: gather sources (model picks the tools),
-    # scrape the web ones, then index + hierarchically retrieve per query.
-    for intent in queries:
-        if isinstance(intent, dict):
-            q = intent.get("query", str(intent))
-            mode_str = intent.get("mode", "MIXED")
-        else:
-            q = str(intent)
-            mode_str = "MIXED"
+    # ── Phase A: gather + scrape every sub-query CONCURRENTLY ─────────────────
+    # Both are network-bound and independent across queries, so overlap them
+    # (bounded by SCOUT_CONCURRENCY). All gathers share the same seen-URL snapshot;
+    # cross-query duplicates are collapsed at registration in Phase B. The
+    # per-provider rate limiter still caps actual API RPM.
+    initial_seen = {v["url"] for v in source_map.values()}
+    sem = asyncio.Semaphore(max(SCOUT_CONCURRENCY, 1))
 
-        logger.info(f"Scout: Processing query '{q}' with mode '{mode_str}'")
+    async def _gather_and_scrape(intent) -> tuple[str, list, list]:
+        q, mode_str = _parse_intent(intent)
+        async with sem:
+            logger.info(f"Scout: Processing query '{q}' with mode '{mode_str}'")
+            candidates = await gather_sources_for_query(
+                q, mode_str, seen_urls=initial_seen, session_id=session_id
+            )
+            if not candidates:
+                logger.info(f"Scout: No new candidate sources for query '{q}'.")
+                return q, [], []
 
-        # Gather candidate sources via model-driven tool selection (web vs.
-        # academic vs. memory), deduped against everything already seen.
-        seen_urls = {v["url"] for v in source_map.values()}
-        candidates = await gather_sources_for_query(q, mode_str, seen_urls=seen_urls)
+            scrape_targets = [c["url"] for c in candidates if c.get("needs_scrape")]
+            prefetched = [c for c in candidates if not c.get("needs_scrape") and (c.get("content") or "").strip()]
+            logger.info(
+                f"Scout: {len(candidates)} candidate(s) for '{q}' "
+                f"({len(prefetched)} prefetched, {len(scrape_targets)} to scrape)."
+            )
+            scraped = await scrape_urls(scrape_targets, query=q) if scrape_targets else []
+            results = [
+                {"url": c["url"], "content": c["content"], "success": True}
+                for c in prefetched
+            ]
+            results.extend(scraped)
+            return q, candidates, results
+
+    gathered = await asyncio.gather(*[_gather_and_scrape(intent) for intent in queries])
+
+    # ── Phase B: index + hierarchically retrieve + register (SEQUENTIAL) ──────
+    # Kept sequential so shared state (next_id, source_map, registered_urls, and
+    # KG writes) stays deterministic and race-free.
+    for q, candidates, results in gathered:
         if not candidates:
-            logger.info(f"Scout: No new candidate sources for query '{q}'.")
             continue
 
         # Record candidate metadata (credibility/source hints, dates) for later.
         for c in candidates:
             candidate_meta[c["url"]] = c
-
-        # Academic backends already supply abstracts (no scrape needed);
-        # web candidates must be scraped for full text.
-        scrape_targets = [c["url"] for c in candidates if c.get("needs_scrape")]
-        prefetched = [c for c in candidates if not c.get("needs_scrape") and (c.get("content") or "").strip()]
-
-        logger.info(
-            f"Scout: {len(candidates)} candidate(s) for '{q}' "
-            f"({len(prefetched)} prefetched, {len(scrape_targets)} to scrape)."
-        )
-
-        scraped = await scrape_urls(scrape_targets, query=q) if scrape_targets else []
-
-        results = [
-            {"url": c["url"], "content": c["content"], "success": True}
-            for c in prefetched
-        ]
-        results.extend(scraped)
 
         try:
             query_emb = get_embeddings([q])[0]
