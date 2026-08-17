@@ -41,7 +41,7 @@ def _base_state(**overrides) -> dict:
 
 # ── Librarian Tests ───────────────────────────────────────────────────────────
 
-@patch("src.agents.librarian.get_llm")
+@patch("src.agents.librarian.get_llm_with_fallbacks")
 def test_librarian_generates_plan(mock_get_llm):
     """Librarian should decompose the query and return a list of search-intent dicts."""
     expected_plan = ResearchPlan(search_queries=[
@@ -49,7 +49,7 @@ def test_librarian_generates_plan(mock_get_llm):
         SearchIntent(query="QuantumScape QSE-5 cycle life results", mode="TRUSTED_FIRST"),
     ])
     # LangChain wraps MagicMock as RunnableLambda; the chain calls mock(input) → .return_value
-    mock_get_llm.return_value.with_structured_output.return_value.return_value = expected_plan
+    mock_get_llm.return_value.return_value = expected_plan
 
     result = librarian_node(_base_state())
 
@@ -60,13 +60,13 @@ def test_librarian_generates_plan(mock_get_llm):
     assert result["active_node"] == "librarian"
 
 
-@patch("src.agents.librarian.get_llm")
+@patch("src.agents.librarian.get_llm_with_fallbacks")
 def test_librarian_injects_critique_on_iteration(mock_get_llm):
     """On iteration > 0, the system prompt must contain the previous critique."""
     expected_plan = ResearchPlan(search_queries=[
         SearchIntent(query="gap-filling query for missing data", mode="MIXED"),
     ])
-    mock_get_llm.return_value.with_structured_output.return_value.return_value = expected_plan
+    mock_get_llm.return_value.return_value = expected_plan
 
     state = _base_state(
         iteration_count=1,
@@ -79,13 +79,13 @@ def test_librarian_injects_critique_on_iteration(mock_get_llm):
     mock_get_llm.assert_called_once()
 
 
-@patch("src.agents.librarian.get_llm")
+@patch("src.agents.librarian.get_llm_with_fallbacks")
 def test_librarian_no_critique_injection_on_first_iteration(mock_get_llm):
     """On iteration 0, critique should NOT be injected even if state has a stale value."""
     expected_plan = ResearchPlan(search_queries=[
         SearchIntent(query="general query", mode="MIXED"),
     ])
-    mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = expected_plan
+    mock_get_llm.return_value.invoke.return_value = expected_plan
 
     # iteration_count=0, critique is non-empty (shouldn't be injected)
     state = _base_state(iteration_count=0, critique="old critique from prior run")
@@ -191,7 +191,7 @@ def test_refiner_extraction(mock_get_llm, mock_extract):
 
 # ── Critic Tests ──────────────────────────────────────────────────────────────
 
-@patch("src.agents.critic.get_llm")
+@patch("src.agents.critic.get_llm_with_fallbacks")
 @patch("src.agents.critic.get_embeddings")
 @patch("src.graph.kg.kg_store")
 def test_critic_evaluation_gaps_found(mock_kg, mock_embeddings, mock_get_llm):
@@ -200,7 +200,7 @@ def test_critic_evaluation_gaps_found(mock_kg, mock_embeddings, mock_get_llm):
     mock_kg.retrieve_relevant_facts.return_value = []
 
     # Chain calls mock as callable → .return_value (not .invoke.return_value)
-    mock_get_llm.return_value.with_structured_output.return_value.return_value = FactCheckResult(
+    mock_get_llm.return_value.return_value = FactCheckResult(
         status="gaps_found",
         new_queries=[SearchIntent(query="follow-up query", mode="MIXED")],
         critique="Missing manufacturing cost data.",
@@ -213,7 +213,7 @@ def test_critic_evaluation_gaps_found(mock_kg, mock_embeddings, mock_get_llm):
     assert result["active_node"] == "critic"
 
 
-@patch("src.agents.critic.get_llm")
+@patch("src.agents.critic.get_llm_with_fallbacks")
 @patch("src.agents.critic.get_embeddings")
 @patch("src.graph.kg.kg_store")
 def test_critic_evaluation_sufficient(mock_kg, mock_embeddings, mock_get_llm):
@@ -221,7 +221,7 @@ def test_critic_evaluation_sufficient(mock_kg, mock_embeddings, mock_get_llm):
     mock_embeddings.return_value = [[0.1] * 384]
     mock_kg.retrieve_relevant_facts.return_value = []
 
-    mock_get_llm.return_value.with_structured_output.return_value.return_value = FactCheckResult(
+    mock_get_llm.return_value.return_value = FactCheckResult(
         status="sufficient",
         new_queries=[],
         critique="All key questions are answered.",
@@ -235,7 +235,7 @@ def test_critic_evaluation_sufficient(mock_kg, mock_embeddings, mock_get_llm):
 
 # ── Writer Tests ──────────────────────────────────────────────────────────────
 
-@patch("src.agents.writer.get_llm")
+@patch("src.agents.writer.get_llm_with_fallbacks")
 def test_writer_report_generation(mock_get_llm):
     """Writer should produce a report body and append a References section."""
     # chain = prompt | llm → LangChain wraps llm as RunnableLambda
@@ -265,7 +265,7 @@ def test_writer_report_generation(mock_get_llm):
     assert result["active_node"] == "writer"
 
 
-@patch("src.agents.writer.get_llm")
+@patch("src.agents.writer.get_llm_with_fallbacks")
 def test_writer_filters_unsupported_facts(mock_get_llm):
     """Writer should exclude NOT_SUPPORTED facts from the evidence block."""
     mock_get_llm.return_value.return_value.content = "Report with only supported facts."

@@ -64,12 +64,12 @@ def test_build_batch_prompt():
 
 # ── Full-Batch Verification Path ─────────────────────────────────────────────
 
-@patch("src.agents.verifier.get_llm")
+@patch("src.agents.verifier.get_llm_with_fallbacks")
 @patch("src.utils.embeddings.get_embeddings")
 @patch("src.graph.kg.kg_store")
 def test_verifier_batch_path(mock_kg, mock_embeddings, mock_get_llm):
     """Two same-batch facts with grounded quotes from two sources are corroborated."""
-    mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+    mock_get_llm.return_value.invoke.return_value = (
         LLMBatchVerification(results=[
             LLMVerificationResult(
                 index=0, reasoning="source confirms",
@@ -95,7 +95,7 @@ def test_verifier_batch_path(mock_kg, mock_embeddings, mock_get_llm):
     result = verifier_node(state)
 
     # Single LLM call for the single (combined) batch.
-    assert mock_get_llm.return_value.with_structured_output.return_value.invoke.call_count == 1
+    assert mock_get_llm.return_value.invoke.call_count == 1
     assert len(result["verified_facts"]) == 2
     assert result["verified_facts"][0]["support_level"] == "SUPPORTED"
     # Corroborated by 2 sources → confidence not capped.
@@ -105,12 +105,12 @@ def test_verifier_batch_path(mock_kg, mock_embeddings, mock_get_llm):
     assert result["active_node"] == "verifier"
 
 
-@patch("src.agents.verifier.get_llm")
+@patch("src.agents.verifier.get_llm_with_fallbacks")
 @patch("src.utils.embeddings.get_embeddings")
 @patch("src.graph.kg.kg_store")
 def test_verifier_drops_ungrounded_supported_fact(mock_kg, mock_embeddings, mock_get_llm):
     """A 'SUPPORTED' verdict with a quote absent from the excerpt is dropped to NOT_SUPPORTED."""
-    mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+    mock_get_llm.return_value.invoke.return_value = (
         LLMBatchVerification(results=[
             LLMVerificationResult(
                 index=0, reasoning="claims support but quote fabricated",
@@ -137,13 +137,17 @@ def test_verifier_drops_ungrounded_supported_fact(mock_kg, mock_embeddings, mock
     mock_kg.store_facts.assert_not_called()
 
 
-# ── Per-Batch Model Fallback Path ────────────────────────────────────────────
+# ── Cross-Provider Fallback Ladder (now lives in llm_factory) ────────────────
 
-@patch("src.agents.verifier.get_llm")
-@patch("src.utils.embeddings.get_embeddings")
-@patch("src.graph.kg.kg_store")
-def test_verifier_model_fallback_within_batch(mock_kg, mock_embeddings, mock_get_llm):
-    """If the primary model fails on a batch, that batch falls back to Gemini."""
+def test_get_llm_with_fallbacks_fails_over_to_next_provider():
+    """A runtime error on the primary (e.g. 503) fails over to the next provider.
+
+    Uses real RunnableLambdas so LangChain's ``.with_fallbacks()`` actually
+    executes the failover rather than being stubbed away.
+    """
+    from src.utils import llm_factory
+    from langchain_core.runnables import RunnableLambda
+
     success_result = LLMBatchVerification(results=[
         LLMVerificationResult(
             index=0, reasoning="ok",
@@ -152,37 +156,49 @@ def test_verifier_model_fallback_within_batch(mock_kg, mock_embeddings, mock_get
         ),
     ])
 
-    invoke_mock = mock_get_llm.return_value.with_structured_output.return_value.invoke
-    invoke_mock.side_effect = [
-        Exception("primary model down"),  # primary model fails for the batch
-        success_result,                   # Gemini fallback succeeds
-    ]
+    calls = {"primary": 0, "fallback": 0}
 
-    mock_embeddings.return_value = [[0.1] * 384]
-    mock_kg.store_facts = MagicMock()
+    def _boom(_):
+        calls["primary"] += 1
+        raise Exception("503 overloaded")
 
-    state = _make_state(structured_evidence=[
-        {"claim": "Reached 400 Wh/kg", "source_excerpt": "The cell reached 400 Wh/kg in lab testing.", "source_url": "http://a.com", "source_id": "[1]"},
-    ])
+    def _ok(_):
+        calls["fallback"] += 1
+        return success_result
 
-    result = verifier_node(state)
+    primary = MagicMock()
+    primary.with_structured_output.return_value = RunnableLambda(_boom)
+    fallback = MagicMock()
+    fallback.with_structured_output.return_value = RunnableLambda(_ok)
 
-    # 1 failed primary call + 1 successful Gemini fallback call
-    assert invoke_mock.call_count == 2
-    assert len(result["verified_facts"]) == 1
-    assert result["verified_facts"][0]["support_level"] == "SUPPORTED"
-    # Single source → confidence capped by corroboration pass.
-    assert result["verified_facts"][0]["confidence"] == 0.7
+    # get_llm is called once per ladder rung (primary, then each fallback spec).
+    with patch.object(llm_factory, "get_llm", side_effect=[primary, fallback]):
+        chain = llm_factory.get_llm_with_fallbacks(
+            "primary-model", "gemini",
+            fallback_chain="llama-3.3-70b-versatile:groq",
+            structured_schema=LLMBatchVerification,
+        )
+        out = chain.invoke("verify these")
+
+    assert out == success_result
+    assert calls["primary"] == 1
+    assert calls["fallback"] == 1
+
+
+def test_parse_fallback_chain_skips_malformed_entries():
+    from src.utils.llm_factory import parse_fallback_chain
+    specs = parse_fallback_chain("a:groq, , bad-entry, b:gemini")
+    assert specs == [("a", "groq"), ("b", "gemini")]
 
 
 # ── Batch Failure Isolation ──────────────────────────────────────────────────
 
-@patch("src.agents.verifier.get_llm")
+@patch("src.agents.verifier.get_llm_with_fallbacks")
 @patch("src.utils.embeddings.get_embeddings")
 @patch("src.graph.kg.kg_store")
 def test_verifier_failed_batch_marked_uncertain(mock_kg, mock_embeddings, mock_get_llm):
-    """A batch whose primary and Gemini calls both fail is marked UNCERTAIN, not dropped."""
-    invoke_mock = mock_get_llm.return_value.with_structured_output.return_value.invoke
+    """A batch whose entire fallback ladder fails is marked UNCERTAIN, not dropped."""
+    invoke_mock = mock_get_llm.return_value.invoke
     invoke_mock.side_effect = Exception("everything is down")
 
     mock_embeddings.return_value = []

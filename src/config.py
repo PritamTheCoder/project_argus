@@ -27,13 +27,15 @@ NVIDIA_API_NEMOTRON3_KEY: str = os.getenv("NVIDIA_API_NEMOTRON3_KEY", "")
 NEMOTRON_MODEL: str = os.getenv("NEMOTRON_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 NEMOTRON_REASONING_BUDGET: int = int(os.getenv("NEMOTRON_REASONING_BUDGET", "4096"))
 
-# DeepSeek V4 Flash (reasoning, supports thinking/reasoning_effort).
-DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_V4_FLASH", "")
-DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-ai/deepseek-v4-flash")
-
 # StepFun Step-3.7 Flash (multimodal / vision-capable chat).
 STEP_API_KEY: str = os.getenv("STEP_3.7_API_KEY", "")
 STEP_MODEL: str = os.getenv("STEP_MODEL", "stepfun-ai/step-3.7-flash")
+
+# Kimi K2.6 (Moonshot, large-context non-reasoning chat). Plain completions — no
+# thinking/reasoning_effort — which makes it well-suited to bulk extraction over
+# big payloads where a reasoning model is needlessly slow and times out.
+KIMI_API_KEY: str = os.getenv("KIMI_NVIDIA_KEY", "")
+KIMI_MODEL: str = os.getenv("KIMI_MODEL", "moonshotai/kimi-k2.6")
 
 # ── Default Gemini model ─────────────────────────────────────────────────────
 # gemini-2.5-flash is deprecated (2026-06-17) and shuts down 2026-10-16. We
@@ -43,15 +45,34 @@ STEP_MODEL: str = os.getenv("STEP_MODEL", "stepfun-ai/step-3.7-flash")
 # quality if you have the rate-limit headroom.
 GEMINI_DEFAULT_MODEL: str = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-2.5-flash-lite")
 
-# Agent LLM Settings
+# Agent LLM Settings.
+# Shared cross-provider fallback ladder for the Groq-primary structured nodes:
+# Kimi (own NIM quota) then Gemini (emergency). Keeps a single provider's daily
+# token cap from ERRORing a whole run — the failure mode that broke the eval.
+_STRUCTURED_FALLBACK = f"{KIMI_MODEL}:kimi,{GEMINI_DEFAULT_MODEL}:gemini"
+
 LIBRARIAN_MODEL: str = os.getenv("LIBRARIAN_MODEL", "llama-3.3-70b-versatile")
 LIBRARIAN_PROVIDER: str = os.getenv("LIBRARIAN_PROVIDER", "groq")
+LIBRARIAN_FALLBACK_CHAIN: str = os.getenv("LIBRARIAN_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
 
 CRITIC_MODEL: str    = os.getenv("CRITIC_MODEL", "llama-3.3-70b-versatile")
 CRITIC_PROVIDER: str = os.getenv("CRITIC_PROVIDER", "groq")
+CRITIC_FALLBACK_CHAIN: str = os.getenv("CRITIC_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
 
-VERIFIER_MODEL: str  = os.getenv("VERIFIER_MODEL", GEMINI_DEFAULT_MODEL)
-VERIFIER_PROVIDER: str = os.getenv("VERIFIER_PROVIDER", "gemini")
+# Verifier: high-frequency, structured-output, small batches (≤30 facts). Primary
+# is Groq llama-3.3-70b — generous free RPM and fits the batch size. Gemini's free
+# tier is only ~20 requests/DAY, so it can't be a primary here; it's demoted to the
+# last fallback rung where its quota is fine as an emergency.
+VERIFIER_MODEL: str  = os.getenv("VERIFIER_MODEL", "llama-3.3-70b-versatile")
+VERIFIER_PROVIDER: str = os.getenv("VERIFIER_PROVIDER", "groq")
+# Cross-provider runtime fallback ladder. When the primary fails at *call* time
+# (429/503/timeout) the request fails over to the NEXT entry — provider diversity
+# is the only real mitigation. Format: comma-separated "model:provider"; all do
+# structured output and sit on independent capacity pools.
+VERIFIER_FALLBACK_CHAIN: str = os.getenv(
+    "VERIFIER_FALLBACK_CHAIN",
+    f"{KIMI_MODEL}:kimi,{GEMINI_DEFAULT_MODEL}:gemini",
+)
 
 # Writer: long-form synthesis (no structured output). Default to the Nemotron
 # reasoning model when its key is present (high quality + offloads Gemini),
@@ -61,6 +82,9 @@ _writer_default_model = NEMOTRON_MODEL if NVIDIA_API_NEMOTRON3_KEY else GEMINI_D
 _writer_default_provider = "nemotron" if NVIDIA_API_NEMOTRON3_KEY else "gemini"
 WRITER_MODEL: str    = os.getenv("WRITER_MODEL", _writer_default_model)
 WRITER_PROVIDER: str = os.getenv("WRITER_PROVIDER", _writer_default_provider)
+# Writer is plain long-form chat (no structured output); Kimi then Gemini are both
+# fine for synthesis and sit on quota independent of Nemotron.
+WRITER_FALLBACK_CHAIN: str = os.getenv("WRITER_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
 
 # Embedding Settings
 EMBEDDING_MODE: str = os.getenv("EMBEDDING_MODE", "local") # "local" or "openai"
@@ -69,25 +93,51 @@ MAX_CHUNK_TOKENS: int = int(os.getenv("MAX_CHUNK_TOKENS", "300"))
 TOP_K_CHUNKS: int = int(os.getenv("TOP_K_CHUNKS", "15"))
 
 # Refiner Settings
-# Refiner sends entire scraped documents (~40K+ tokens). Groq free tier caps
-# at 12K TPM, so a large-context Gemini model is the correct default here.
-REFINER_MODEL: str = os.getenv("REFINER_MODEL", GEMINI_DEFAULT_MODEL)
-REFINER_PROVIDER: str = os.getenv("REFINER_PROVIDER", "gemini")
-REFINER_FALLBACK_MODEL: str = os.getenv("REFINER_FALLBACK_MODEL", "llama3-8b-8192")
-REFINER_FALLBACK_PROVIDER: str = os.getenv("REFINER_FALLBACK_PROVIDER", "groq")
+# Refiner sends entire scraped documents (~40K+ tokens), so the model MUST be
+# large-context AND non-reasoning (extraction, not reasoning). Primary is Kimi-K2.6
+# (large context, own NIM quota, plain completions, live-verified for structured
+# output) since Gemini's ~20-requests/DAY free tier can't sustain a high-frequency
+# node. Fallback rungs are also large-context (Groq llama-3.3-70b is 128K; Gemini is
+# the emergency last rung). Small Groq models are unusable here.
+REFINER_MODEL: str = os.getenv("REFINER_MODEL", KIMI_MODEL)
+REFINER_PROVIDER: str = os.getenv("REFINER_PROVIDER", "kimi")
+# Cross-provider runtime fallback ladder for the refiner. A runtime failure on the
+# primary fails over to the NEXT entry; every rung must be large-context.
+REFINER_FALLBACK_CHAIN: str = os.getenv(
+    "REFINER_FALLBACK_CHAIN",
+    f"llama-3.3-70b-versatile:groq,{GEMINI_DEFAULT_MODEL}:gemini",
+)
 
 # ── Client-side rate limiting ────────────────────────────────────────────────
 # Proactive per-provider throttle (requests/minute) applied to every LLM call
 # so we stay under provider free-tier RPM limits instead of reactively eating
 # 429s. Tune per your tier. Gemini free flash-lite ≈ 30 RPM → keep margin.
+# google-genai "attempts" (total tries incl. the first); 0 or 1 means NO retries.
+# We want NO in-SDK retries: on a 429/503 the SDK otherwise sleeps *inside* the
+# call (honouring the server's RetryInfo, which on daily-quota exhaustion can be
+# minutes) before raising — which stalls the run and starves the cross-provider
+# fallback ladder, since `.with_fallbacks()` only fires once the primary RAISES.
+# Failing fast hands off to an independent provider in ~1s. The ladder IS the retry.
+GEMINI_MAX_RETRIES: int = int(os.getenv("GEMINI_MAX_RETRIES", "1"))
+# Hard per-request ceiling (seconds) so a hung socket can't block the run either.
+GEMINI_TIMEOUT: int = int(os.getenv("GEMINI_TIMEOUT", "60"))
 GEMINI_RPM: int = int(os.getenv("GEMINI_RPM", "25"))
-GROQ_RPM: int = int(os.getenv("GROQ_RPM", "25"))
+GROQ_RPM: int = int(os.getenv("GROQ_RPM", "30"))  # llama-3.3-70b free-tier ceiling; x2 with the key pool
 OPENAI_RPM: int = int(os.getenv("OPENAI_RPM", "60"))
 NVIDIA_RPM: int = int(os.getenv("NVIDIA_RPM", "30"))
 # NVIDIA NIM reasoning models are large; keep their rates conservative.
 NEMOTRON_RPM: int = int(os.getenv("NEMOTRON_RPM", "8"))
-DEEPSEEK_RPM: int = int(os.getenv("DEEPSEEK_RPM", "10"))
 STEP_RPM: int = int(os.getenv("STEP_RPM", "10"))
+KIMI_RPM: int = int(os.getenv("KIMI_RPM", "10"))
+# Burst size for the proactive limiter: how many calls fire immediately before it
+# throttles to the steady RPM. Raised now that every node has a cross-provider
+# fallback ladder — parallel bursts (see the Scout) flow through instead of being
+# serialized, and an occasional 429 fails over rather than stalling the run.
+RATE_LIMIT_BURST: int = int(os.getenv("RATE_LIMIT_BURST", "8"))
+# Hard per-request ceiling (seconds) for NIM (OpenAI-compatible) calls. NVIDIA's
+# gateway can sit on a slow request for ~5 min before a 504; this aborts client-side
+# first so a stuck NIM call fails over to the next fallback rung quickly.
+NIM_TIMEOUT: int = int(os.getenv("NIM_TIMEOUT", "120"))
 
 # Search Settings
 MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "5"))
@@ -121,8 +171,21 @@ MCP_SERVERS_JSON: str = os.getenv("MCP_SERVERS_JSON", "")
 # Gemini RPM usage low. A deterministic fallback covers any tool-calling failure.
 GATHERER_MODEL: str = os.getenv("GATHERER_MODEL", "llama-3.3-70b-versatile")
 GATHERER_PROVIDER: str = os.getenv("GATHERER_PROVIDER", "groq")
+# Tool-calling fallback ladder (Kimi + Gemini both do tool calling). Applies on
+# top of the deterministic mode-aware fallback the gatherer already has.
+GATHERER_FALLBACK_CHAIN: str = os.getenv("GATHERER_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
 # Max tool-calling rounds per sub-query before stopping (cost/loop safety).
 GATHER_MAX_STEPS: int = int(os.getenv("GATHER_MAX_STEPS", "2"))
+# How many sub-queries the Scout gathers+scrapes concurrently. Overlaps the
+# network-bound work (tool calls + scraping) across the plan's queries; the
+# per-provider rate limiter still caps actual API RPM. Keep modest so we don't
+# open too many simultaneous scrapes.
+SCOUT_CONCURRENCY: int = int(os.getenv("SCOUT_CONCURRENCY", "4"))
+# kg_lookup scope. Default "session": the memory tool sees only THIS run's facts,
+# consistent with the session-scoped Critic/Reflector retrieval (no cross-run
+# contamination). Set "global" to opt into cross-run memory (the future
+# memory-first path — reuses prior runs' verified facts).
+KG_LOOKUP_GLOBAL: bool = os.getenv("KG_LOOKUP_SCOPE", "session").lower() == "global"
 
 # Scraper Settings
 SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", "15"))

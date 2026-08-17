@@ -5,14 +5,16 @@ Verifies the proactive rate limiter is attached to every model and that the
 Nemotron provider wires up / degrades correctly.
 """
 
+import os
 import pytest
 from unittest.mock import patch
 
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
 
-from src.utils.llm_factory import get_llm, _get_rate_limiter
+from src.utils.llm_factory import get_llm, _get_rate_limiter, _groq_keys, _next_groq_key
 
 
 def test_gemini_model_has_rate_limiter():
@@ -50,6 +52,43 @@ def test_nemotron_constructs_with_key():
 def test_nemotron_falls_back_without_key():
     llm = get_llm("nvidia/nemotron-3-ultra-550b-a55b", "nemotron")
     # No key → graceful fallback to the default Gemini model.
+    assert isinstance(llm, ChatGoogleGenerativeAI)
+
+
+# ── Groq multi-key pool ──────────────────────────────────────────────────────
+
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY": ""}, clear=False)
+def test_groq_pool_resolves_both_keys():
+    assert _groq_keys() == ["gsk_aaa", "gsk_bbb"]
+
+
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY": ""}, clear=False)
+def test_groq_pool_round_robins():
+    # Consecutive selections alternate across the two pool indices.
+    idxs = [_next_groq_key()[1] for _ in range(4)]
+    assert set(idxs) == {0, 1}
+    assert idxs[0] != idxs[1]  # alternates rather than repeating
+
+
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY": ""}, clear=False)
+def test_groq_builds_rotate_keys_and_limiters():
+    a = get_llm("llama-3.3-70b-versatile", "groq")
+    b = get_llm("llama-3.3-70b-versatile", "groq")
+    assert isinstance(a, ChatGroq) and isinstance(b, ChatGroq)
+    # Different accounts → different keys AND independent rate-limiter buckets.
+    assert a.groq_api_key.get_secret_value() != b.groq_api_key.get_secret_value()
+    assert a.rate_limiter is not b.rate_limiter
+
+
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "", "GROQ_API_KEY_B": "", "GROQ_API_KEY": ""}, clear=False)
+def test_groq_falls_back_to_gemini_without_keys():
+    llm = get_llm("llama-3.3-70b-versatile", "groq")
+    assert isinstance(llm, ChatGoogleGenerativeAI)
+
+
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "badprefix", "GROQ_API_KEY_B": "", "GROQ_API_KEY": ""}, clear=False)
+def test_groq_falls_back_when_no_valid_prefix():
+    llm = get_llm("llama-3.3-70b-versatile", "groq")
     assert isinstance(llm, ChatGoogleGenerativeAI)
 
 

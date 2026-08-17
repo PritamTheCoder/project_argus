@@ -3,8 +3,8 @@
 import logging
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
-from src.config import REFINER_MODEL, REFINER_PROVIDER
-from src.utils.llm_factory import get_llm
+from src.config import REFINER_MODEL, REFINER_PROVIDER, REFINER_FALLBACK_CHAIN
+from src.utils.llm_factory import get_llm_with_fallbacks
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +68,8 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
                     ====================
             """
 
-    def _invoke_extraction(model: str, provider: str) -> list[dict]:
-        """Attempt fact extraction with the given model/provider."""
-        llm = get_llm(model, provider, temperature=0)
-        structured_llm = llm.with_structured_output(FactExtractionResult)
-        result: FactExtractionResult = structured_llm.invoke(prompt)
-
+    def _shape_facts(result: FactExtractionResult) -> list[dict]:
+        """Convert validated structured output into our internal fact dicts."""
         facts = []
         dropped = 0
         if result and result.facts:
@@ -95,21 +91,22 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
             logger.warning(f"Refiner: dropped {dropped} fact(s) missing claim/source_id from LLM output.")
         return facts
 
+    # Build the structured extractor once, armed with a cross-provider fallback
+    # ladder. A runtime 503 on the primary (e.g. Gemini overloaded) now fails over
+    # to an independent large-context provider instead of retrying the same one.
+    structured_llm = get_llm_with_fallbacks(
+        REFINER_MODEL,
+        REFINER_PROVIDER,
+        fallback_chain=REFINER_FALLBACK_CHAIN,
+        temperature=0,
+        structured_schema=FactExtractionResult,
+    )
+
     try:
-        logger.info(f"Refiner: Attempting extraction with {REFINER_MODEL} via {REFINER_PROVIDER}...")
-        facts = _invoke_extraction(REFINER_MODEL, REFINER_PROVIDER)
-        return {"facts": facts, "raw_jsonl": ""}
-
-    except Exception as primary_err:
-        logger.warning(f"Refiner: Primary model failed ({primary_err}). Trying Gemini fallback...")
-
-        # Gemini's 1M context handles large payloads the primary model may reject.
-        try:
-            from src.config import GEMINI_DEFAULT_MODEL
-            facts = _invoke_extraction(GEMINI_DEFAULT_MODEL, "gemini")
-            logger.info(f"Refiner: Gemini fallback succeeded — extracted {len(facts)} facts.")
-            return {"facts": facts, "raw_jsonl": ""}
-        except Exception as fallback_err:
-            logger.error(f"Refiner: Gemini fallback also failed: {fallback_err}")
-            raise fallback_err
+        logger.info(f"Refiner: Extracting with {REFINER_MODEL} via {REFINER_PROVIDER} (+ fallback ladder)...")
+        result: FactExtractionResult = structured_llm.invoke(prompt)
+        return {"facts": _shape_facts(result), "raw_jsonl": ""}
+    except Exception as err:
+        logger.error(f"Refiner: extraction failed across the entire fallback ladder: {err}")
+        raise
 

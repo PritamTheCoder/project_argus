@@ -4,7 +4,7 @@ import unicodedata
 import re
 from difflib import SequenceMatcher
 from src.schema.state import AgentState
-from src.utils.llm_factory import get_llm
+from src.utils.llm_factory import get_llm_with_fallbacks
 from src.config import VERIFY_BATCH_SIZE, MAX_FACTS_TO_VERIFY
 from pydantic import BaseModel, Field
 from typing import Literal, List
@@ -225,24 +225,22 @@ def verifier_node(state: AgentState) -> dict:
             f"(set MAX_FACTS_TO_VERIFY env var to raise the limit)."
         )
 
-    from src.config import VERIFIER_MODEL, VERIFIER_PROVIDER
-    
-    def _run_with_fallback(batch: list[dict], model: str, provider: str) -> list[dict]:
-        """Verify with the primary model; fall back to Gemini on failure."""
-        try:
-            llm = get_llm(model, provider, temperature=0)
-            structured_llm = llm.with_structured_output(LLMBatchVerification)
-            return _verify_batch(structured_llm, batch)
-        except Exception as primary_err:
-            logger.warning(f"Verifier: Primary model failed ({primary_err}). Falling back to Gemini...")
-            try:
-                from src.config import GEMINI_DEFAULT_MODEL
-                fallback_llm = get_llm(GEMINI_DEFAULT_MODEL, "gemini", temperature=0)
-                fallback_structured = fallback_llm.with_structured_output(LLMBatchVerification)
-                return _verify_batch(fallback_structured, batch)
-            except Exception as fallback_err:
-                logger.error(f"Verifier: Gemini fallback failed: {fallback_err}")
-                raise fallback_err
+    from src.config import VERIFIER_MODEL, VERIFIER_PROVIDER, VERIFIER_FALLBACK_CHAIN
+
+    # Build the structured verifier once, armed with a cross-provider fallback
+    # ladder. A runtime 503 ("model overloaded") on the primary now fails over to
+    # an independent provider instead of retrying the same saturated one.
+    structured_llm = get_llm_with_fallbacks(
+        VERIFIER_MODEL,
+        VERIFIER_PROVIDER,
+        fallback_chain=VERIFIER_FALLBACK_CHAIN,
+        temperature=0,
+        structured_schema=LLMBatchVerification,
+    )
+
+    def _run_with_fallback(batch: list[dict]) -> list[dict]:
+        """Verify a batch; the LLM already carries its own cross-provider ladder."""
+        return _verify_batch(structured_llm, batch)
 
     # Verify in source-grouped batches. Each batch independently falls back to
     # Gemini on model failure, and only that batch is marked UNCERTAIN if it
@@ -256,7 +254,7 @@ def verifier_node(state: AgentState) -> dict:
     verified_facts = []
     for i, batch in enumerate(batches, start=1):
         try:
-            batch_results = _run_with_fallback(batch, VERIFIER_MODEL, VERIFIER_PROVIDER)
+            batch_results = _run_with_fallback(batch)
             verified_facts.extend(batch_results)
             logger.info(f"Verifier: Batch {i}/{len(batches)} verified {len(batch_results)} facts.")
         except Exception as batch_err:

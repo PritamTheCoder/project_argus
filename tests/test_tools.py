@@ -196,10 +196,10 @@ class TestExtractFacts:
         """The refiner module should import without errors."""
         assert callable(extract_facts)
 
-    @patch("src.tools.refiner.get_llm")
+    @patch("src.tools.refiner.get_llm_with_fallbacks")
     def test_extract_returns_facts_key(self, mock_get_llm):
         """extract_facts should return a dict with a 'facts' list."""
-        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+        mock_get_llm.return_value.invoke.return_value = (
             _build_mock_extraction_result()
         )
         result = extract_facts(_REFINER_SAMPLE, {"metrics": "numeric value"})
@@ -208,10 +208,10 @@ class TestExtractFacts:
         assert "facts" in result
         assert isinstance(result["facts"], list)
 
-    @patch("src.tools.refiner.get_llm")
+    @patch("src.tools.refiner.get_llm_with_fallbacks")
     def test_fact_structure(self, mock_get_llm):
         """Each fact should have class, claim, source_excerpt, source_span, and attributes."""
-        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+        mock_get_llm.return_value.invoke.return_value = (
             _build_mock_extraction_result()
         )
         result = extract_facts(_REFINER_SAMPLE, {"metrics": "numeric value"})
@@ -226,10 +226,10 @@ class TestExtractFacts:
             assert "end" in fact["source_span"]
             assert "attributes" in fact
 
-    @patch("src.tools.refiner.get_llm")
+    @patch("src.tools.refiner.get_llm_with_fallbacks")
     def test_source_span_points_to_text(self, mock_get_llm):
         """source_span indices, when not None, should be valid offsets."""
-        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+        mock_get_llm.return_value.invoke.return_value = (
             _build_mock_extraction_result()
         )
         result = extract_facts(_REFINER_SAMPLE, {"metrics": "numeric value"})
@@ -241,10 +241,10 @@ class TestExtractFacts:
                 assert start >= 0
                 assert end >= start
 
-    @patch("src.tools.refiner.get_llm")
+    @patch("src.tools.refiner.get_llm_with_fallbacks")
     def test_empty_text_does_not_crash(self, mock_get_llm):
         """Passing empty text should return a result, not raise."""
-        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+        mock_get_llm.return_value.invoke.return_value = (
             FactExtractionResult(facts=[])
         )
         result = extract_facts("", {"dates": "date"})
@@ -253,10 +253,10 @@ class TestExtractFacts:
         assert "facts" in result
         assert result["facts"] == []
 
-    @patch("src.tools.refiner.get_llm")
+    @patch("src.tools.refiner.get_llm_with_fallbacks")
     def test_raw_jsonl_present(self, mock_get_llm):
         """Result should include a raw_jsonl key."""
-        mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+        mock_get_llm.return_value.invoke.return_value = (
             _build_mock_extraction_result()
         )
         result = extract_facts(_REFINER_SAMPLE, {"metrics": "numeric value"})

@@ -3,8 +3,8 @@
 import logging
 from langchain_core.prompts import ChatPromptTemplate
 from src.schema.state import AgentState, ResearchPlan
-from src.config import LIBRARIAN_MODEL, LIBRARIAN_PROVIDER
-from src.utils.llm_factory import get_llm
+from src.config import LIBRARIAN_MODEL, LIBRARIAN_PROVIDER, LIBRARIAN_FALLBACK_CHAIN
+from src.utils.llm_factory import get_llm_with_fallbacks
 from src.utils.retry import retry_on_rate_limit
 
 logger = logging.getLogger(__name__)
@@ -18,8 +18,12 @@ def librarian_node(state: AgentState) -> dict:
     iteration = state.get("iteration_count", 0)
     critique = state.get("critique", "")
 
-    llm = get_llm(LIBRARIAN_MODEL, LIBRARIAN_PROVIDER, temperature=0)
-    structured_llm = llm.with_structured_output(ResearchPlan)
+    structured_llm = get_llm_with_fallbacks(
+        LIBRARIAN_MODEL, LIBRARIAN_PROVIDER,
+        fallback_chain=LIBRARIAN_FALLBACK_CHAIN,
+        temperature=0,
+        structured_schema=ResearchPlan,
+    )
 
     system_prompt = (
         "You are an expert technical researcher. Your goal is to plan a deep-dive "

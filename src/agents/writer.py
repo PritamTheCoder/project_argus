@@ -4,8 +4,8 @@ with rigorous per-claim citation."""
 import logging
 from langchain_core.prompts import ChatPromptTemplate
 from src.schema.state import AgentState
-from src.config import WRITER_MODEL, WRITER_PROVIDER
-from src.utils.llm_factory import get_llm
+from src.config import WRITER_MODEL, WRITER_PROVIDER, WRITER_FALLBACK_CHAIN
+from src.utils.llm_factory import get_llm_with_fallbacks
 
 logger = logging.getLogger(__name__)
 
@@ -143,22 +143,15 @@ def writer_node(state: AgentState) -> dict:
         "evidence": evidence_text,
     }
 
-    def _invoke_writer(model: str, provider: str):
-        llm = get_llm(model, provider, temperature=0.7)
-        return (prompt | llm).invoke(invoke_payload)
-
-    # The Writer may be configured to use a heavier model (e.g. Nemotron). Guard
-    # the call so a provider/rate-limit error never blocks report generation —
-    # fall back to the default Gemini model.
-    try:
-        response = _invoke_writer(WRITER_MODEL, WRITER_PROVIDER)
-    except Exception as e:
-        from src.config import GEMINI_DEFAULT_MODEL
-        logger.warning(
-            f"Writer: primary model {WRITER_PROVIDER}/{WRITER_MODEL} failed ({e}). "
-            f"Falling back to gemini/{GEMINI_DEFAULT_MODEL}."
-        )
-        response = _invoke_writer(GEMINI_DEFAULT_MODEL, "gemini")
+    # The Writer may be configured to use a heavier model (e.g. Nemotron). The
+    # cross-provider ladder guards the call so a provider/rate-limit error never
+    # blocks report generation — it fails over through Kimi then Gemini.
+    llm = get_llm_with_fallbacks(
+        WRITER_MODEL, WRITER_PROVIDER,
+        fallback_chain=WRITER_FALLBACK_CHAIN,
+        temperature=0.7,
+    )
+    response = (prompt | llm).invoke(invoke_payload)
 
     report_content = response.content
 

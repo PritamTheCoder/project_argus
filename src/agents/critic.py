@@ -7,8 +7,8 @@ follow-up queries if necessary.
 import logging
 from langchain_core.prompts import ChatPromptTemplate
 from src.schema.state import AgentState, FactCheckResult
-from src.config import CRITIC_MODEL, CRITIC_PROVIDER
-from src.utils.llm_factory import get_llm
+from src.config import CRITIC_MODEL, CRITIC_PROVIDER, CRITIC_FALLBACK_CHAIN
+from src.utils.llm_factory import get_llm_with_fallbacks
 from src.utils.embeddings import get_embeddings
 
 logger = logging.getLogger(__name__)
@@ -55,8 +55,12 @@ def critic_node(state: AgentState) -> dict:
     for url, stats in source_stats.items():
         diversity_str += f"- {url} (Type: {stats['type']}, Credibility: {stats['credibility']}, Mentions: {stats['count']})\n"
         
-    llm = get_llm(CRITIC_MODEL, CRITIC_PROVIDER, temperature=0)
-    structured_llm = llm.with_structured_output(FactCheckResult)
+    structured_llm = get_llm_with_fallbacks(
+        CRITIC_MODEL, CRITIC_PROVIDER,
+        fallback_chain=CRITIC_FALLBACK_CHAIN,
+        temperature=0,
+        structured_schema=FactCheckResult,
+    )
     
     system_prompt = (
         "You are a rigorous Fact Checker, Reflector, and Source Cross-Referencing Engine. "
