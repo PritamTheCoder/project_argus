@@ -3,11 +3,37 @@
 import logging
 from langchain_core.prompts import ChatPromptTemplate
 from src.schema.state import AgentState, ResearchPlan
-from src.config import LIBRARIAN_MODEL, LIBRARIAN_PROVIDER, LIBRARIAN_FALLBACK_CHAIN
+from src.config import LIBRARIAN_MODEL, LIBRARIAN_PROVIDER, LIBRARIAN_FALLBACK_CHAIN, KG_LOOKUP_GLOBAL
 from src.utils.llm_factory import get_llm_with_fallbacks
 from src.utils.retry import retry_on_rate_limit
 
 logger = logging.getLogger(__name__)
+
+
+def _prior_knowledge_summary(query: str, k: int = 8, min_confidence: float = 0.6) -> str:
+    """Cross-session, high-confidence facts already covering this query, so the
+    Librarian can steer sub-queries away from ground already researched. Planning
+    signal only — never injected as this run's citable evidence. Gated on
+    KG_LOOKUP_GLOBAL (opt-in; same flag the kg_lookup tool uses)."""
+    if not KG_LOOKUP_GLOBAL:
+        return ""
+    try:
+        from src.utils.embeddings import get_embeddings
+        from src.graph.kg import kg_store
+        emb = get_embeddings([query])[0]
+        facts = kg_store.retrieve_relevant_facts(emb, k=k * 3, session_id=None)
+        strong = [
+            f for f in facts
+            if f.get("support_level") == "SUPPORTED" and (f.get("confidence") or 0) >= min_confidence
+        ][:k]
+        if not strong:
+            return ""
+        return "\n".join(
+            f"- {f['claim']} (source: {f.get('source_url', 'unknown')})" for f in strong
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Librarian: prior-knowledge lookup failed ({e}); planning without it.")
+        return ""
 
 
 def librarian_node(state: AgentState) -> dict:
@@ -45,6 +71,16 @@ def librarian_node(state: AgentState) -> dict:
             "Do NOT repeat queries from the previous iteration."
         )
         logger.info(f"Librarian: Iteration {iteration} — injecting critique for targeted gap-fill queries.")
+    elif iteration == 0:
+        prior_knowledge = _prior_knowledge_summary(query)
+        if prior_knowledge:
+            system_prompt += (
+                f"\n\nALREADY KNOWN (high-confidence, from prior research sessions):\n"
+                f"{prior_knowledge}\n\n"
+                "Do not generate sub-queries that would just re-derive the above. "
+                "Focus new queries on what is NOT covered by it."
+            )
+            logger.info("Librarian: Injected prior-knowledge summary from cross-run memory.")
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),

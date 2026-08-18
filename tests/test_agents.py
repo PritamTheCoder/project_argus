@@ -95,6 +95,62 @@ def test_librarian_no_critique_injection_on_first_iteration(mock_get_llm):
     mock_get_llm.assert_called_once()
 
 
+# ── Librarian: structural memory-reuse (Phase 4A.2) ───────────────────────────
+
+@patch("src.agents.librarian.get_llm_with_fallbacks")
+@patch("src.agents.librarian._prior_knowledge_summary")
+def test_librarian_checks_prior_knowledge_on_first_iteration_only(mock_summary, mock_get_llm):
+    """The prior-knowledge check runs on iteration 0, never on a critique-driven iteration."""
+    mock_summary.return_value = ""
+    mock_get_llm.return_value.return_value = ResearchPlan(search_queries=[
+        SearchIntent(query="q", mode="MIXED"),
+    ])
+
+    librarian_node(_base_state(iteration_count=0))
+    mock_summary.assert_called_once()
+
+    mock_summary.reset_mock()
+    librarian_node(_base_state(iteration_count=1, critique="gap"))
+    mock_summary.assert_not_called()
+
+
+def test_prior_knowledge_summary_disabled_by_default():
+    """KG_LOOKUP_GLOBAL off (the default) means no cross-run lookup happens at all."""
+    from src.agents.librarian import _prior_knowledge_summary
+    with patch("src.agents.librarian.KG_LOOKUP_GLOBAL", False):
+        assert _prior_knowledge_summary("any query") == ""
+
+
+def test_prior_knowledge_summary_filters_weak_facts():
+    """Only SUPPORTED, high-confidence facts are surfaced; weak/unsupported ones are dropped."""
+    from src.agents.librarian import _prior_knowledge_summary
+
+    store = MagicMock()
+    store.retrieve_relevant_facts.return_value = [
+        {"claim": "Strong fact", "source_url": "http://a.com", "support_level": "SUPPORTED", "confidence": 0.9},
+        {"claim": "Weak fact", "source_url": "http://b.com", "support_level": "SUPPORTED", "confidence": 0.2},
+        {"claim": "Unsupported fact", "source_url": "http://c.com", "support_level": "NOT_SUPPORTED", "confidence": 0.9},
+    ]
+    with patch("src.agents.librarian.KG_LOOKUP_GLOBAL", True), \
+         patch("src.utils.embeddings.get_embeddings", return_value=[[0.1] * 384]), \
+         patch("src.graph.kg.kg_store", store):
+        summary = _prior_knowledge_summary("query", min_confidence=0.6)
+
+    assert "Strong fact" in summary
+    assert "Weak fact" not in summary
+    assert "Unsupported fact" not in summary
+    # Global reuse must query without session scoping.
+    assert store.retrieve_relevant_facts.call_args.kwargs["session_id"] is None
+
+
+def test_prior_knowledge_summary_degrades_on_failure():
+    """A KG/embedding failure returns '' rather than raising — planning proceeds unaffected."""
+    from src.agents.librarian import _prior_knowledge_summary
+    with patch("src.agents.librarian.KG_LOOKUP_GLOBAL", True), \
+         patch("src.utils.embeddings.get_embeddings", side_effect=RuntimeError("embedding service down")):
+        assert _prior_knowledge_summary("query") == ""
+
+
 # ── Scout Tests ───────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
