@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import sqlite_vec
 import json
@@ -14,6 +15,7 @@ class KnowledgeGraph:
         self.db.enable_load_extension(True)
         sqlite_vec.load(self.db)
         self.db.enable_load_extension(False)
+        self.fts_available = True
         self._init_db()
 
     def _init_db(self):
@@ -75,6 +77,19 @@ class KnowledgeGraph:
             embedding float[384]
         );
         """)
+
+        # BM25 keyword index over chunks, fused with vec_chunks at query time so
+        # exact tokens (model numbers, tickers) aren't lost to embeddings alone.
+        # Degrades to vector-only if the SQLite build lacks FTS5.
+        try:
+            self.db.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                content, tokenize='porter unicode61'
+            );
+            """)
+        except sqlite3.OperationalError as e:
+            self.fts_available = False
+            logger.warning(f"FTS5 unavailable ({e}); BM25 chunk retrieval disabled, vector-only.")
 
         self.db.commit()
     
@@ -184,7 +199,11 @@ class KnowledgeGraph:
             cursor.execute("""
             INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)
             """, (chunk_id, self._serialize_f32(emb)))
-            
+            if self.fts_available:
+                cursor.execute("""
+                INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)
+                """, (chunk_id, chunk))
+
         self.db.commit()
         return doc_id
         
@@ -214,14 +233,48 @@ class KnowledgeGraph:
         """
         params = tuple(doc_ids) + (self._serialize_f32(query_embedding), k * 3)  # overfetch: doc_id filter is applied after the KNN MATCH
         cursor.execute(query, params)
-        
+
         results = []
         for row in cursor.fetchall():
             results.append((row[0], row[1]))
             if len(results) >= k:
                 break
-                
+
         return results
+
+    @staticmethod
+    def _fts5_match_expr(text: str) -> str:
+        """Quote each token individually so punctuation in ``text`` can't break FTS5 syntax."""
+        tokens = re.findall(r"\w+", text)
+        return " OR ".join(f'"{t}"' for t in tokens)
+
+    def retrieve_top_chunks_bm25(self, query_text: str, doc_ids: List[int], k: int = 8) -> List[tuple[int, str]]:
+        """Sparse (BM25) counterpart to ``retrieve_top_chunks``. Returns ``[]`` on
+        any failure so callers degrade to vector-only instead of erroring."""
+        if not doc_ids or not self.fts_available:
+            return []
+        match_expr = self._fts5_match_expr(query_text)
+        if not match_expr:
+            return []
+
+        cursor = self.db.cursor()
+        placeholders = ",".join(["?"] * len(doc_ids))
+        # MATCH must use the FTS5 table's real name, not its join alias `f`
+        # (SQLite raises "no such column: f" otherwise) — `f.rank` is fine.
+        query = f"""
+            SELECT c.doc_id, c.content
+            FROM chunks_fts f
+            JOIN chunks c ON c.id = f.rowid
+            WHERE chunks_fts MATCH ? AND c.doc_id IN ({placeholders})
+            ORDER BY f.rank
+            LIMIT ?
+        """
+        try:
+            cursor.execute(query, (match_expr, *doc_ids, k))
+            return [(row[0], row[1]) for row in cursor.fetchall()]
+        except sqlite3.OperationalError as e:
+            logger.warning(f"BM25 chunk retrieval failed ({e}); continuing vector-only.")
+            return []
 
     def get_doc_metadata(self, doc_id: int) -> dict:
         cursor = self.db.cursor()

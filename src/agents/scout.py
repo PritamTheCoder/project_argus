@@ -8,6 +8,7 @@ from src.tools.scraper import scrape_urls
 from src.agents.acquisition import gather_sources_for_query
 from src.utils.embeddings import get_embeddings
 from src.utils.rerank import rerank_chunks
+from src.utils.rrf import reciprocal_rank_fusion
 from src.utils.source_scoring import evaluate_source
 from src.config import MAX_CHUNK_TOKENS, TOP_K_CHUNKS, SCOUT_CONCURRENCY
 
@@ -197,10 +198,13 @@ async def scout_node(state: AgentState) -> dict:
                 logger.warning("Skipping indexing due to missing query embedding.")
 
         if query_emb is not None:
-            logger.info("Scout: Performing Hierarchical Retrieval...")
+            logger.info("Scout: Performing Hierarchical Retrieval (vector + BM25)...")
             top_doc_ids = kg_store.retrieve_top_docs(query_emb, k=10)
-            top_retrieved = kg_store.retrieve_top_chunks(query_emb, top_doc_ids, k=TOP_K_CHUNKS * 2)  # extra for reranker
-            top_stage2_chunks = [chunk for doc_id, chunk in top_retrieved]
+            # Fuse dense (vector) and sparse (BM25) chunk candidates before reranking.
+            vector_chunks = kg_store.retrieve_top_chunks(query_emb, top_doc_ids, k=TOP_K_CHUNKS * 2)
+            bm25_chunks = kg_store.retrieve_top_chunks_bm25(q, top_doc_ids, k=TOP_K_CHUNKS * 2)
+            candidate_pairs = reciprocal_rank_fusion([vector_chunks, bm25_chunks])[:TOP_K_CHUNKS * 2]
+            top_stage2_chunks = [chunk for doc_id, chunk in candidate_pairs]
 
             best_chunks = top_stage2_chunks[:TOP_K_CHUNKS]
             try:
@@ -213,7 +217,7 @@ async def scout_node(state: AgentState) -> dict:
             # Parent Document Retrieval — map ranked chunks back to their exact
             # source docs (consuming each occurrence so duplicate chunk text across
             # documents is never misattributed to a single arbitrary source).
-            best_pairs = _align_reranked_to_docs(best_chunks, top_retrieved)
+            best_pairs = _align_reranked_to_docs(best_chunks, candidate_pairs)
             best_doc_ids = list({doc_id for doc_id, _ in best_pairs})
 
             doc_all_chunks = kg_store.get_all_chunks_for_docs(best_doc_ids)
