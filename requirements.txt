@@ -14,6 +14,12 @@ openai
 PyMuPDF
 aiohttp
 httpx
+fastapi
+uvicorn[standard]
 # Optional: enables loading tools from external MCP servers (Phase 3).
 # The system runs fine without it (MCP simply stays disabled).
 langchain-mcp-adapters
+
+# Test tooling
+pytest
+pytest-asyncio
