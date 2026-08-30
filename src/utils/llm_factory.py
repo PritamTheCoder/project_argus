@@ -21,11 +21,11 @@ from langchain_openai import ChatOpenAI
 
 from src.config import (
     GEMINI_DEFAULT_MODEL, GEMINI_MAX_RETRIES, GEMINI_TIMEOUT,
-    GEMINI_RPM, GROQ_RPM, OPENAI_RPM, NVIDIA_RPM, NEMOTRON_RPM, STEP_RPM, KIMI_RPM,
+    GEMINI_RPM, GROQ_RPM, OPENAI_RPM, NVIDIA_RPM, NEMOTRON_RPM, STEP_RPM, KIMI_RPM, GLM_RPM,
     RATE_LIMIT_BURST,
     NVIDIA_BASE_URL, NIM_TIMEOUT,
     NVIDIA_API_NEMOTRON3_KEY, NEMOTRON_REASONING_BUDGET,
-    STEP_API_KEY, KIMI_API_KEY,
+    STEP_API_KEY, KIMI_API_KEY, GLM_API_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,13 +47,14 @@ _PROVIDER_RPM = {
     "nemotron": NEMOTRON_RPM,
     "step": STEP_RPM,
     "kimi": KIMI_RPM,
+    "glm": GLM_RPM,
 }
 _rate_limiters: dict[str, InMemoryRateLimiter] = {}
 
 # NVIDIA NIM providers reached via the OpenAI-compatible endpoint. Each maps to
 # its own key + optional reasoning `extra_body`. Keys/extra_body are read at
 # call time (via the helper below) so they stay patch-friendly for tests.
-_NIM_PROVIDERS = ("nemotron", "step", "kimi")
+_NIM_PROVIDERS = ("nemotron", "step", "kimi", "glm")
 
 
 def _nim_spec(provider: str) -> tuple[str, dict | None]:
@@ -67,6 +68,8 @@ def _nim_spec(provider: str) -> tuple[str, dict | None]:
         return STEP_API_KEY, None  # multimodal chat; no reasoning extra_body
     if provider == "kimi":
         return KIMI_API_KEY, None  # plain large-context chat; no reasoning extra_body
+    if provider == "glm":
+        return GLM_API_KEY, None  # no reasoning extra_body; plain chat/structured-output mode
     return "", None
 
 
@@ -149,7 +152,7 @@ def _create_llm(model_name: str, provider: str, temperature: float) -> BaseChatM
         )
 
     elif provider in _NIM_PROVIDERS:
-        # NVIDIA NIM models (Nemotron / Step / Kimi) via the OpenAI-compatible
+        # NVIDIA NIM models (Nemotron / Step / Kimi / GLM) via the OpenAI-compatible
         # endpoint. Each has its own key (own quota) and optional reasoning params.
         api_key, extra_body = _nim_spec(provider)
         kwargs = dict(
@@ -181,7 +184,7 @@ def _create_llm(model_name: str, provider: str, temperature: float) -> BaseChatM
     else:
         raise ValueError(
             f"Unsupported LLM provider: '{provider}'. "
-            "Supported: ['gemini', 'groq', 'openai', 'nvidia', 'nemotron', 'step', 'kimi']"
+            "Supported: ['gemini', 'groq', 'openai', 'nvidia', 'nemotron', 'step', 'kimi', 'glm']"
         )
 
 
