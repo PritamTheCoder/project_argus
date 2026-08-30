@@ -153,7 +153,17 @@ def test_prior_knowledge_summary_degrades_on_failure():
 
 # ── Scout Tests ───────────────────────────────────────────────────────────────
 
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _fake_shared_crawler():
+    """Scout opens a real browser via shared_crawler() — stub it out in tests."""
+    yield MagicMock()
+
+
 @pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
 @patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock)
 @patch("src.agents.scout.scrape_urls", new_callable=AsyncMock)
 @patch("src.agents.scout.get_embeddings")

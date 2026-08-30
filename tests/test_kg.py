@@ -80,6 +80,39 @@ def test_kg_session_scoping():
         pass
 
 
+def test_kg_docs_session_scoping():
+    """retrieve_top_docs is scoped like facts: concurrent runs can't see each other's docs."""
+    tmp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(tmp_dir, "test_kg_docs_session.db")
+    kg = KnowledgeGraph(db_path)
+
+    kg.store_document_and_chunks(
+        url="http://a.com", query="q", summary="s", summary_embedding=[0.1] * 384,
+        chunks=["chunk a"], chunk_embeddings=[[0.1] * 384], session_id="sessA",
+    )
+    kg.store_document_and_chunks(
+        url="http://b.com", query="q", summary="s", summary_embedding=[0.1] * 384,
+        chunks=["chunk b"], chunk_embeddings=[[0.1] * 384], session_id="sessB",
+    )
+
+    emb = [0.1] * 384
+    scoped_ids = kg.retrieve_top_docs(emb, k=10, session_id="sessA")
+    assert len(scoped_ids) == 1
+    assert kg.get_doc_metadata(scoped_ids[0])["url"] == "http://a.com"
+
+    full_ids = kg.retrieve_top_docs(emb, k=10)
+    assert len(full_ids) == 2
+
+    kg.db.close()
+    del kg
+    gc.collect()
+    try:
+        os.remove(db_path)
+        os.rmdir(tmp_dir)
+    except PermissionError:
+        pass
+
+
 def test_kg_bm25_chunk_retrieval():
     """Chunks are indexed into FTS5 alongside the vector index and are keyword-searchable."""
     tmp_dir = tempfile.mkdtemp()

@@ -5,6 +5,7 @@ import os
 import asyncio
 import logging
 import warnings
+from contextlib import asynccontextmanager
 import aiohttp
 import fitz  # PyMuPDF
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
@@ -301,13 +302,37 @@ async def _scrape_single(
         }
 
 
-async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
+def _browser_config() -> BrowserConfig:
+    return BrowserConfig(headless=True, verbose=False)
+
+
+@asynccontextmanager
+async def shared_crawler():
+    """One browser instance for a whole batch of ``scrape_urls()`` calls.
+
+    Scout gathers/scrapes up to ``SCOUT_CONCURRENCY`` sub-queries at once; each
+    call to ``scrape_urls()`` used to open its own ``AsyncWebCrawler`` (its own
+    Chromium process, which itself spawns several OS processes). Launching
+    several of those simultaneously can exhaust the OS commit/paging limit
+    (observed as Windows ``WinError 1455``). Open one crawler per Scout run
+    and pass it into every ``scrape_urls()`` call instead.
+    """
+    async with AsyncWebCrawler(config=_browser_config()) as crawler:
+        yield crawler
+
+
+async def scrape_urls(urls: list[str], query: str = "", crawler: AsyncWebCrawler | None = None) -> list[dict]:
     """
     Scrape multiple URLs concurrently using Crawl4AI.
 
     Fetches the full DOM, strips boilerplate (navbars, ads, footers),
     and returns clean Markdown for each page. Failed URLs return
     structured errors instead of crashing the pipeline.
+
+    ``crawler``: reuse an existing ``AsyncWebCrawler`` (see ``shared_crawler()``)
+    instead of opening a new browser for this call. If omitted, one is opened
+    and closed just for this call — fine for a single one-off scrape, but
+    concurrent callers should share one via ``shared_crawler()``.
 
     Returns:
         List of result dicts, each with keys:
@@ -321,11 +346,6 @@ async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
 
     logger.info(f"Scraping {len(urls)} URLs concurrently...")
 
-    browser_config = BrowserConfig(
-        headless=True,
-        verbose=False,
-    )
-
     run_config = CrawlerRunConfig(
         word_count_threshold=10,
         excluded_tags=["nav", "footer", "header", "aside", "script", "style"],
@@ -333,15 +353,11 @@ async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
         page_timeout=SCRAPE_TIMEOUT * 1000,  # ms — Playwright-native timeout
     )
 
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        tasks = [
-            _scrape_single(crawler, url, run_config, query)
-            for url in urls
-        ]
-        # Use return_exceptions=True to prevent a single TargetClosedError from crashing the batch
-        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-        # Give Playwright time to clean up frames / pending navigations
-        await asyncio.sleep(1.0)
+    if crawler is not None:
+        raw_results = await _scrape_batch(crawler, urls, run_config, query)
+    else:
+        async with shared_crawler() as owned_crawler:
+            raw_results = await _scrape_batch(owned_crawler, urls, run_config, query)
 
     results = []
     for url, res in zip(urls, raw_results):
@@ -360,3 +376,12 @@ async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
     logger.info(f"Scraping complete: {successful}/{len(urls)} succeeded")
 
     return results
+
+
+async def _scrape_batch(crawler: AsyncWebCrawler, urls: list[str], run_config: CrawlerRunConfig, query: str) -> list:
+    tasks = [_scrape_single(crawler, url, run_config, query) for url in urls]
+    # Use return_exceptions=True to prevent a single TargetClosedError from crashing the batch
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Give Playwright time to clean up frames / pending navigations
+    await asyncio.sleep(1.0)
+    return raw_results

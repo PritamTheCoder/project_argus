@@ -4,6 +4,7 @@ import sqlite_vec
 import json
 import logging
 import struct
+import threading
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -16,6 +17,10 @@ class KnowledgeGraph:
         sqlite_vec.load(self.db)
         self.db.enable_load_extension(False)
         self.fts_available = True
+        # kg_store is a process-wide singleton but the API runs each job in its
+        # own OS thread, and sqlite3.Connection isn't safe under real concurrent
+        # access from multiple threads — every method below takes this lock.
+        self._lock = threading.RLock()
         self._init_db()
 
     def _init_db(self):
@@ -58,6 +63,11 @@ class KnowledgeGraph:
             summary TEXT
         )
         """)
+        # Scopes doc/chunk retrieval to the run that scraped them — same fix
+        # Phase 0 applied to `facts`, needed now that concurrent API requests
+        # can have multiple runs' docs in the table at once.
+        self._ensure_column("docs", "session_id", "TEXT")
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_docs_session ON docs(session_id)")
         self.db.execute("""
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_docs USING vec0(
             embedding float[384]
@@ -110,20 +120,21 @@ class KnowledgeGraph:
         if not facts_with_embeddings:
             return
 
-        cursor = self.db.cursor()
-        for fact in facts_with_embeddings:
-            cursor.execute("""
-            INSERT INTO facts (claim, source_url, source_excerpt, support_level, confidence, credibility_score, source_type, session_id, support_quote, corroboration_count, as_of_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (fact["claim"], fact["source_url"], fact["source_excerpt"], fact["support_level"], fact["confidence"], fact.get("credibility_score", 0.4), fact.get("source_type", "Unverified/Web"), session_id or fact.get("session_id", ""), fact.get("support_quote", ""), fact.get("corroboration_count"), fact.get("as_of_date", "")))
+        with self._lock:
+            cursor = self.db.cursor()
+            for fact in facts_with_embeddings:
+                cursor.execute("""
+                INSERT INTO facts (claim, source_url, source_excerpt, support_level, confidence, credibility_score, source_type, session_id, support_quote, corroboration_count, as_of_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (fact["claim"], fact["source_url"], fact["source_excerpt"], fact["support_level"], fact["confidence"], fact.get("credibility_score", 0.4), fact.get("source_type", "Unverified/Web"), session_id or fact.get("session_id", ""), fact.get("support_quote", ""), fact.get("corroboration_count"), fact.get("as_of_date", "")))
 
-            fact_id = cursor.lastrowid
+                fact_id = cursor.lastrowid
 
-            cursor.execute("""
-            INSERT INTO vec_facts(rowid, embedding) VALUES (?, ?)
-            """, (fact_id, self._serialize_f32(fact["embedding"])))
+                cursor.execute("""
+                INSERT INTO vec_facts(rowid, embedding) VALUES (?, ?)
+                """, (fact_id, self._serialize_f32(fact["embedding"])))
 
-        self.db.commit()
+            self.db.commit()
         logger.info(f"Stored {len(facts_with_embeddings)} facts into Knowledge Graph (session={session_id or 'global'}).")
 
     def retrieve_relevant_facts(self, query_embedding: List[float], k: int = 5, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -138,27 +149,29 @@ class KnowledgeGraph:
         # Over-fetch when scoping so the session filter still yields up to k results.
         fetch_k = k if not session_id else max(k * 10, 100)
 
-        cursor = self.db.cursor()
-        cursor.execute("""
-            SELECT
-                f.id,
-                f.claim,
-                f.source_url,
-                f.source_excerpt,
-                f.support_level,
-                f.confidence,
-                f.credibility_score,
-                f.source_type,
-                f.session_id,
-                DISTANCE
-            FROM vec_facts v
-            JOIN facts f ON f.id = v.rowid
-            WHERE embedding MATCH ? AND k = ?
-            ORDER BY distance ASC
-        """, (self._serialize_f32(query_embedding), fetch_k))
+        with self._lock:
+            cursor = self.db.cursor()
+            cursor.execute("""
+                SELECT
+                    f.id,
+                    f.claim,
+                    f.source_url,
+                    f.source_excerpt,
+                    f.support_level,
+                    f.confidence,
+                    f.credibility_score,
+                    f.source_type,
+                    f.session_id,
+                    DISTANCE
+                FROM vec_facts v
+                JOIN facts f ON f.id = v.rowid
+                WHERE embedding MATCH ? AND k = ?
+                ORDER BY distance ASC
+            """, (self._serialize_f32(query_embedding), fetch_k))
+            rows = cursor.fetchall()
 
         results = []
-        for row in cursor.fetchall():
+        for row in rows:
             if session_id and row[8] != session_id:
                 continue
             results.append({
@@ -177,65 +190,86 @@ class KnowledgeGraph:
                 break
         return results
 
-    def store_document_and_chunks(self, url: str, query: str, summary: str, summary_embedding: List[float], chunks: List[str], chunk_embeddings: List[List[float]]) -> int:
-        cursor = self.db.cursor()
-        cursor.execute("""
-        INSERT INTO docs (url, query, summary)
-        VALUES (?, ?, ?)
-        """, (url, query, summary))
-        
-        doc_id = cursor.lastrowid
-        cursor.execute("""
-        INSERT INTO vec_docs(rowid, embedding) VALUES (?, ?)
-        """, (doc_id, self._serialize_f32(summary_embedding)))
-        
-        for chunk, emb in zip(chunks, chunk_embeddings):
-            if not chunk.strip():
-                continue
+    def store_document_and_chunks(
+        self, url: str, query: str, summary: str, summary_embedding: List[float],
+        chunks: List[str], chunk_embeddings: List[List[float]], session_id: str = "",
+    ) -> int:
+        with self._lock:
+            cursor = self.db.cursor()
             cursor.execute("""
-            INSERT INTO chunks (doc_id, content) VALUES (?, ?)
-            """, (doc_id, chunk))
-            chunk_id = cursor.lastrowid
-            cursor.execute("""
-            INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)
-            """, (chunk_id, self._serialize_f32(emb)))
-            if self.fts_available:
-                cursor.execute("""
-                INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)
-                """, (chunk_id, chunk))
+            INSERT INTO docs (url, query, summary, session_id)
+            VALUES (?, ?, ?, ?)
+            """, (url, query, summary, session_id))
 
-        self.db.commit()
-        return doc_id
+            doc_id = cursor.lastrowid
+            cursor.execute("""
+            INSERT INTO vec_docs(rowid, embedding) VALUES (?, ?)
+            """, (doc_id, self._serialize_f32(summary_embedding)))
+
+            for chunk, emb in zip(chunks, chunk_embeddings):
+                if not chunk.strip():
+                    continue
+                cursor.execute("""
+                INSERT INTO chunks (doc_id, content) VALUES (?, ?)
+                """, (doc_id, chunk))
+                chunk_id = cursor.lastrowid
+                cursor.execute("""
+                INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)
+                """, (chunk_id, self._serialize_f32(emb)))
+                if self.fts_available:
+                    cursor.execute("""
+                    INSERT INTO chunks_fts(rowid, content) VALUES (?, ?)
+                    """, (chunk_id, chunk))
+
+            self.db.commit()
+            return doc_id
         
-    def retrieve_top_docs(self, query_embedding: List[float], k: int = 5) -> List[int]:
-        cursor = self.db.cursor()
-        cursor.execute("""
-            SELECT rowid FROM vec_docs
-            WHERE embedding MATCH ? AND k = ?
-            ORDER BY distance ASC
-        """, (self._serialize_f32(query_embedding), k))
-        return [row[0] for row in cursor.fetchall()]
+    def retrieve_top_docs(self, query_embedding: List[float], k: int = 5, session_id: Optional[str] = None) -> List[int]:
+        """Scoped like ``retrieve_relevant_facts``: over-fetch then filter by
+        session in Python, since the vec0 KNN cut happens before any JOIN."""
+        fetch_k = k if not session_id else max(k * 10, 100)
+        with self._lock:
+            cursor = self.db.cursor()
+            cursor.execute("""
+                SELECT v.rowid, d.session_id
+                FROM vec_docs v
+                JOIN docs d ON d.id = v.rowid
+                WHERE embedding MATCH ? AND k = ?
+                ORDER BY distance ASC
+            """, (self._serialize_f32(query_embedding), fetch_k))
+            rows = cursor.fetchall()
+
+        results = []
+        for doc_id, row_session in rows:
+            if session_id and row_session != session_id:
+                continue
+            results.append(doc_id)
+            if len(results) >= k:
+                break
+        return results
 
     def retrieve_top_chunks(self, query_embedding: List[float], doc_ids: List[int], k: int = 8) -> List[tuple[int, str]]:
         if not doc_ids:
             return []
-        
-        cursor = self.db.cursor()
-        placeholders = ",".join(["?"] * len(doc_ids))
-        
-        query = f"""
-            SELECT c.doc_id, c.content 
-            FROM vec_chunks v
-            JOIN chunks c ON c.id = v.rowid
-            WHERE c.doc_id IN ({placeholders})
-              AND v.embedding MATCH ? AND v.k = ?
-            ORDER BY v.distance ASC
-        """
-        params = tuple(doc_ids) + (self._serialize_f32(query_embedding), k * 3)  # overfetch: doc_id filter is applied after the KNN MATCH
-        cursor.execute(query, params)
+
+        with self._lock:
+            cursor = self.db.cursor()
+            placeholders = ",".join(["?"] * len(doc_ids))
+
+            query = f"""
+                SELECT c.doc_id, c.content
+                FROM vec_chunks v
+                JOIN chunks c ON c.id = v.rowid
+                WHERE c.doc_id IN ({placeholders})
+                  AND v.embedding MATCH ? AND v.k = ?
+                ORDER BY v.distance ASC
+            """
+            params = tuple(doc_ids) + (self._serialize_f32(query_embedding), k * 3)  # overfetch: doc_id filter is applied after the KNN MATCH
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
 
         results = []
-        for row in cursor.fetchall():
+        for row in rows:
             results.append((row[0], row[1]))
             if len(results) >= k:
                 break
@@ -257,7 +291,6 @@ class KnowledgeGraph:
         if not match_expr:
             return []
 
-        cursor = self.db.cursor()
         placeholders = ",".join(["?"] * len(doc_ids))
         # MATCH must use the FTS5 table's real name, not its join alias `f`
         # (SQLite raises "no such column: f" otherwise) — `f.rank` is fine.
@@ -270,40 +303,45 @@ class KnowledgeGraph:
             LIMIT ?
         """
         try:
-            cursor.execute(query, (match_expr, *doc_ids, k))
-            return [(row[0], row[1]) for row in cursor.fetchall()]
+            with self._lock:
+                cursor = self.db.cursor()
+                cursor.execute(query, (match_expr, *doc_ids, k))
+                return [(row[0], row[1]) for row in cursor.fetchall()]
         except sqlite3.OperationalError as e:
             logger.warning(f"BM25 chunk retrieval failed ({e}); continuing vector-only.")
             return []
 
     def get_doc_metadata(self, doc_id: int) -> dict:
-        cursor = self.db.cursor()
-        cursor.execute("SELECT url, query, summary FROM docs WHERE id=?", (doc_id,))
-        row = cursor.fetchone()
+        with self._lock:
+            cursor = self.db.cursor()
+            cursor.execute("SELECT url, query, summary FROM docs WHERE id=?", (doc_id,))
+            row = cursor.fetchone()
         if row:
             return {"url": row[0], "query": row[1], "summary": row[2]}
         return {}
-        
+
     def get_all_chunks_for_docs(self, doc_ids: List[int]) -> Dict[int, List[str]]:
         """Retrieve all chunks for the given document IDs, ordered by their original sequence."""
         if not doc_ids:
             return {}
-            
-        cursor = self.db.cursor()
-        placeholders = ",".join(["?"] * len(doc_ids))
-        
-        query = f"""
-            SELECT doc_id, content 
-            FROM chunks 
-            WHERE doc_id IN ({placeholders})
-            ORDER BY doc_id, id ASC
-        """
-        cursor.execute(query, tuple(doc_ids))
-        
+
+        with self._lock:
+            cursor = self.db.cursor()
+            placeholders = ",".join(["?"] * len(doc_ids))
+
+            query = f"""
+                SELECT doc_id, content
+                FROM chunks
+                WHERE doc_id IN ({placeholders})
+                ORDER BY doc_id, id ASC
+            """
+            cursor.execute(query, tuple(doc_ids))
+            rows = cursor.fetchall()
+
         results = {doc_id: [] for doc_id in doc_ids}
-        for row in cursor.fetchall():
+        for row in rows:
             results[row[0]].append(row[1])
-            
+
         return results
 
     def find_gaps(self, query_embedding: List[float], k: int = 20, session_id: Optional[str] = None) -> List[str]:
@@ -316,17 +354,19 @@ class KnowledgeGraph:
         """
         fetch_k = k if not session_id else max(k * 10, 100)
         try:
-            cursor = self.db.cursor()
-            cursor.execute("""
-                SELECT f.claim, f.support_level, f.confidence, f.session_id
-                FROM vec_facts v
-                JOIN facts f ON f.id = v.rowid
-                WHERE embedding MATCH ? AND k = ?
-                ORDER BY distance ASC
-            """, (self._serialize_f32(query_embedding), fetch_k))
+            with self._lock:
+                cursor = self.db.cursor()
+                cursor.execute("""
+                    SELECT f.claim, f.support_level, f.confidence, f.session_id
+                    FROM vec_facts v
+                    JOIN facts f ON f.id = v.rowid
+                    WHERE embedding MATCH ? AND k = ?
+                    ORDER BY distance ASC
+                """, (self._serialize_f32(query_embedding), fetch_k))
+                rows = cursor.fetchall()
 
             gaps = []
-            for row in cursor.fetchall():
+            for row in rows:
                 claim, support_level, confidence, row_session = row
                 if session_id and row_session != session_id:
                     continue
@@ -340,13 +380,18 @@ class KnowledgeGraph:
             return []
 
     def clear_scratchpad(self):
-        """Clear out temporary documents and chunks from the vector database. Keeps verified facts."""
-        cursor = self.db.cursor()
-        cursor.execute("DELETE FROM docs")
-        cursor.execute("DELETE FROM vec_docs")
-        cursor.execute("DELETE FROM chunks")
-        cursor.execute("DELETE FROM vec_chunks")
-        self.db.commit()
+        """Clear out ALL temporary documents and chunks (every session). Keeps
+        verified facts. Not called automatically by the pipeline anymore now
+        that doc/chunk retrieval is session-scoped — kept for manual/admin use."""
+        with self._lock:
+            cursor = self.db.cursor()
+            cursor.execute("DELETE FROM docs")
+            cursor.execute("DELETE FROM vec_docs")
+            cursor.execute("DELETE FROM chunks")
+            cursor.execute("DELETE FROM vec_chunks")
+            if self.fts_available:
+                cursor.execute("DELETE FROM chunks_fts")
+            self.db.commit()
         logger.info("Cleared Vector DB scratchpad (docs and chunks).")
 
 kg_store = KnowledgeGraph()

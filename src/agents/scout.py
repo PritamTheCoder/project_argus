@@ -4,7 +4,7 @@ builds the raw data payload."""
 import asyncio
 import logging
 from src.schema.state import AgentState
-from src.tools.scraper import scrape_urls
+from src.tools.scraper import scrape_urls, shared_crawler
 from src.agents.acquisition import gather_sources_for_query
 from src.utils.embeddings import get_embeddings
 from src.utils.rerank import rerank_chunks
@@ -122,7 +122,7 @@ async def scout_node(state: AgentState) -> dict:
     initial_seen = {v["url"] for v in source_map.values()}
     sem = asyncio.Semaphore(max(SCOUT_CONCURRENCY, 1))
 
-    async def _gather_and_scrape(intent) -> tuple[str, list, list]:
+    async def _gather_and_scrape(intent, crawler) -> tuple[str, list, list]:
         q, mode_str = _parse_intent(intent)
         async with sem:
             logger.info(f"Scout: Processing query '{q}' with mode '{mode_str}'")
@@ -139,7 +139,7 @@ async def scout_node(state: AgentState) -> dict:
                 f"Scout: {len(candidates)} candidate(s) for '{q}' "
                 f"({len(prefetched)} prefetched, {len(scrape_targets)} to scrape)."
             )
-            scraped = await scrape_urls(scrape_targets, query=q) if scrape_targets else []
+            scraped = await scrape_urls(scrape_targets, query=q, crawler=crawler) if scrape_targets else []
             results = [
                 {"url": c["url"], "content": c["content"], "success": True}
                 for c in prefetched
@@ -147,7 +147,11 @@ async def scout_node(state: AgentState) -> dict:
             results.extend(scraped)
             return q, candidates, results
 
-    gathered = await asyncio.gather(*[_gather_and_scrape(intent) for intent in queries])
+    # One browser shared across every concurrent sub-query (see shared_crawler()
+    # docstring) instead of one per sub-query — avoids launching SCOUT_CONCURRENCY
+    # Chromium processes at once.
+    async with shared_crawler() as crawler:
+        gathered = await asyncio.gather(*[_gather_and_scrape(intent, crawler) for intent in queries])
 
     # ── Phase B: index + hierarchically retrieve + register (SEQUENTIAL) ──────
     # Kept sequential so shared state (next_id, source_map, registered_urls, and
@@ -185,12 +189,13 @@ async def scout_node(state: AgentState) -> dict:
                     summary_emb = get_embeddings([summary])[0]
                     chunk_embs = get_embeddings(chunks)
                     doc_id = kg_store.store_document_and_chunks(
-                        url=res["url"], 
-                        query=q, 
-                        summary=summary, 
-                        summary_embedding=summary_emb, 
-                        chunks=chunks, 
-                        chunk_embeddings=chunk_embs
+                        url=res["url"],
+                        query=q,
+                        summary=summary,
+                        summary_embedding=summary_emb,
+                        chunks=chunks,
+                        chunk_embeddings=chunk_embs,
+                        session_id=session_id,
                     )
                 except Exception as e:
                     logger.error(f"Failed to index document: {e}")
@@ -199,7 +204,7 @@ async def scout_node(state: AgentState) -> dict:
 
         if query_emb is not None:
             logger.info("Scout: Performing Hierarchical Retrieval (vector + BM25)...")
-            top_doc_ids = kg_store.retrieve_top_docs(query_emb, k=10)
+            top_doc_ids = kg_store.retrieve_top_docs(query_emb, k=10, session_id=session_id)
             # Fuse dense (vector) and sparse (BM25) chunk candidates before reranking.
             vector_chunks = kg_store.retrieve_top_chunks(query_emb, top_doc_ids, k=TOP_K_CHUNKS * 2)
             bm25_chunks = kg_store.retrieve_top_chunks_bm25(q, top_doc_ids, k=TOP_K_CHUNKS * 2)
