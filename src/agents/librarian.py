@@ -93,9 +93,14 @@ def librarian_node(state: AgentState) -> dict:
     logger.info(f"Librarian: Generated {len(result.search_queries)} queries.")
     
     plan_dicts = [intent.model_dump() for intent in result.search_queries]
-    
-    return {
+
+    result_dict = {
         "plan": plan_dicts,
         "active_node": "librarian"
     }
+    # original_plan is set once, on the first pass only, so the Critic can
+    # measure coverage against it even after `plan` moves on to follow-ups.
+    if iteration == 0:
+        result_dict["original_plan"] = plan_dicts
+    return result_dict
 
