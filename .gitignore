@@ -25,3 +25,13 @@ upd.md
 eval/*
 SETUP.md
 tests/test_eval_metrics.py
+
+# Bench harness code is tracked; its run outputs are not.
+bench/results/
+bench/report/
+
+# Local run artifacts
+.DS_Store
+*.log
+response_*.json
+spacex.md
