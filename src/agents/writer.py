@@ -10,6 +10,20 @@ from src.utils.llm_factory import get_llm_with_fallbacks
 logger = logging.getLogger(__name__)
 
 
+def _as_text(content) -> str:
+    """response.content is a str for most providers, but a list of blocks for
+    some (e.g. Gemini). Flatten either into one string."""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict):
+            parts.append(block.get("text", ""))
+    return "".join(parts)
+
+
 def writer_node(state: AgentState) -> dict:
     """Write the final report."""
     logger.info("Writer: Synthesizing report...")
@@ -153,7 +167,7 @@ def writer_node(state: AgentState) -> dict:
     )
     response = (prompt | llm).invoke(invoke_payload)
 
-    report_content = response.content
+    report_content = _as_text(response.content)
 
     # Prepend a compact research-quality banner so the trust signals are visible
     # at a glance (also useful for PDF/UI headers downstream).
