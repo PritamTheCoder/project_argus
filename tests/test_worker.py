@@ -4,17 +4,18 @@ from unittest.mock import MagicMock, patch
 from src.api.worker import _run
 
 
-async def _fake_stream_success(query, thread_id=None):
+async def _fake_stream_success(query, thread_id=None, callbacks=None):
     yield "librarian", {"plan": [{"query": "q1", "mode": "MIXED"}]}
     yield "scout", {"scraped_data": [{"url": "http://a.com"}]}
     yield "__final__", {
         "report": "final report text",
         "source_map": {"[1]": {"url": "http://a.com"}},
         "quality_score": {"coverage": 0.9},
+        "node_seconds": {"librarian": 1.2, "scout": 3.4},
     }
 
 
-async def _fake_stream_failure(query, thread_id=None):
+async def _fake_stream_failure(query, thread_id=None, callbacks=None):
     yield "librarian", {"plan": []}
     raise RuntimeError("provider outage")
 
@@ -35,6 +36,8 @@ async def test_run_updates_job_progress_then_marks_done(mock_store):
     assert final_call["report"] == "final report text"
     assert final_call["source_map"] == {"[1]": {"url": "http://a.com"}}
     assert final_call["quality_score"] == {"coverage": 0.9}
+    assert final_call["usage"]["node_seconds"] == {"librarian": 1.2, "scout": 3.4}
+    assert "llm" in final_call["usage"]
 
 
 @pytest.mark.asyncio
@@ -47,3 +50,4 @@ async def test_run_marks_job_error_on_exception(mock_store):
     error_call = calls[-1]
     assert error_call["status"] == "error"
     assert "provider outage" in error_call["error"]
+    assert "llm" in error_call["usage"]
