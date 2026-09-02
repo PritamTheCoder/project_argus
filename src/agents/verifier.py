@@ -5,6 +5,7 @@ import re
 from difflib import SequenceMatcher
 from src.schema.state import AgentState
 from src.utils.llm_factory import get_llm_with_fallbacks
+from src.utils.grounding import _fact_source_key
 from src.config import VERIFY_BATCH_SIZE, MAX_FACTS_TO_VERIFY
 from pydantic import BaseModel, Field
 from typing import Literal, List
@@ -41,14 +42,20 @@ def _normalize_claim(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _deduplicate_facts(facts: list[dict], sim_threshold: float = 0.88) -> list[dict]:
+def _merge_duplicate_facts(facts: list[dict], sim_threshold: float = 0.88) -> list[dict]:
     """
-    Remove near-duplicate claims using difflib ratio comparison.
+    Collapse near-duplicate claims into one canonical fact, recording every
+    distinct source that stated it in ``merged_sources``.
 
-    Two claims are considered duplicates when their normalised text similarity
-    exceeds ``sim_threshold``. The first occurrence (highest-credibility source
-    is sorted to the front before comparison) is kept; later near-duplicates
-    are dropped.  O(n²) but fast enough for the typical 200-500 fact range.
+    Two claims are duplicates when their normalised text similarity exceeds
+    ``sim_threshold``. The highest-credibility copy is kept as canonical.
+
+    A duplicate is MERGED, not dropped: when several sources restate the same
+    measurement, that restatement *is* the cross-source corroboration signal
+    ``annotate_corroboration`` looks for downstream. Merging keeps the token
+    saving — one claim still goes to the verifier — without destroying it.
+
+    O(n²) but fast enough for the typical 200-500 fact range.
     """
     # Sort so higher-credibility facts are seen first and kept as the canonical copy.
     sorted_facts = sorted(facts, key=lambda f: -f.get("credibility_score", 0.4))
@@ -58,13 +65,22 @@ def _deduplicate_facts(facts: list[dict], sim_threshold: float = 0.88) -> list[d
         norm = _normalize_claim(fact.get("claim", ""))
         if not norm:
             continue
-        duplicate = any(
-            SequenceMatcher(None, norm, s).ratio() >= sim_threshold
-            for s in seen_norms
-        )
-        if not duplicate:
+        match_idx = None
+        for i, seen in enumerate(seen_norms):
+            if SequenceMatcher(None, norm, seen).ratio() >= sim_threshold:
+                match_idx = i
+                break
+
+        if match_idx is None:
             seen_norms.append(norm)
+            key = _fact_source_key(fact)
+            fact["merged_sources"] = [key] if key else []
             unique.append(fact)
+        else:
+            canonical = unique[match_idx]
+            key = _fact_source_key(fact)
+            if key and key not in canonical["merged_sources"]:
+                canonical["merged_sources"].append(key)
     return unique
 
 
@@ -208,14 +224,16 @@ def verifier_node(state: AgentState) -> dict:
         logger.warning("Verifier: All facts were missing claim or excerpt.")
         return {"verified_facts": [], "knowledge_gap_detected": True, "knowledge_gaps": [], "active_node": "verifier"}
 
-    # Deduplicate near-identical claims before batching. A single scrape pass
-    # often yields the same measurement stated across several pages; verifying
-    # duplicates burns RPM without adding information.
+    # Merge near-identical claims before batching. A single scrape pass often
+    # yields the same measurement stated across several pages; verifying each
+    # copy burns RPM without adding information — but the copies themselves are
+    # the corroboration evidence, so they are folded into the survivor's
+    # `merged_sources` rather than discarded.
     before_dedup = len(valid_facts)
-    valid_facts = _deduplicate_facts(valid_facts)
+    valid_facts = _merge_duplicate_facts(valid_facts)
     dedup_dropped = before_dedup - len(valid_facts)
     if dedup_dropped:
-        logger.info(f"Verifier: dedup dropped {dedup_dropped} near-duplicate fact(s) ({before_dedup} → {len(valid_facts)}).")
+        logger.info(f"Verifier: merged {dedup_dropped} near-duplicate fact(s) into canonical claims ({before_dedup} → {len(valid_facts)}).")
 
     # Hard cap: if still above limit, keep the highest-credibility facts.
     valid_facts = _cap_facts(valid_facts, MAX_FACTS_TO_VERIFY)
@@ -315,9 +333,18 @@ def verifier_node(state: AgentState) -> dict:
     if knowledge_gap_detected:
         logger.info(f"Verifier: {len(knowledge_gaps)} knowledge gap(s) detected.")
 
+    # Interim quality score so the router can act on source quality mid-loop
+    # (see route_after_critic). contradiction_count is unknown until Consensus
+    # runs at the end of the loop, so it's 0 here — Consensus overwrites this
+    # with the final version.
+    from src.utils.quality import compute_quality_score
+    quality_score = compute_quality_score(verified_facts, source_map, contradiction_count=0)
+    logger.info(f"Verifier: interim quality score: {quality_score}")
+
     return {
         "verified_facts": verified_facts,
         "knowledge_gap_detected": knowledge_gap_detected,
         "knowledge_gaps": knowledge_gaps,
+        "quality_score": quality_score,
         "active_node": "verifier"
     }

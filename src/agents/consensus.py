@@ -12,9 +12,11 @@ This is what turns isolated facts ("Source A: 400 Wh/kg") into analyst-grade
 statements ("3 independent sources report 380-420 Wh/kg") and prevents two
 conflicting SUPPORTED facts from silently both reaching the report.
 
-It also computes a per-run quality score from the final evidence.
+It also finalizes the per-run quality score (`src/utils/quality.py`) with the
+real contradiction count — the Verifier computes an interim version of the same
+score earlier so the research loop can act on source quality mid-run.
 
-Clustering and scoring are pure functions (unit-tested without an LLM).
+Clustering is a pure function (unit-tested without an LLM).
 """
 
 import logging
@@ -23,9 +25,10 @@ from typing import Any, Dict, List, Literal
 from pydantic import BaseModel, Field
 
 from src.schema.state import AgentState
-from src.config import CRITIC_MODEL, CRITIC_PROVIDER
-from src.utils.llm_factory import get_llm
-from src.utils.grounding import _cosine, _fact_source_key
+from src.config import CRITIC_MODEL, CRITIC_PROVIDER, CRITIC_FALLBACK_CHAIN
+from src.utils.llm_factory import get_llm_with_fallbacks
+from src.utils.grounding import _cosine, merged_source_keys
+from src.utils.quality import compute_quality_score
 
 logger = logging.getLogger(__name__)
 
@@ -72,38 +75,19 @@ def cluster_facts(facts: List[Dict[str, Any]], sim_threshold: float = 0.85) -> L
 
 
 def distinct_sources(cluster: List[Dict[str, Any]]) -> List[str]:
-    """Distinct, non-empty source keys within a cluster (preserves first-seen order)."""
+    """
+    Distinct, non-empty source keys within a cluster (preserves first-seen order).
+
+    Includes sources folded into a fact by the Verifier's near-duplicate merge —
+    a claim three sites restated is backed by three sources, not one, and that is
+    exactly what makes a cluster worth judging for consensus/contradiction.
+    """
     seen = []
     for f in cluster:
-        key = _fact_source_key(f)
-        if key and key not in seen:
-            seen.append(key)
+        for key in merged_source_keys(f):
+            if key not in seen:
+                seen.append(key)
     return seen
-
-
-def compute_quality_score(
-    verified_facts: List[Dict[str, Any]],
-    source_map: Dict[str, Any],
-    contradiction_count: int,
-) -> Dict[str, Any]:
-    """Deterministic quality summary of a finished run."""
-    supported = [f for f in verified_facts if f.get("support_level") in _SUPPORTED_LEVELS]
-    n = len(supported)
-
-    creds = [float(f.get("credibility_score", 0.4) or 0.0) for f in supported]
-    avg_cred = round(sum(creds) / len(creds), 3) if creds else 0.0
-
-    sources = {f.get("source_url", "") for f in supported if f.get("source_url")}
-    corroborated = sum(1 for f in supported if (f.get("corroboration_count") or 1) >= 2)
-
-    return {
-        "verified_fact_count": n,
-        "avg_source_credibility": avg_cred,
-        "distinct_source_count": len(sources),
-        "corroborated_fact_count": corroborated,
-        "single_source_fact_count": n - corroborated,
-        "contradiction_count": contradiction_count,
-    }
 
 
 # ── LLM judgement schema ─────────────────────────────────────────────────────
@@ -171,8 +155,12 @@ def consensus_node(state: AgentState) -> dict:
 
         if candidates:
             try:
-                llm = get_llm(CRITIC_MODEL, CRITIC_PROVIDER, temperature=0)
-                structured = llm.with_structured_output(ConsensusBatch)
+                structured = get_llm_with_fallbacks(
+                    CRITIC_MODEL, CRITIC_PROVIDER,
+                    fallback_chain=CRITIC_FALLBACK_CHAIN,
+                    temperature=0,
+                    structured_schema=ConsensusBatch,
+                )
                 result: ConsensusBatch = structured.invoke(_build_cluster_prompt(candidates))
 
                 for judgment in result.judgments:

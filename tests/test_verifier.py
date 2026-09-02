@@ -10,6 +10,7 @@ from src.agents.verifier import (
     verifier_node,
     _build_batch_prompt,
     _group_facts_into_batches,
+    _merge_duplicate_facts,
     LLMBatchVerification,
     LLMVerificationResult,
 )
@@ -251,3 +252,140 @@ def test_verifier_skips_invalid_facts():
     result = verifier_node(state)
     assert result["verified_facts"] == []
     assert result["active_node"] == "verifier"
+
+
+# ── Near-duplicate merge preserves corroboration ─────────────────────────────
+
+def test_merge_folds_duplicate_into_canonical_with_both_sources():
+    """A claim restated by a second source is merged, not dropped, and both
+    sources are recorded on the survivor."""
+    facts = [
+        {"claim": "SpaceX was valued at $350 billion in March 2026.",
+         "source_url": "http://a.com", "source_id": "[1]", "credibility_score": 0.4},
+        {"claim": "SpaceX was valued at $350 billion in March 2026",
+         "source_url": "http://b.com", "source_id": "[2]", "credibility_score": 0.4},
+    ]
+    merged = _merge_duplicate_facts(facts)
+
+    assert len(merged) == 1, "near-identical claims should collapse to one"
+    assert sorted(merged[0]["merged_sources"]) == ["http://a.com", "http://b.com"]
+
+
+def test_merge_keeps_highest_credibility_copy_as_canonical():
+    facts = [
+        {"claim": "Valuation reached $350 billion.", "source_url": "http://farm.com",
+         "source_id": "[1]", "credibility_score": 0.4},
+        {"claim": "Valuation reached $350 billion", "source_url": "http://reuters.com",
+         "source_id": "[2]", "credibility_score": 0.7},
+    ]
+    merged = _merge_duplicate_facts(facts)
+
+    assert len(merged) == 1
+    assert merged[0]["source_url"] == "http://reuters.com"
+    assert merged[0]["credibility_score"] == 0.7
+
+
+def test_merge_leaves_distinct_claims_alone():
+    facts = [
+        {"claim": "Starlink reached 10 million customers.", "source_url": "http://a.com",
+         "source_id": "[1]", "credibility_score": 0.4},
+        {"claim": "Falcon 9 landed a booster in December 2015.", "source_url": "http://b.com",
+         "source_id": "[2]", "credibility_score": 0.4},
+    ]
+    merged = _merge_duplicate_facts(facts)
+
+    assert len(merged) == 2
+    assert merged[0]["merged_sources"] != merged[1]["merged_sources"]
+
+
+def test_merge_same_source_restating_itself_is_one_source():
+    """Two pages of the same site are one source, not corroboration."""
+    facts = [
+        {"claim": "Valuation hit $350 billion.", "source_url": "http://a.com",
+         "source_id": "[1]", "credibility_score": 0.4},
+        {"claim": "Valuation hit $350 billion", "source_url": "http://a.com",
+         "source_id": "[2]", "credibility_score": 0.4},
+    ]
+    merged = _merge_duplicate_facts(facts)
+
+    assert len(merged) == 1
+    assert merged[0]["merged_sources"] == ["http://a.com"]
+
+
+@patch("src.agents.verifier.get_llm_with_fallbacks")
+@patch("src.utils.embeddings.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_verifier_corroborates_claim_restated_by_second_source(
+    mock_kg, mock_embeddings, mock_get_llm
+):
+    """Regression: two sources restating one claim must yield corroboration_count 2.
+
+    The merge step collapses them into a single verified fact (so only one claim
+    is sent to the LLM), but the second source survives in `merged_sources` and
+    must still count. Dropping the duplicate outright — the previous behaviour —
+    pinned corroborated_fact_count at zero for every run.
+    """
+    mock_get_llm.return_value.invoke.return_value = (
+        LLMBatchVerification(results=[
+            LLMVerificationResult(
+                index=0, reasoning="source confirms",
+                support_quote="valued at $350 billion in March 2026",
+                support_level="SUPPORTED", confidence=0.95,
+            ),
+        ])
+    )
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.store_facts = MagicMock()
+
+    state = _make_state(structured_evidence=[
+        {"claim": "SpaceX was valued at $350 billion in March 2026.",
+         "source_excerpt": "SpaceX was valued at $350 billion in March 2026 per filings.",
+         "source_url": "http://a.com", "source_id": "[1]"},
+        {"claim": "SpaceX was valued at $350 billion in March 2026",
+         "source_excerpt": "Reports say SpaceX was valued at $350 billion in March 2026.",
+         "source_url": "http://b.com", "source_id": "[2]"},
+    ])
+
+    result = verifier_node(state)
+
+    facts = result["verified_facts"]
+    assert len(facts) == 1, "duplicates collapse to one verified claim"
+    assert facts[0]["corroboration_count"] == 2
+    assert facts[0]["single_source_warning"] is False
+    # Corroborated → confidence must NOT be capped to the single-source ceiling.
+    assert facts[0]["confidence"] == 0.95
+
+
+# ── Interim quality_score (Phase 5A.4) ───────────────────────────────────────
+
+@patch("src.agents.verifier.get_llm_with_fallbacks")
+@patch("src.utils.embeddings.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_verifier_returns_interim_quality_score(mock_kg, mock_embeddings, mock_get_llm):
+    """The Verifier computes an interim quality_score so the router can act on
+    source quality before the loop exits (contradiction_count is always 0 here —
+    only Consensus, which hasn't run yet, can detect contradictions)."""
+    mock_get_llm.return_value.invoke.return_value = LLMBatchVerification(results=[
+        LLMVerificationResult(
+            index=0, reasoning="ok", support_quote="reached 400 Wh/kg in 2024 lab trials",
+            support_level="SUPPORTED", confidence=0.9,
+        ),
+    ])
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.store_facts = MagicMock()
+
+    state = _make_state(
+        structured_evidence=[
+            {"claim": "Reached 400 Wh/kg",
+             "source_excerpt": "Solid-state batteries reached 400 Wh/kg in 2024 lab trials.",
+             "source_url": "http://a.com", "source_id": "[1]"},
+        ],
+        source_map={"[1]": {"credibility_score": 0.4}},
+    )
+
+    result = verifier_node(state)
+
+    qs = result["quality_score"]
+    assert qs["verified_fact_count"] == 1
+    assert qs["avg_source_credibility"] == 0.4
+    assert qs["contradiction_count"] == 0

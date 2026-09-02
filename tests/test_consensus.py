@@ -5,11 +5,8 @@ The LLM judgement path is not exercised here (it requires a model); these tests
 pin the deterministic clustering and quality-score logic the node relies on.
 """
 
-from src.agents.consensus import (
-    cluster_facts,
-    distinct_sources,
-    compute_quality_score,
-)
+from src.agents.consensus import cluster_facts, distinct_sources
+from src.utils.quality import compute_quality_score
 
 
 def test_cluster_groups_similar_embeddings():
@@ -60,3 +57,20 @@ def test_quality_score_empty():
     qs = compute_quality_score([], source_map={}, contradiction_count=0)
     assert qs["verified_fact_count"] == 0
     assert qs["avg_source_credibility"] == 0.0
+
+
+def test_distinct_sources_counts_merged_sources():
+    """A claim several sites restated is backed by all of them, so the cluster
+    is eligible for consensus judgement rather than looking single-source."""
+    cluster = [
+        {"claim": "A", "source_url": "http://a", "merged_sources": ["http://a", "http://b"]},
+    ]
+    assert sorted(distinct_sources(cluster)) == ["http://a", "http://b"]
+
+
+def test_distinct_sources_deduplicates_across_merged_facts():
+    cluster = [
+        {"claim": "A", "source_url": "http://a", "merged_sources": ["http://a", "http://b"]},
+        {"claim": "A2", "source_url": "http://b", "merged_sources": ["http://b", "http://c"]},
+    ]
+    assert sorted(distinct_sources(cluster)) == ["http://a", "http://b", "http://c"]
