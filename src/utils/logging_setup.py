@@ -1,7 +1,5 @@
 """Shared logging setup for every entrypoint (CLI, API, Streamlit) — console
-plus a rotating file, so a run's logs still exist after the terminal closes.
-Without this, a background API job's logs only ever live in the uvicorn
-process's console and vanish when it's closed or scrolled past."""
+plus a rotating file, so logs survive after the terminal/process closes."""
 
 import logging
 import logging.handlers

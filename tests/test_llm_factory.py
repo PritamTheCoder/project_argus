@@ -57,20 +57,30 @@ def test_nemotron_falls_back_without_key():
 
 # ── Groq multi-key pool ──────────────────────────────────────────────────────
 
-@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY": ""}, clear=False)
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY_C": "", "GROQ_API_KEY": ""}, clear=False)
 def test_groq_pool_resolves_both_keys():
     assert _groq_keys() == ["gsk_aaa", "gsk_bbb"]
 
 
-@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY": ""}, clear=False)
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY_C": "gsk_ccc", "GROQ_API_KEY": ""}, clear=False)
+def test_groq_pool_resolves_three_keys():
+    assert _groq_keys() == ["gsk_aaa", "gsk_bbb", "gsk_ccc"]
+
+
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY_C": "", "GROQ_API_KEY": ""}, clear=False)
 def test_groq_pool_round_robins():
-    # Consecutive selections alternate across the two pool indices.
     idxs = [_next_groq_key()[1] for _ in range(4)]
     assert set(idxs) == {0, 1}
     assert idxs[0] != idxs[1]  # alternates rather than repeating
 
 
-@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY": ""}, clear=False)
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY_C": "gsk_ccc", "GROQ_API_KEY": ""}, clear=False)
+def test_groq_pool_round_robins_three_keys():
+    idxs = [_next_groq_key()[1] for _ in range(6)]
+    assert set(idxs) == {0, 1, 2}
+
+
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "gsk_aaa", "GROQ_API_KEY_B": "gsk_bbb", "GROQ_API_KEY_C": "", "GROQ_API_KEY": ""}, clear=False)
 def test_groq_builds_rotate_keys_and_limiters():
     a = get_llm("llama-3.3-70b-versatile", "groq")
     b = get_llm("llama-3.3-70b-versatile", "groq")
@@ -80,13 +90,13 @@ def test_groq_builds_rotate_keys_and_limiters():
     assert a.rate_limiter is not b.rate_limiter
 
 
-@patch.dict(os.environ, {"GROQ_API_KEY_A": "", "GROQ_API_KEY_B": "", "GROQ_API_KEY": ""}, clear=False)
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "", "GROQ_API_KEY_B": "", "GROQ_API_KEY_C": "", "GROQ_API_KEY": ""}, clear=False)
 def test_groq_falls_back_to_gemini_without_keys():
     llm = get_llm("llama-3.3-70b-versatile", "groq")
     assert isinstance(llm, ChatGoogleGenerativeAI)
 
 
-@patch.dict(os.environ, {"GROQ_API_KEY_A": "badprefix", "GROQ_API_KEY_B": "", "GROQ_API_KEY": ""}, clear=False)
+@patch.dict(os.environ, {"GROQ_API_KEY_A": "badprefix", "GROQ_API_KEY_B": "", "GROQ_API_KEY_C": "", "GROQ_API_KEY": ""}, clear=False)
 def test_groq_falls_back_when_no_valid_prefix():
     llm = get_llm("llama-3.3-70b-versatile", "groq")
     assert isinstance(llm, ChatGoogleGenerativeAI)

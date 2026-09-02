@@ -25,3 +25,17 @@ any new machine or rebuilt venv, or the scraper tests/nodes fail with
 Run tests: `python -m pytest -q` (5 tests are `@pytest.mark.live` and skip by
 default — pass `--run-live` or set `RUN_LIVE_TESTS=1` to run them against real
 network/API keys).
+
+## API
+
+```bash
+uvicorn src.api.app:app --reload
+```
+
+`POST /research` and `GET /research/{job_id}` require an API key. Create one:
+
+```bash
+python -m src.api.auth "your name"
+```
+
+This prints the key once — save it. Send it as `Authorization: Bearer <key>`.

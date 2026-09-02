@@ -17,9 +17,7 @@ class KnowledgeGraph:
         sqlite_vec.load(self.db)
         self.db.enable_load_extension(False)
         self.fts_available = True
-        # kg_store is a process-wide singleton but the API runs each job in its
-        # own OS thread, and sqlite3.Connection isn't safe under real concurrent
-        # access from multiple threads — every method below takes this lock.
+        # sqlite3.Connection isn't thread-safe; API jobs run in separate threads.
         self._lock = threading.RLock()
         self._init_db()
 
@@ -63,9 +61,7 @@ class KnowledgeGraph:
             summary TEXT
         )
         """)
-        # Scopes doc/chunk retrieval to the run that scraped them — same fix
-        # Phase 0 applied to `facts`, needed now that concurrent API requests
-        # can have multiple runs' docs in the table at once.
+        # Scopes doc/chunk retrieval to the run that scraped them (same as `facts`).
         self._ensure_column("docs", "session_id", "TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_docs_session ON docs(session_id)")
         self.db.execute("""
@@ -380,9 +376,8 @@ class KnowledgeGraph:
             return []
 
     def clear_scratchpad(self):
-        """Clear out ALL temporary documents and chunks (every session). Keeps
-        verified facts. Not called automatically by the pipeline anymore now
-        that doc/chunk retrieval is session-scoped — kept for manual/admin use."""
+        """Clear all temporary documents and chunks (every session). Keeps
+        verified facts. Manual/admin use only, not called by the pipeline."""
         with self._lock:
             cursor = self.db.cursor()
             cursor.execute("DELETE FROM docs")

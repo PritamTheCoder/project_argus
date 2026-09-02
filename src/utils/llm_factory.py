@@ -24,7 +24,7 @@ from src.config import (
     GEMINI_RPM, GROQ_RPM, OPENAI_RPM, NVIDIA_RPM, NEMOTRON_RPM, STEP_RPM, KIMI_RPM, GLM_RPM,
     RATE_LIMIT_BURST,
     NVIDIA_BASE_URL, NIM_TIMEOUT,
-    NVIDIA_API_NEMOTRON3_KEY, NEMOTRON_REASONING_BUDGET,
+    NVIDIA_API_NEMOTRON3_KEY,
     STEP_API_KEY, KIMI_API_KEY, GLM_API_KEY,
 )
 
@@ -60,9 +60,9 @@ _NIM_PROVIDERS = ("nemotron", "step", "kimi", "glm")
 def _nim_spec(provider: str) -> tuple[str, dict | None]:
     """Return (api_key, extra_body) for a NVIDIA NIM provider, read live."""
     if provider == "nemotron":
+        # reasoning_budget removed: NVIDIA's model runner rejects it (400 on every call).
         return NVIDIA_API_NEMOTRON3_KEY, {
             "chat_template_kwargs": {"enable_thinking": True},
-            "reasoning_budget": NEMOTRON_REASONING_BUDGET,
         }
     if provider == "step":
         return STEP_API_KEY, None  # multimodal chat; no reasoning extra_body
@@ -87,9 +87,8 @@ def _get_rate_limiter(name: str, rpm: int | None = None) -> InMemoryRateLimiter:
 
 
 # ── Groq multi-key pool ──────────────────────────────────────────────────────
-# Two Groq accounts (GROQ_API_KEY_A / _B) each carry their own free-tier daily
-# token budget (100K TPD) and RPM. Round-robining across them ~doubles effective
-# throughput (≈200K TPD, 2x RPM). Falls back to a legacy single GROQ_API_KEY.
+# Round-robins across multiple Groq accounts (GROQ_API_KEY_A/_B/_C) to multiply
+# free-tier RPM/TPD. Falls back to a single GROQ_API_KEY if none are set.
 _groq_rr_counter = itertools.count()
 
 
@@ -98,6 +97,7 @@ def _groq_keys() -> list[str]:
     candidates = [
         os.getenv("GROQ_API_KEY_A", ""),
         os.getenv("GROQ_API_KEY_B", ""),
+        os.getenv("GROQ_API_KEY_C", ""),
         os.getenv("GROQ_API_KEY", ""),  # legacy single-key fallback
     ]
     return [k.strip() for k in candidates if k.strip()]
@@ -210,12 +210,11 @@ def get_llm(
     """
     provider_lower = provider.lower().strip()
 
-    # Groq key-pool validation (checks GROQ_API_KEY_A/_B and the legacy single key)
     if provider_lower == "groq":
         groq_keys = _groq_keys()
         if not groq_keys:
             logger.warning(
-                f"No Groq API key set (GROQ_API_KEY_A/_B or GROQ_API_KEY). "
+                f"No Groq API key set (GROQ_API_KEY_A/_B/_C or GROQ_API_KEY). "
                 f"Falling back to {_FALLBACK_PROVIDER}/{_FALLBACK_MODEL}."
             )
             return _create_llm(_FALLBACK_MODEL, _FALLBACK_PROVIDER, temperature)

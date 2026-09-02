@@ -65,6 +65,12 @@ async def run_query(query: str):
     else:
         print("(No report generated — check logs for errors)")
 
+    node_seconds = (final_state or {}).get("node_seconds") or {}
+    if node_seconds:
+        print("\nTime per node:")
+        for node, seconds in sorted(node_seconds.items(), key=lambda kv: -kv[1]):
+            print(f"  {node:<15} {seconds:>6.1f}s")
+
     print("\n" + "=" * 80)
     print(f"State persisted to SQLite (thread: {thread_id})")
     print("=" * 80 + "\n")
