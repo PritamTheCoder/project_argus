@@ -7,8 +7,9 @@ Run with: python -m pytest tests/test_tools.py -v
 
 import pytest
 import asyncio
+from unittest.mock import patch, MagicMock, AsyncMock
 from src.tools.search import search_ddg, _is_junk_domain
-from src.tools.scraper import scrape_urls
+from src.tools.scraper import scrape_urls, shared_crawler
 from src.tools.scout import run_scout
 
 
@@ -119,6 +120,60 @@ class TestScraper:
         assert all("url" in r for r in results)
 
 
+class TestSharedCrawler:
+    """shared_crawler()'s browser close is time-boxed: Playwright's close
+    handshake can hang indefinitely with no error, which has stalled a whole
+    research job with no log output. These mock AsyncWebCrawler directly so
+    the hang is simulated, not a real (slow, flaky) browser interaction."""
+
+    @pytest.mark.asyncio
+    @patch("src.tools.scraper.AsyncWebCrawler")
+    async def test_starts_and_closes_normally(self, mock_cls):
+        mock_crawler = MagicMock()
+        mock_crawler.start = AsyncMock()
+        mock_crawler.close = AsyncMock()
+        mock_cls.return_value = mock_crawler
+
+        async with shared_crawler() as crawler:
+            assert crawler is mock_crawler
+
+        mock_crawler.start.assert_awaited_once()
+        mock_crawler.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch("src.tools.scraper.CRAWLER_CLOSE_TIMEOUT", 0.05)
+    @patch("src.tools.scraper.AsyncWebCrawler")
+    async def test_survives_a_hung_close(self, mock_cls):
+        """A close() that never returns must not block the caller forever."""
+        async def _hang_forever():
+            await asyncio.sleep(10)
+
+        mock_crawler = MagicMock()
+        mock_crawler.start = AsyncMock()
+        mock_crawler.close = AsyncMock(side_effect=_hang_forever)
+        mock_cls.return_value = mock_crawler
+
+        async def _use_it():
+            async with shared_crawler() as crawler:
+                return crawler
+
+        result = await asyncio.wait_for(_use_it(), timeout=2.0)
+        assert result is mock_crawler
+
+    @pytest.mark.asyncio
+    @patch("src.tools.scraper.AsyncWebCrawler")
+    async def test_swallows_close_errors(self, mock_cls):
+        """A close() that raises shouldn't crash a run whose scraping already succeeded."""
+        mock_crawler = MagicMock()
+        mock_crawler.start = AsyncMock()
+        mock_crawler.close = AsyncMock(side_effect=RuntimeError("boom"))
+        mock_cls.return_value = mock_crawler
+
+        async with shared_crawler() as crawler:
+            assert crawler is mock_crawler
+        # No exception propagated out of the `async with` — reaching here is the assertion.
+
+
 # ── Scout Pipeline Tests (End-to-End) ───────────────────────────────────────
 
 
@@ -164,7 +219,6 @@ class TestRunScout:
 
 
 from src.tools.refiner import extract_facts, ExtractedFact, FactExtractionResult
-from unittest.mock import patch, MagicMock
 
 
 # Sample text used across refiner tests

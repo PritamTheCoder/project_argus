@@ -11,8 +11,9 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from src.schema.state import AgentState, ResearchPlan, SearchIntent, FactCheckResult
 from src.agents.librarian import librarian_node
 from src.agents.scout import scout_node
-from src.agents.refiner import refiner_node
-from src.agents.critic import critic_node
+from src.agents.refiner import refiner_node, _split_into_batches
+from src.agents.critic import critic_node, _compute_coverage_gaps
+from src.agents.reflector import reflector_node, ReflectorOutput
 from src.agents.writer import writer_node
 
 
@@ -93,6 +94,28 @@ def test_librarian_no_critique_injection_on_first_iteration(mock_get_llm):
 
     assert result["active_node"] == "librarian"
     mock_get_llm.assert_called_once()
+
+
+@patch("src.agents.librarian.get_llm_with_fallbacks")
+def test_librarian_sets_original_plan_on_first_iteration(mock_get_llm):
+    """original_plan lets the Critic measure coverage even after `plan` is
+    later overwritten by follow-up queries — set once, on the first pass."""
+    expected_plan = ResearchPlan(search_queries=[SearchIntent(query="q1", mode="MIXED")])
+    mock_get_llm.return_value.return_value = expected_plan
+
+    result = librarian_node(_base_state(iteration_count=0))
+
+    assert result["original_plan"] == result["plan"]
+
+
+@patch("src.agents.librarian.get_llm_with_fallbacks")
+def test_librarian_does_not_reset_original_plan_on_later_iterations(mock_get_llm):
+    expected_plan = ResearchPlan(search_queries=[SearchIntent(query="q2", mode="MIXED")])
+    mock_get_llm.return_value.return_value = expected_plan
+
+    result = librarian_node(_base_state(iteration_count=1, critique="prior critique"))
+
+    assert "original_plan" not in result
 
 
 # ── Librarian: structural memory-reuse (Phase 4A.2) ───────────────────────────
@@ -213,17 +236,46 @@ async def test_scout_execution(mock_rerank, mock_embeddings, mock_scrape, mock_g
     assert mock_scrape.call_count == 1
 
 
+@pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
+@patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock)
+@patch("src.agents.scout.scrape_urls", new_callable=AsyncMock)
+@patch("src.agents.scout.get_embeddings")
+@patch("src.agents.scout.MAX_SOURCES_PER_DOMAIN", 2)
+async def test_scout_caps_sources_per_domain(mock_embeddings, mock_scrape, mock_gather):
+    """No single domain should fill more than MAX_SOURCES_PER_DOMAIN source_map
+    slots — otherwise one content farm's subpages crowd out source diversity.
+
+    Forces the no-embeddings degraded path (registers scraped results directly,
+    skipping retrieval/reranking) so this test doesn't need to mock the KG."""
+    mock_embeddings.side_effect = Exception("embeddings unavailable")
+
+    urls = [f"http://farm.com/page{i}" for i in range(4)]
+    mock_gather.return_value = [{"url": u, "content": "", "needs_scrape": True, "source": "web"} for u in urls]
+    mock_scrape.return_value = [
+        {"url": u, "content": "Some scraped page content.", "success": True} for u in urls
+    ]
+
+    state = _base_state(plan=["q1"])
+    with patch("src.graph.kg.kg_store", MagicMock()):
+        result = await scout_node(state)
+
+    farm_sources = [v for v in result["source_map"].values() if "farm.com" in v["url"]]
+    assert len(farm_sources) == 2
+
+
 # ── Refiner Tests ─────────────────────────────────────────────────────────────
 
 @patch("src.agents.refiner.extract_facts")
-@patch("src.agents.refiner.get_llm")
+@patch("src.agents.refiner.get_llm_with_fallbacks")
 def test_refiner_extraction(mock_get_llm, mock_extract):
     """Refiner should call extract_facts and return structured_evidence."""
     from src.tools.refiner import ExtractedFact, FactExtractionResult
     from src.agents.refiner import ExtractionSchema
 
-    # _generate_dynamic_schema uses get_llm → structured_llm.invoke → ExtractionSchema
-    mock_get_llm.return_value.with_structured_output.return_value.invoke.return_value = (
+    # _generate_dynamic_schema: get_llm_with_fallbacks(...) already returns the
+    # structured-output LLM, so .invoke() is the next hop straight to the result.
+    mock_get_llm.return_value.invoke.return_value = (
         ExtractionSchema(schema_dict={"dates": "date", "metrics": "numeric value"})
     )
 
@@ -299,6 +351,142 @@ def test_critic_evaluation_sufficient(mock_kg, mock_embeddings, mock_get_llm):
     assert result["active_node"] == "critic"
 
 
+# ── Critic: coverage gaps (Phase 5B) ────────────────────────────────────────
+
+def test_compute_coverage_gaps_flags_unanswered_subquestion():
+    original_plan = [
+        {"query": "SpaceX funding rounds", "mode": "MIXED"},
+        {"query": "SpaceX Starlink revenue", "mode": "MIXED"},
+    ]
+    scraped_data = [{"source_id": "[1]", "query": "SpaceX funding rounds"}]
+    verified_facts = [{"source_id": "[1]", "support_level": "SUPPORTED", "claim": "x"}]
+
+    gaps = _compute_coverage_gaps(original_plan, scraped_data, verified_facts)
+    assert gaps == ["SpaceX Starlink revenue"]
+
+
+def test_compute_coverage_gaps_empty_when_all_answered():
+    original_plan = [{"query": "q1", "mode": "MIXED"}]
+    scraped_data = [{"source_id": "[1]", "query": "q1"}]
+    verified_facts = [{"source_id": "[1]", "support_level": "SUPPORTED", "claim": "x"}]
+    assert _compute_coverage_gaps(original_plan, scraped_data, verified_facts) == []
+
+
+def test_compute_coverage_gaps_ignores_ungrounded_facts():
+    """A fact that failed verification doesn't count as covering its sub-question."""
+    original_plan = [{"query": "q1", "mode": "MIXED"}]
+    scraped_data = [{"source_id": "[1]", "query": "q1"}]
+    verified_facts = [{"source_id": "[1]", "support_level": "NOT_SUPPORTED", "claim": "x"}]
+    assert _compute_coverage_gaps(original_plan, scraped_data, verified_facts) == ["q1"]
+
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_returns_coverage_gaps(mock_kg, mock_embeddings, mock_get_llm):
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = []
+    mock_get_llm.return_value.return_value = FactCheckResult(status="sufficient", new_queries=[], critique="ok")
+
+    state = _base_state(original_plan=[{"query": "q1", "mode": "MIXED"}])
+    result = critic_node(state)
+
+    assert result["coverage_gaps"] == ["q1"]
+
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_upgrades_mixed_mode_when_credibility_low(mock_kg, mock_embeddings, mock_get_llm):
+    """Chasing more MIXED-mode search when sources are already low-credibility
+    just re-finds the same tier of source — upgrade toward trusted instead."""
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = []
+    mock_get_llm.return_value.return_value = FactCheckResult(
+        status="gaps_found",
+        new_queries=[SearchIntent(query="follow-up", mode="MIXED")],
+        critique="Sources are weak.",
+    )
+
+    state = _base_state(quality_score={"avg_source_credibility": 0.3})
+    result = critic_node(state)
+
+    assert result["plan"][0]["mode"] == "TRUSTED_FIRST"
+
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_leaves_mode_alone_when_credibility_fine(mock_kg, mock_embeddings, mock_get_llm):
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = []
+    mock_get_llm.return_value.return_value = FactCheckResult(
+        status="gaps_found",
+        new_queries=[SearchIntent(query="follow-up", mode="MIXED")],
+        critique="ok",
+    )
+
+    state = _base_state(quality_score={"avg_source_credibility": 0.9})
+    result = critic_node(state)
+
+    assert result["plan"][0]["mode"] == "MIXED"
+
+
+# ── Reflector Tests ──────────────────────────────────────────────────────────
+
+@patch("src.agents.reflector.get_llm_with_fallbacks")
+def test_reflector_merges_plan_with_critics_queries(mock_get_llm):
+    """Reflector's gap-fill queries should be ADDED to the Critic's plan, not
+    replace it — Scout's next pass should cover both."""
+    mock_get_llm.return_value.invoke.return_value = ReflectorOutput(
+        search_queries=[SearchIntent(query="gap query", mode="MIXED")]
+    )
+    state = _base_state(
+        plan=[{"query": "critic query", "mode": "MIXED"}],
+        knowledge_gaps=["some unverified claim"],
+    )
+    result = reflector_node(state)
+
+    queries = {intent["query"] for intent in result["plan"]}
+    assert queries == {"critic query", "gap query"}
+
+
+@patch("src.agents.reflector.get_llm_with_fallbacks")
+def test_reflector_does_not_duplicate_matching_queries(mock_get_llm):
+    mock_get_llm.return_value.invoke.return_value = ReflectorOutput(
+        search_queries=[SearchIntent(query="same query", mode="MIXED")]
+    )
+    state = _base_state(
+        plan=[{"query": "same query", "mode": "MIXED"}],
+        knowledge_gaps=["gap"],
+    )
+    result = reflector_node(state)
+    assert len(result["plan"]) == 1
+
+
+@patch("src.agents.reflector.get_llm_with_fallbacks")
+def test_reflector_prioritizes_coverage_gaps_over_knowledge_gaps(mock_get_llm):
+    """coverage_gaps (real unanswered sub-questions) should lead the prompt,
+    with knowledge_gaps (unverified claims) filling remaining slots."""
+    captured = {}
+
+    def _invoke(prompt):
+        captured["prompt"] = prompt
+        return ReflectorOutput(search_queries=[SearchIntent(query="q", mode="MIXED")])
+
+    mock_get_llm.return_value.invoke.side_effect = _invoke
+
+    state = _base_state(
+        coverage_gaps=["uncovered sub-question"],
+        knowledge_gaps=["shaky claim"],
+    )
+    reflector_node(state)
+
+    assert "uncovered sub-question" in captured["prompt"]
+    assert "shaky claim" in captured["prompt"]
+    assert captured["prompt"].index("uncovered sub-question") < captured["prompt"].index("shaky claim")
+
+
 # ── Writer Tests ──────────────────────────────────────────────────────────────
 
 @patch("src.agents.writer.get_llm_with_fallbacks")
@@ -354,3 +542,107 @@ def test_writer_filters_unsupported_facts(mock_get_llm):
     # NOT_SUPPORTED fact should not appear in report
     assert "Bad fact" not in result["report"]
     assert result["active_node"] == "writer"
+
+
+@patch("src.agents.writer.get_llm_with_fallbacks")
+def test_writer_handles_list_content_response(mock_get_llm):
+    """Some providers (e.g. Gemini) return .content as a list of blocks
+    instead of a plain string — the Writer must flatten it, not crash."""
+    mock_get_llm.return_value.return_value.content = [{"type": "text", "text": "Report from a list-content response."}]
+
+    state = _base_state(
+        query="test",
+        verified_facts=[{
+            "claim": "Good fact", "source_id": "[1]", "source_url": "http://a.com",
+            "support_level": "SUPPORTED", "credibility_score": 0.8, "source_type": "Academic/Scientific",
+        }],
+        source_map={"[1]": {"url": "http://a.com", "credibility_score": 0.8, "source_type": "Academic/Scientific"}},
+    )
+
+    result = writer_node(state)
+
+    assert "Report from a list-content response." in result["report"]
+
+
+# ── Refiner batching ─────────────────────────────────────────────────────────
+
+def test_split_into_batches_packs_under_limit():
+    docs = [{"source_id": f"[{i}]", "content": "x" * 100} for i in range(5)]
+    batches = _split_into_batches(docs, max_chars=300, max_doc_chars=1000)
+    assert len(batches) > 1, "five 100-char docs must not fit one 300-char batch"
+    assert all(len(b) <= 300 or b.count("<document") == 1 for b in batches)
+    # Every document survives the split exactly once.
+    joined = "".join(batches)
+    for i in range(5):
+        assert joined.count(f'source_id="[{i}]"') == 1
+
+
+def test_split_into_batches_single_payload_when_small():
+    docs = [{"source_id": "[1]", "content": "short"}, {"source_id": "[2]", "content": "also short"}]
+    batches = _split_into_batches(docs, max_chars=100_000, max_doc_chars=100_000)
+    assert len(batches) == 1
+    assert 'source_id="[1]"' in batches[0] and 'source_id="[2]"' in batches[0]
+
+
+def test_split_into_batches_truncates_oversized_doc_instead_of_dropping():
+    docs = [{"source_id": "[1]", "content": "y" * 5000}]
+    batches = _split_into_batches(docs, max_chars=500, max_doc_chars=200)
+    assert len(batches) == 1
+    assert batches[0].count("y") == 200
+    assert 'source_id="[1]"' in batches[0]
+
+
+def test_split_into_batches_skips_empty_docs():
+    docs = [{"source_id": "[1]", "content": "   "}, {"source_id": "[2]", "content": ""}]
+    assert _split_into_batches(docs) == []
+
+
+@patch("src.agents.refiner._generate_dynamic_schema", return_value={"facts": "any"})
+@patch("src.agents.refiner.extract_facts")
+def test_refiner_survives_a_failed_batch(mock_extract, _mock_schema):
+    """A batch failing across the whole ladder must not discard the other batches."""
+    mock_extract.side_effect = [
+        RuntimeError("429 rate limit"),
+        {"facts": [{"claim": "survived", "source_id": "[2]"}]},
+    ]
+    state = {
+        "query": "q", "plan": [], "verified_facts": [], "source_map": {},
+        "scraped_data": [
+            {"source_id": "[1]", "content": "a" * 30000},
+            {"source_id": "[2]", "content": "b" * 30000},
+        ],
+    }
+
+    result = refiner_node(state)
+
+    assert mock_extract.call_count == 2, "each document should be its own batch"
+    evidence = result["structured_evidence"]
+    assert len(evidence) == 1
+    assert evidence[0]["claim"] == "survived"
+
+
+@pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
+@patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock)
+@patch("src.agents.scout.scrape_urls", new_callable=AsyncMock)
+@patch("src.agents.scout.get_embeddings")
+@patch("src.agents.scout.MAX_SOURCES_PER_DOMAIN", 2)
+async def test_scout_does_not_cap_authoritative_domains(mock_embeddings, mock_scrape, mock_gather):
+    """The per-domain cap targets content farms. Capping sec.gov threw away 18
+    of 20 primary-source SEC filings in a real run — authoritative domains are
+    exempt."""
+    mock_embeddings.side_effect = Exception("embeddings unavailable")
+
+    urls = [f"https://www.sec.gov/Archives/edgar/data/{i}/filing.htm" for i in range(5)]
+    mock_gather.return_value = [{"url": u, "content": "", "needs_scrape": True, "source": "web"} for u in urls]
+    mock_scrape.return_value = [
+        {"url": u, "content": "SEC filing content.", "success": True} for u in urls
+    ]
+
+    state = _base_state(plan=["q1"])
+    with patch("src.graph.kg.kg_store", MagicMock()):
+        result = await scout_node(state)
+
+    sec_sources = [v for v in result["source_map"].values() if "sec.gov" in v["url"]]
+    assert len(sec_sources) == 5, "all 5 filings should survive, not just MAX_SOURCES_PER_DOMAIN"
+    assert all(v["credibility_score"] == 0.9 for v in sec_sources)

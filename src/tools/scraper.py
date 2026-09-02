@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 import aiohttp
 import fitz  # PyMuPDF
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-from src.config import SCRAPE_TIMEOUT
+from src.config import SCRAPE_TIMEOUT, CRAWLER_CLOSE_TIMEOUT
 from src.utils.cache import get_cached_markdown, set_cached_markdown, init_db
 import re
 
@@ -308,17 +308,26 @@ def _browser_config() -> BrowserConfig:
 
 @asynccontextmanager
 async def shared_crawler():
-    """One browser instance for a whole batch of ``scrape_urls()`` calls.
+    """One browser instance for a whole batch of scrape_urls() calls, instead
+    of one Chromium process per call — avoids exhausting OS process limits
+    when Scout scrapes several sub-queries concurrently.
 
-    Scout gathers/scrapes up to ``SCOUT_CONCURRENCY`` sub-queries at once; each
-    call to ``scrape_urls()`` used to open its own ``AsyncWebCrawler`` (its own
-    Chromium process, which itself spawns several OS processes). Launching
-    several of those simultaneously can exhaust the OS commit/paging limit
-    (observed as Windows ``WinError 1455``). Open one crawler per Scout run
-    and pass it into every ``scrape_urls()`` call instead.
+    Uses explicit start()/close() rather than `async with AsyncWebCrawler(...)`
+    so close() can be time-boxed: Playwright's browser-close handshake can hang
+    indefinitely without raising. On timeout we log and move on — a leaked
+    browser process is a smaller problem than a permanently hung job.
     """
-    async with AsyncWebCrawler(config=_browser_config()) as crawler:
+    crawler = AsyncWebCrawler(config=_browser_config())
+    await crawler.start()
+    try:
         yield crawler
+    finally:
+        try:
+            await asyncio.wait_for(crawler.close(), timeout=CRAWLER_CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(f"Browser close did not finish within {CRAWLER_CLOSE_TIMEOUT}s — continuing without it.")
+        except Exception as e:
+            logger.warning(f"Browser close raised {type(e).__name__}: {e}")
 
 
 async def scrape_urls(urls: list[str], query: str = "", crawler: AsyncWebCrawler | None = None) -> list[dict]:
@@ -329,10 +338,9 @@ async def scrape_urls(urls: list[str], query: str = "", crawler: AsyncWebCrawler
     and returns clean Markdown for each page. Failed URLs return
     structured errors instead of crashing the pipeline.
 
-    ``crawler``: reuse an existing ``AsyncWebCrawler`` (see ``shared_crawler()``)
-    instead of opening a new browser for this call. If omitted, one is opened
-    and closed just for this call — fine for a single one-off scrape, but
-    concurrent callers should share one via ``shared_crawler()``.
+    ``crawler``: reuse an existing ``AsyncWebCrawler`` instead of opening a new
+    one. Omit for a one-off scrape; concurrent callers should share one via
+    ``shared_crawler()``.
 
     Returns:
         List of result dicts, each with keys:

@@ -41,7 +41,11 @@ def build_gatherer_system_prompt(mode: str) -> str:
         "facts already known. Stop once you have gathered enough good sources.\n\n"
         "Routing guidance:\n"
         "- Scientific / technical / medical questions → semantic_scholar_search, arxiv_search, crossref_search.\n"
+        "- Company financials, funding rounds, ownership, regulatory risk → sec_edgar_search FIRST "
+        "(official filings are primary sources), then web_search for context and reporting.\n"
         "- News / market / commercial / company / general questions → web_search.\n"
+        "- With web_search, set `category` when the question calls for a specific kind of source "
+        "(\"news\", \"company\", \"financial report\", \"research paper\", \"pdf\").\n"
     )
     mode = (mode or "MIXED").upper()
     if mode == "TRUSTED_ONLY":

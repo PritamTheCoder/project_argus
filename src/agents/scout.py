@@ -9,8 +9,8 @@ from src.agents.acquisition import gather_sources_for_query
 from src.utils.embeddings import get_embeddings
 from src.utils.rerank import rerank_chunks
 from src.utils.rrf import reciprocal_rank_fusion
-from src.utils.source_scoring import evaluate_source
-from src.config import MAX_CHUNK_TOKENS, TOP_K_CHUNKS, SCOUT_CONCURRENCY
+from src.utils.source_scoring import evaluate_source, registrable_domain
+from src.config import MAX_CHUNK_TOKENS, TOP_K_CHUNKS, SCOUT_CONCURRENCY, MAX_SOURCES_PER_DOMAIN, AUTHORITATIVE_CREDIBILITY
 
 logger = logging.getLogger(__name__)
 
@@ -76,15 +76,32 @@ async def scout_node(state: AgentState) -> dict:
     # a URL is registered once even though parallel gathers share a seen snapshot.
     registered_urls: set[str] = {v["url"] for v in source_map.values()}
 
+    # Sources registered per domain so far, so one site (or its subpages) can't
+    # crowd out source diversity. Seeded from any prior round for the same reason.
+    domain_counts: dict[str, int] = {}
+    for v in source_map.values():
+        d = registrable_domain(v["url"])
+        domain_counts[d] = domain_counts.get(d, 0) + 1
+
     def _register_source(url: str, content: str, query: str) -> None:
         nonlocal next_id
         if url in registered_urls:
             return  # first occurrence wins (matches the old per-query seen_urls dedup)
-        registered_urls.add(url)
-        base = evaluate_source(url)
+
+        base = evaluate_source(url, query)
         score = base["score"]
         stype = base["type"]
         as_of = ""
+
+        # The per-domain cap stops one content farm's subpages crowding out
+        # diversity, but must not throttle an authoritative domain — sec.gov and
+        # journal publishers legitimately supply many documents.
+        domain = registrable_domain(url)
+        if score < AUTHORITATIVE_CREDIBILITY and domain_counts.get(domain, 0) >= MAX_SOURCES_PER_DOMAIN:
+            return
+
+        registered_urls.add(url)
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
 
         # Prefer the backend's credibility hint when it is higher than the
         # domain heuristic (e.g. a Semantic Scholar paper at a generic .org host).
@@ -147,9 +164,7 @@ async def scout_node(state: AgentState) -> dict:
             results.extend(scraped)
             return q, candidates, results
 
-    # One browser shared across every concurrent sub-query (see shared_crawler()
-    # docstring) instead of one per sub-query — avoids launching SCOUT_CONCURRENCY
-    # Chromium processes at once.
+    # One browser shared across every concurrent sub-query (see shared_crawler()).
     async with shared_crawler() as crawler:
         gathered = await asyncio.gather(*[_gather_and_scrape(intent, crawler) for intent in queries])
 

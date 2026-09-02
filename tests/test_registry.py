@@ -61,7 +61,10 @@ def test_default_registry_has_expected_tools():
 
 def test_default_registry_candidate_tools_are_search_backends():
     candidates = set(default_registry.candidate_tool_names())
-    assert candidates == {"web_search", "semantic_scholar_search", "arxiv_search", "crossref_search"}
+    assert candidates == {
+        "web_search", "semantic_scholar_search", "arxiv_search",
+        "crossref_search", "sec_edgar_search",
+    }
 
 
 def test_retrieval_tag_excludes_utility_tools():

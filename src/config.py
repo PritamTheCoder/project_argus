@@ -17,60 +17,37 @@ OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
-# NVIDIA NIM (OpenAI-compatible) endpoint + per-model keys. Each model has its
-# own key, i.e. its own free-tier quota — assigning agents across them spreads
-# rate-limit load. All are reached via the same OpenAI-compatible base URL.
+# NVIDIA NIM (OpenAI-compatible) endpoint. Each model below has its own key
+# (own free-tier quota) but shares this base URL.
 NVIDIA_BASE_URL: str = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
-# Nemotron-3 Ultra (reasoning).
+# Nemotron-3 Ultra (reasoning). Writer's primary when the key is set.
 NVIDIA_API_NEMOTRON3_KEY: str = os.getenv("NVIDIA_API_NEMOTRON3_KEY", "")
 NEMOTRON_MODEL: str = os.getenv("NEMOTRON_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+# Unused: NVIDIA's model runner currently rejects this param. See llm_factory._nim_spec.
 NEMOTRON_REASONING_BUDGET: int = int(os.getenv("NEMOTRON_REASONING_BUDGET", "4096"))
 
-# StepFun Step-3.7 Flash (multimodal / vision-capable chat). Live-verified
-# working 2026-08-18 (an earlier 401 on this key has since resolved itself).
+# StepFun Step-3.7 Flash (multimodal). Dead as of 2026-08-28 (410, end of life).
 STEP_API_KEY: str = os.getenv("STEP_3.7_API_KEY", "")
 STEP_MODEL: str = os.getenv("STEP_MODEL", "stepfun-ai/step-3.7-flash")
 
-# Kimi K2.6 (Moonshot, large-context non-reasoning chat) via NVIDIA NIM.
-# NOT used in any default below as of 2026-08-18: this account's key gets a 404
-# ("Function ... Not found for account") specifically for kimi-k2.6 — the model
-# ID itself is correct (verified against NVIDIA's own NIM reference docs), but
-# it isn't provisioned/entitled for this NVIDIA developer account. Request
-# access for the model on build.nvidia.com to re-enable it, then add it back
-# into the relevant *_FALLBACK_CHAIN env var(s) below.
+# Kimi K2.6 via NVIDIA NIM. Not entitled on this account (404).
 KIMI_API_KEY: str = os.getenv("KIMI_NVIDIA_KEY", "")
 KIMI_MODEL: str = os.getenv("KIMI_MODEL", "moonshotai/kimi-k2.6")
 
-# Z.AI GLM-5.2 (Zhipu AI) via NVIDIA NIM. Large context (131K), full tool-calling
-# + structured-output support, generous free NIM quota. Live-verified 2026-08-18
-# against this account — the two prior GLM generations (glm-5.1, glm-4.7) both
-# returned HTTP 410 "reached end of life" on the same check, so this model ID
-# WILL need re-verifying again eventually; don't assume it's permanent.
+# Z.AI GLM-5.2 via NVIDIA NIM. Dead as of 2026-08-21 (410, end of life).
 GLM_API_KEY: str = os.getenv("ZLM_NVIDIA_KEY", "")
 GLM_MODEL: str = os.getenv("GLM_MODEL", "z-ai/glm-5.2")
 
 # ── Default Gemini model ─────────────────────────────────────────────────────
-# gemini-2.5-flash-lite is deprecated and shuts down 2026-10-16 (was previously
-# the default here). Live-verified 2026-08-18: gemini-3.1-flash-lite is the
-# current GA (non-preview) flash-lite model on this key's free tier — Google's
-# own migration guidance names 3.1-flash-lite as the successor tier. Re-check
-# against `GET generativelanguage.googleapis.com/v1beta/models` if this starts
-# 404ing; Google rotates these every few months.
 GEMINI_DEFAULT_MODEL: str = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-3.1-flash-lite")
 
 # Agent LLM Settings.
-# Shared cross-provider fallback ladder for the Groq-primary structured nodes:
-# GLM (own NIM quota) then Gemini (emergency). Keeps a single provider's daily
-# token cap from ERRORing a whole run — the failure mode that broke the eval.
-_STRUCTURED_FALLBACK = f"{GLM_MODEL}:glm,{GEMINI_DEFAULT_MODEL}:gemini"
+# Shared fallback for the Groq-primary structured nodes. Gemini is the only
+# working alternate right now (Step/GLM/Kimi are all dead or not entitled —
+# see PRODUCTION_GRADE_AND_TOOL_USE_PLAN.md for the full provider audit).
+_STRUCTURED_FALLBACK = f"{GEMINI_DEFAULT_MODEL}:gemini"
 
-# llama-3.3-70b-versatile (the previous default here) was deprecated by Groq on
-# 2026-06-17 and has been removed from this account's model list entirely (a
-# real, confirmed-live outage — see error.md). openai/gpt-oss-120b is Groq's own
-# documented migration target: same free-tier RPM (30), native tool-calling and
-# structured-output support (it's OpenAI's own open-weight release, built for
-# exactly this).
 LIBRARIAN_MODEL: str = os.getenv("LIBRARIAN_MODEL", "openai/gpt-oss-120b")
 LIBRARIAN_PROVIDER: str = os.getenv("LIBRARIAN_PROVIDER", "groq")
 LIBRARIAN_FALLBACK_CHAIN: str = os.getenv("LIBRARIAN_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
@@ -79,29 +56,25 @@ CRITIC_MODEL: str    = os.getenv("CRITIC_MODEL", "openai/gpt-oss-120b")
 CRITIC_PROVIDER: str = os.getenv("CRITIC_PROVIDER", "groq")
 CRITIC_FALLBACK_CHAIN: str = os.getenv("CRITIC_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
 
-# Verifier: high-frequency, structured-output, small batches (≤30 facts). Primary
-# is Groq gpt-oss-120b — generous free RPM and fits the batch size. Gemini's free
-# tier is too small to be a primary here; it's demoted to the last fallback rung
-# where its quota is fine as an emergency.
+# Verifier: high-frequency, small batches (<=30 facts). Gemini's free tier is
+# too small to be primary, so it's the fallback only.
 VERIFIER_MODEL: str  = os.getenv("VERIFIER_MODEL", "openai/gpt-oss-120b")
 VERIFIER_PROVIDER: str = os.getenv("VERIFIER_PROVIDER", "groq")
-# Cross-provider runtime fallback ladder. When the primary fails at *call* time
-# (429/503/timeout) the request fails over to the NEXT entry — provider diversity
-# is the only real mitigation. Format: comma-separated "model:provider"; all do
-# structured output and sit on independent capacity pools.
 VERIFIER_FALLBACK_CHAIN: str = os.getenv("VERIFIER_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
 
-# Writer: long-form synthesis (no structured output). Default to the Nemotron
-# reasoning model when its key is present (high quality + offloads Gemini),
-# otherwise fall back to the default Gemini model. The Writer guards its call
-# with an in-node fallback so a Nemotron error never blocks a report.
-_writer_default_model = NEMOTRON_MODEL if NVIDIA_API_NEMOTRON3_KEY else GEMINI_DEFAULT_MODEL
-_writer_default_provider = "nemotron" if NVIDIA_API_NEMOTRON3_KEY else "gemini"
-WRITER_MODEL: str    = os.getenv("WRITER_MODEL", _writer_default_model)
-WRITER_PROVIDER: str = os.getenv("WRITER_PROVIDER", _writer_default_provider)
-# Writer is plain long-form chat (no structured output); GLM then Gemini are both
-# fine for synthesis and sit on quota independent of Nemotron.
-WRITER_FALLBACK_CHAIN: str = os.getenv("WRITER_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
+# Writer: long-form synthesis from evidence the Verifier has already checked.
+# It assembles prose from pre-verified bullets rather than reasoning its way to
+# new conclusions, so a fast model is the right tool; a large reasoning model
+# costs minutes per report for no quality gain.
+WRITER_MODEL: str    = os.getenv("WRITER_MODEL", "openai/gpt-oss-120b")
+WRITER_PROVIDER: str = os.getenv("WRITER_PROVIDER", "groq")
+# Nemotron sits on the ladder rather than at the front: available when Groq is
+# rate-limited, without paying its latency on every run.
+_writer_fallback = (
+    f"{NEMOTRON_MODEL}:nemotron,{_STRUCTURED_FALLBACK}"
+    if NVIDIA_API_NEMOTRON3_KEY else _STRUCTURED_FALLBACK
+)
+WRITER_FALLBACK_CHAIN: str = os.getenv("WRITER_FALLBACK_CHAIN", _writer_fallback)
 
 # Embedding Settings
 EMBEDDING_MODE: str = os.getenv("EMBEDDING_MODE", "local") # "local" or "openai"
@@ -110,60 +83,84 @@ MAX_CHUNK_TOKENS: int = int(os.getenv("MAX_CHUNK_TOKENS", "300"))
 TOP_K_CHUNKS: int = int(os.getenv("TOP_K_CHUNKS", "15"))
 
 # Refiner Settings
-# Refiner sends entire scraped documents (~40K+ tokens), so the model MUST be
-# large-context. Kimi-K2.6 was the intended primary here (large context, plain
-# completions) but is not usable on this account (see KIMI_API_KEY note above),
-# so GLM-5.2 is primary instead (131K context, own NIM quota, structured output
-# confirmed). Gemini's free tier can't sustain a high-frequency node as primary.
-REFINER_MODEL: str = os.getenv("REFINER_MODEL", GLM_MODEL)
-REFINER_PROVIDER: str = os.getenv("REFINER_PROVIDER", "glm")
-# Cross-provider runtime fallback ladder for the refiner. A runtime failure on the
-# primary fails over to the NEXT entry; every rung must be large-context.
-REFINER_FALLBACK_CHAIN: str = os.getenv(
-    "REFINER_FALLBACK_CHAIN",
-    f"openai/gpt-oss-120b:groq,{GEMINI_DEFAULT_MODEL}:gemini",
-)
+# Sends whole scraped documents, so the model must be large-context. Groq
+# gpt-oss-120b (128K) is primary; Gemini's free tier can't sustain this as primary.
+REFINER_MODEL: str = os.getenv("REFINER_MODEL", "openai/gpt-oss-120b")
+REFINER_PROVIDER: str = os.getenv("REFINER_PROVIDER", "groq")
+REFINER_FALLBACK_CHAIN: str = os.getenv("REFINER_FALLBACK_CHAIN", f"{GEMINI_DEFAULT_MODEL}:gemini")
+
+# Extraction is split into batches sized to fit the primary's per-minute TOKEN
+# budget. Packing every scraped document into one prompt fits the model's
+# context but breaches free-tier TPM limits, and the whole payload is then
+# re-sent to the fallback rung. Batching bounds that: a failed batch costs one
+# batch, not the run. ~4 chars/token, so 32K chars ≈ 8K tokens per request.
+REFINER_BATCH_MAX_CHARS: int = int(os.getenv("REFINER_BATCH_MAX_CHARS", "32000"))
+# Ceiling on a single document's contribution, so one huge page can't by itself
+# produce a batch that breaches the budget.
+REFINER_MAX_DOC_CHARS: int = int(os.getenv("REFINER_MAX_DOC_CHARS", "32000"))
 
 # ── Client-side rate limiting ────────────────────────────────────────────────
-# Proactive per-provider throttle (requests/minute) applied to every LLM call
-# so we stay under provider free-tier RPM limits instead of reactively eating
-# 429s. Tune per your tier. Gemini free flash-lite ≈ 30 RPM → keep margin.
-# google-genai "attempts" (total tries incl. the first); 0 or 1 means NO retries.
-# We want NO in-SDK retries: on a 429/503 the SDK otherwise sleeps *inside* the
-# call (honouring the server's RetryInfo, which on daily-quota exhaustion can be
-# minutes) before raising — which stalls the run and starves the cross-provider
-# fallback ladder, since `.with_fallbacks()` only fires once the primary RAISES.
-# Failing fast hands off to an independent provider in ~1s. The ladder IS the retry.
+# Proactive per-provider throttle (requests/minute), so we stay under free-tier
+# limits instead of reactively eating 429s.
+# GEMINI_MAX_RETRIES=1 means no in-SDK retries: on a 429/503 we want to fail
+# fast to the next fallback provider, not have the SDK sleep and block the run.
 GEMINI_MAX_RETRIES: int = int(os.getenv("GEMINI_MAX_RETRIES", "1"))
-# Hard per-request ceiling (seconds) so a hung socket can't block the run either.
-GEMINI_TIMEOUT: int = int(os.getenv("GEMINI_TIMEOUT", "60"))
+GEMINI_TIMEOUT: int = int(os.getenv("GEMINI_TIMEOUT", "60"))  # hard per-request ceiling
 GEMINI_RPM: int = int(os.getenv("GEMINI_RPM", "25"))
-GROQ_RPM: int = int(os.getenv("GROQ_RPM", "30"))  # openai/gpt-oss-120b free-tier ceiling; x2 with the key pool
+GROQ_RPM: int = int(os.getenv("GROQ_RPM", "30"))  # per key; multiplied by the key pool
 OPENAI_RPM: int = int(os.getenv("OPENAI_RPM", "60"))
 NVIDIA_RPM: int = int(os.getenv("NVIDIA_RPM", "30"))
-# NVIDIA NIM reasoning models are large; keep their rates conservative.
-NEMOTRON_RPM: int = int(os.getenv("NEMOTRON_RPM", "8"))
-STEP_RPM: int = int(os.getenv("STEP_RPM", "10"))
-KIMI_RPM: int = int(os.getenv("KIMI_RPM", "10"))  # unused by default — see KIMI_API_KEY note
-# GLM-5.1 was reported free on NIM at up to 40 RPM with no daily cap; staying
-# under that with margin since GLM-5.2's own limit isn't independently confirmed.
-GLM_RPM: int = int(os.getenv("GLM_RPM", "20"))
-# Burst size for the proactive limiter: how many calls fire immediately before it
-# throttles to the steady RPM. Raised now that every node has a cross-provider
-# fallback ladder — parallel bursts (see the Scout) flow through instead of being
-# serialized, and an occasional 429 fails over rather than stalling the run.
+NEMOTRON_RPM: int = int(os.getenv("NEMOTRON_RPM", "8"))  # large reasoning model, keep conservative
+STEP_RPM: int = int(os.getenv("STEP_RPM", "10"))  # unused, model is dead
+KIMI_RPM: int = int(os.getenv("KIMI_RPM", "10"))  # unused, not entitled
+GLM_RPM: int = int(os.getenv("GLM_RPM", "20"))  # unused, model is dead
+# How many calls fire immediately before the limiter throttles to steady RPM.
 RATE_LIMIT_BURST: int = int(os.getenv("RATE_LIMIT_BURST", "8"))
-# Hard per-request ceiling (seconds) for NIM (OpenAI-compatible) calls. NVIDIA's
-# gateway can sit on a slow request for ~5 min before a 504; this aborts client-side
-# first so a stuck NIM call fails over to the next fallback rung quickly.
+# Client-side timeout for NIM calls, so a stuck request fails over quickly
+# instead of waiting on NVIDIA's own ~5 min gateway timeout.
 NIM_TIMEOUT: int = int(os.getenv("NIM_TIMEOUT", "120"))
 
 # Search Settings
 MAX_SEARCH_RESULTS: int = int(os.getenv("MAX_SEARCH_RESULTS", "5"))
 
 # ── Tool layer / multi-backend search ───────────────────────────────────────
+# web_search tries these in order: Exa → Brave → DuckDuckGo. Each rung is used
+# only if the one before it is unconfigured or returns nothing, so missing keys
+# degrade instead of failing. DuckDuckGo needs no key and is the final backstop.
+#
+# Exa (neural search over a curated index). Its `category` filter is the reason
+# it leads the ladder: asking for a "financial report" is a query parameter
+# rather than a hope about ranking. Free tier is 20k requests/month.
+EXA_API_KEY: str = os.getenv("EXA_API_KEY", "")
+# How much page text Exa returns inline. Text it supplies skips the scraper
+# entirely, so this trades tokens against scrape latency.
+EXA_TEXT_CHARS: int = int(os.getenv("EXA_TEXT_CHARS", "4000"))
+# "text" (default) or "highlights". Text gives continuous prose, which the
+# verbatim-quote grounding in the Verifier needs; highlights are cheaper per
+# result but fragmentary. See _exa_contents_payload().
+EXA_CONTENT_MODE: str = os.getenv("EXA_CONTENT_MODE", "text").strip().lower()
+# auto | fast | instant | deep-lite | deep | deep-reasoning. "auto" balances
+# relevance and latency (~1s). instant/fast/auto/deep-lite all bill at the same
+# rate, so `fast` is free speed — but the `deep` variants cost ~2x per request.
+EXA_SEARCH_TYPE: str = os.getenv("EXA_SEARCH_TYPE", "auto").strip().lower()
+# Results per Exa request. Exa bills $7/1k for the search plus $1/1k *per page*
+# for contents, so each extra result we don't actually use is pure waste. The
+# Scout only registers a handful of sources per sub-query, so 5 is plenty.
+EXA_MAX_RESULTS: int = int(os.getenv("EXA_MAX_RESULTS", "5"))
+# Hours an Exa response stays cached. Re-running a research query is the normal
+# development loop, and each repeat is billed — caching makes it free. 0 = off.
+EXA_CACHE_TTL_HOURS: int = int(os.getenv("EXA_CACHE_TTL_HOURS", "24"))
+
 # Brave Search API (optional). If unset, web_search falls back to DuckDuckGo.
 BRAVE_API_KEY: str = os.getenv("BRAVE_API_KEY", "")
+
+# SEC EDGAR: free, no key, but SEC policy requires a descriptive User-Agent with
+# a contact address, and rate-limits to 10 req/s.
+EDGAR_USER_AGENT: str = os.getenv("EDGAR_USER_AGENT", "ProjectArgus research@project-argus.local")
+EDGAR_MAX_RESULTS: int = int(os.getenv("EDGAR_MAX_RESULTS", "10"))
+# Concurrent primary_doc.xml fetches when enriching filings. SEC allows
+# 10 req/s; stay well under it since scrapes may run alongside.
+EDGAR_ENRICH_CONCURRENCY: int = int(os.getenv("EDGAR_ENRICH_CONCURRENCY", "4"))
 # Semantic Scholar API key (optional). Unset still works but is rate-limited.
 SEMANTIC_SCHOLAR_API_KEY: str = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
 # Crossref "polite pool" contact (recommended by Crossref ToS).
@@ -184,15 +181,9 @@ TOOL_SEARCH_MAX_TOOLS: int = int(os.getenv("TOOL_SEARCH_MAX_TOOLS", "6"))
 #                  "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"]}}
 MCP_SERVERS_JSON: str = os.getenv("MCP_SERVERS_JSON", "")
 
-# Acquisition agent (the tool-calling source gatherer). Must be a model that
-# supports tool/function calling. Defaults to Groq (gpt-oss-120b, tool-calling
-# native): the gatherer fires several tool-calling rounds per sub-query, so
-# keeping it off Gemini keeps Gemini RPM usage low. A deterministic fallback
-# covers any tool-calling failure.
+# Acquisition agent (the tool-calling source gatherer). Must support tool calling.
 GATHERER_MODEL: str = os.getenv("GATHERER_MODEL", "openai/gpt-oss-120b")
 GATHERER_PROVIDER: str = os.getenv("GATHERER_PROVIDER", "groq")
-# Tool-calling fallback ladder (GLM + Gemini both do tool calling). Applies on
-# top of the deterministic mode-aware fallback the gatherer already has.
 GATHERER_FALLBACK_CHAIN: str = os.getenv("GATHERER_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
 # Max tool-calling rounds per sub-query before stopping (cost/loop safety).
 GATHER_MAX_STEPS: int = int(os.getenv("GATHER_MAX_STEPS", "2"))
@@ -209,6 +200,11 @@ KG_LOOKUP_GLOBAL: bool = os.getenv("KG_LOOKUP_SCOPE", "session").lower() == "glo
 
 # Scraper Settings
 SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", "15"))
+# Playwright's browser-close handshake can hang indefinitely with no error
+# (a crawl4ai/Playwright issue, more likely under concurrent scraping). This
+# bounds how long we wait for it before giving up and moving on, so a stuck
+# shutdown can't stall an entire research job.
+CRAWLER_CLOSE_TIMEOUT: int = int(os.getenv("CRAWLER_CLOSE_TIMEOUT", "15"))
 
 # Verifier Settings
 # Facts per verification batch. Larger = fewer LLM calls (less RPM pressure) but
@@ -266,9 +262,57 @@ TRUSTED_DOMAINS: set[str] = {
     "wiley.com",
     "mit.edu",
     "stanford.edu",
-    "harvard.edu",
-    # Note: .gov and .edu top-level domains will be handled via regex/endswith in the filter logic
+    "harvard.edu" # Note: .gov and .edu top-level domains will be handled via regex/endswith in the filter logic
 }
+
+# Major News Outlets — high-credibility non-academic journalism, staff-reported.
+MAJOR_NEWS_DOMAINS: set[str] = {
+    "reuters.com", "bloomberg.com", "bbc.com", "bbc.co.uk",
+    "nytimes.com", "washingtonpost.com", "wsj.com",
+    "cnbc.com", "nbcnews.com", "apnews.com",
+    "theguardian.com", "ft.com", "economist.com",
+    "sciencedaily.com", "arstechnica.com",
+    # Business/financial desks — the tier to trust for market reporting.
+    "fortune.com", "theglobeandmail.com", "theinformation.com",
+    "barrons.com", "axios.com", "politico.com", "latimes.com",
+    "cnn.com", "abcnews.go.com", "cbsnews.com", "time.com",
+}
+
+# Reputable Industry / Market Research firms.
+INDUSTRY_DOMAINS: set[str] = {
+    "marketsandmarkets.com", "grandviewresearch.com",
+    "researchandmarkets.com", "mordorintelligence.com",
+    "statista.com", "iea.org", "irena.org",
+    "mckinsey.com", "bcg.com", "deloitte.com",
+    "pwc.com", "kpmg.com",
+    "yahoo.com",  # yahoo finance/news
+    "cars.com", "notebookcheck.net",
+    # Company / funding databases. Professionally maintained and routinely cited
+    # by financial press — aggregators rather than primary sources, so they sit
+    # at the industry tier, not the government/academic one.
+    "crunchbase.com", "cbinsights.com", "pitchbook.com",
+    "tracxn.com", "dealroom.co", "sacra.com", "caplight.com",
+    # Trade and business press. Real reporting, but either topic-specialist or
+    # carrying contributor content of uneven quality (Forbes' /sites/ network,
+    # Business Insider), so they sit a tier below staff-reported major news.
+    "forbes.com", "techcrunch.com", "businessinsider.com",
+    "morningstar.com", "marketwatch.com", "spacenews.com",
+    "theverge.com", "wired.com", "engadget.com", "zdnet.com",
+    "investopedia.com", "nasdaq.com",
+}
+
+# A source's registrable domain can host at most this many sources per run, so
+# one site (or a network of subpages on it) can't crowd out source diversity.
+MAX_SOURCES_PER_DOMAIN: int = int(os.getenv("MAX_SOURCES_PER_DOMAIN", "2"))
+# Domains scoring at or above this are exempt from that cap — sec.gov and
+# journal publishers legitimately supply many documents, and capping them
+# throws away primary sources to make room for blogs.
+AUTHORITATIVE_CREDIBILITY: float = float(os.getenv("AUTHORITATIVE_CREDIBILITY", "0.8"))
+
+# Below this average source credibility, the research loop re-searches broadly
+# (upgrading toward trusted sources) instead of chasing individual unverified
+# claims, which tends to just re-find the same low-quality source.
+LOW_SOURCE_CREDIBILITY_THRESHOLD: float = float(os.getenv("LOW_SOURCE_CREDIBILITY_THRESHOLD", "0.5"))
 
 # Data Directories
 DATA_DIR = PROJECT_ROOT / "data"

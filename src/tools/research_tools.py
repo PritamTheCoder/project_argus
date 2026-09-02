@@ -19,7 +19,7 @@ from typing import Any, Dict, List
 
 from langchain_core.tools import tool
 
-from src.config import ACADEMIC_MAX_RESULTS, KG_LOOKUP_GLOBAL
+from src.config import ACADEMIC_MAX_RESULTS, EDGAR_MAX_RESULTS, KG_LOOKUP_GLOBAL
 from src.tools import providers
 from src.tools.registry import ToolSpec, registry
 
@@ -46,11 +46,36 @@ def reset_kg_session(token: contextvars.Token) -> None:
 # ── Search tools (yield retrieval candidates) ────────────────────────────────
 
 @tool
-async def web_search(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+async def web_search(query: str, limit: int = 8, category: str = "") -> List[Dict[str, Any]]:
     """Search the general web (news, company sites, blogs, market data).
     Best for current events, market/commercial information, product announcements,
-    and non-academic topics. Returns candidate web pages to be scraped."""
-    results = await providers.web_search(query, limit=limit)
+    and non-academic topics.
+    Set `category` to steer results toward a source type when the question calls
+    for one: "news", "company", "financial report", "publication", "people", or
+    "personal site". Leave it empty for a general search.
+    Returns candidate pages to be scraped."""
+    results = await providers.web_search(query, limit=limit, category=category or None)
+    return [r.to_candidate() for r in results]
+
+
+@tool
+async def sec_edgar_search(
+    query: str, limit: int = EDGAR_MAX_RESULTS, forms: str = "", cik: str = ""
+) -> List[Dict[str, Any]]:
+    """Search official SEC EDGAR filings — US regulatory primary sources.
+    Best for company financials, funding rounds, ownership, and risk disclosures:
+    these are the filings themselves, not news coverage about them.
+
+    STRONGLY PREFER passing `cik` (the company's SEC identifier) or its stock
+    ticker: a plain name search mostly returns SPVs and feeder funds set up to
+    invest in the company, whose amounts are NOT the company's funding rounds.
+    A ticker or exact registered name is resolved to a CIK automatically.
+
+    `forms` optionally filters by type, e.g. "D" (private placements / funding
+    rounds), "10-K" (annual report), "8-K" (material events), "S-1" (IPO).
+    Note: Form D reports the amount raised, NOT the company's valuation — no SEC
+    filing states a private company's valuation."""
+    results = await providers.edgar_search(query, limit=limit, forms=forms or None, cik=cik or None)
     return [r.to_candidate() for r in results]
 
 
@@ -169,6 +194,9 @@ def _register_default_tools() -> None:
                  when_to_use="latest preprints in physics/CS/math", yields_candidates=True),
         ToolSpec(name="crossref_search", tool=crossref_search, tags=["retrieval", "academic"],
                  when_to_use="formally published papers across publishers", yields_candidates=True),
+        ToolSpec(name="sec_edgar_search", tool=sec_edgar_search, tags=["retrieval", "financial"],
+                 when_to_use="company financials, funding rounds, ownership — official SEC filings as primary sources",
+                 yields_candidates=True),
         ToolSpec(name="kg_lookup", tool=kg_lookup, tags=["memory"],
                  when_to_use="check already-known facts before searching", yields_candidates=False),
         ToolSpec(name="calculator", tool=calculator, tags=["compute"],
