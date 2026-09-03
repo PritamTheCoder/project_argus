@@ -68,13 +68,10 @@ VERIFIER_FALLBACK_CHAIN: str = os.getenv("VERIFIER_FALLBACK_CHAIN", _STRUCTURED_
 # costs minutes per report for no quality gain.
 WRITER_MODEL: str    = os.getenv("WRITER_MODEL", "openai/gpt-oss-120b")
 WRITER_PROVIDER: str = os.getenv("WRITER_PROVIDER", "groq")
-# Nemotron sits on the ladder rather than at the front: available when Groq is
-# rate-limited, without paying its latency on every run.
-_writer_fallback = (
-    f"{NEMOTRON_MODEL}:nemotron,{_STRUCTURED_FALLBACK}"
-    if NVIDIA_API_NEMOTRON3_KEY else _STRUCTURED_FALLBACK
-)
-WRITER_FALLBACK_CHAIN: str = os.getenv("WRITER_FALLBACK_CHAIN", _writer_fallback)
+# Nemotron is deliberately NOT on this ladder: it fails over slowly enough
+# (long retry-after on a 503) to blow the per-case timeout on its own. Set
+# WRITER_FALLBACK_CHAIN to re-insert it if its availability improves.
+WRITER_FALLBACK_CHAIN: str = os.getenv("WRITER_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
 
 # Embedding Settings
 EMBEDDING_MODE: str = os.getenv("EMBEDDING_MODE", "local") # "local" or "openai"
@@ -90,14 +87,15 @@ REFINER_PROVIDER: str = os.getenv("REFINER_PROVIDER", "groq")
 REFINER_FALLBACK_CHAIN: str = os.getenv("REFINER_FALLBACK_CHAIN", f"{GEMINI_DEFAULT_MODEL}:gemini")
 
 # Extraction is split into batches sized to fit the primary's per-minute TOKEN
-# budget. Packing every scraped document into one prompt fits the model's
-# context but breaches free-tier TPM limits, and the whole payload is then
-# re-sent to the fallback rung. Batching bounds that: a failed batch costs one
-# batch, not the run. ~4 chars/token, so 32K chars ≈ 8K tokens per request.
-REFINER_BATCH_MAX_CHARS: int = int(os.getenv("REFINER_BATCH_MAX_CHARS", "32000"))
+# budget, NOT its context window. Free-tier Groq allows ~8K tokens/minute for
+# this model, so a batch near that ceiling consumes the whole minute and 413s
+# the moment any other call overlaps it. ~4 chars/token, so 12K chars ≈ 3K
+# tokens of documents, leaving room for the schema, instructions, the response,
+# and the other nodes sharing the same bucket.
+REFINER_BATCH_MAX_CHARS: int = int(os.getenv("REFINER_BATCH_MAX_CHARS", "12000"))
 # Ceiling on a single document's contribution, so one huge page can't by itself
 # produce a batch that breaches the budget.
-REFINER_MAX_DOC_CHARS: int = int(os.getenv("REFINER_MAX_DOC_CHARS", "32000"))
+REFINER_MAX_DOC_CHARS: int = int(os.getenv("REFINER_MAX_DOC_CHARS", "12000"))
 
 # ── Client-side rate limiting ────────────────────────────────────────────────
 # Proactive per-provider throttle (requests/minute), so we stay under free-tier
@@ -116,6 +114,17 @@ KIMI_RPM: int = int(os.getenv("KIMI_RPM", "10"))  # unused, not entitled
 GLM_RPM: int = int(os.getenv("GLM_RPM", "20"))  # unused, model is dead
 # How many calls fire immediately before the limiter throttles to steady RPM.
 RATE_LIMIT_BURST: int = int(os.getenv("RATE_LIMIT_BURST", "8"))
+
+# Tokens-per-minute ceilings. RPM alone is the wrong constraint: free-tier Groq
+# rejects on tokens long before requests. 0 disables the token gate for that provider.
+GROQ_TPM: int = int(os.getenv("GROQ_TPM", "8000"))       # per key, like GROQ_RPM
+GEMINI_TPM: int = int(os.getenv("GEMINI_TPM", "0"))      # free tier gates on RPM/RPD, not TPM
+OPENAI_TPM: int = int(os.getenv("OPENAI_TPM", "0"))
+NVIDIA_TPM: int = int(os.getenv("NVIDIA_TPM", "0"))
+NEMOTRON_TPM: int = int(os.getenv("NEMOTRON_TPM", "0"))
+# Tokens assumed for a call before its true size is known. The limiter replaces
+# this with a running average of observed usage as responses come back.
+RATE_LIMIT_DEFAULT_CALL_TOKENS: int = int(os.getenv("RATE_LIMIT_DEFAULT_CALL_TOKENS", "2000"))
 # Client-side timeout for NIM calls, so a stuck request fails over quickly
 # instead of waiting on NVIDIA's own ~5 min gateway timeout.
 NIM_TIMEOUT: int = int(os.getenv("NIM_TIMEOUT", "120"))
@@ -161,8 +170,15 @@ EDGAR_MAX_RESULTS: int = int(os.getenv("EDGAR_MAX_RESULTS", "10"))
 # Concurrent primary_doc.xml fetches when enriching filings. SEC allows
 # 10 req/s; stay well under it since scrapes may run alongside.
 EDGAR_ENRICH_CONCURRENCY: int = int(os.getenv("EDGAR_ENRICH_CONCURRENCY", "4"))
-# Semantic Scholar API key (optional). Unset still works but is rate-limited.
-SEMANTIC_SCHOLAR_API_KEY: str = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+# Semantic Scholar API key (optional). Unauthenticated requests share one global
+# pool and get throttled during heavy use; a key gives a dedicated 1 RPS.
+# SS2_API_KEY is accepted as an alias.
+SEMANTIC_SCHOLAR_API_KEY: str = os.getenv("SEMANTIC_SCHOLAR_API_KEY") or os.getenv("SS2_API_KEY", "")
+# Client-side ceiling. The Scout issues sub-queries concurrently, so without
+# this a burst would exceed the 1 RPS allowance and be rejected.
+SEMANTIC_SCHOLAR_RPS: float = float(os.getenv("SEMANTIC_SCHOLAR_RPS", "1.0"))
+# Repeat sub-queries across loop iterations are served from cache, not quota.
+SEMANTIC_SCHOLAR_CACHE_TTL_HOURS: int = int(os.getenv("SEMANTIC_SCHOLAR_CACHE_TTL_HOURS", "24"))
 # Crossref "polite pool" contact (recommended by Crossref ToS).
 CROSSREF_MAILTO: str = os.getenv("CROSSREF_MAILTO", "research@project-argus.local")
 # Shared HTTP timeout (seconds) for tool/provider network calls.
@@ -173,7 +189,7 @@ ACADEMIC_MAX_RESULTS: int = int(os.getenv("ACADEMIC_MAX_RESULTS", "8"))
 # Tool search: when the tool catalog exceeds this many tools, the acquisition
 # agent binds only the top-N most relevant tools rather than every tool. Below
 # this, all tools are bound (no embedding work).
-TOOL_SEARCH_MAX_TOOLS: int = int(os.getenv("TOOL_SEARCH_MAX_TOOLS", "6"))
+TOOL_SEARCH_MAX_TOOLS: int = int(os.getenv("TOOL_SEARCH_MAX_TOOLS", "8"))
 
 # MCP (Model Context Protocol) servers to load tools from at startup. JSON map
 # of {server_name: {transport, command/args or url}}. Empty = MCP disabled.
@@ -200,6 +216,13 @@ KG_LOOKUP_GLOBAL: bool = os.getenv("KG_LOOKUP_SCOPE", "session").lower() == "glo
 
 # Scraper Settings
 SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", "15"))
+# Seconds to let a thin page finish rendering before re-reading it. Cheaper and
+# more effective than relaunching a browser, which is what this replaced.
+SCRAPE_RETRY_SETTLE_S: float = float(os.getenv("SCRAPE_RETRY_SETTLE_S", "2.0"))
+# Retry thin pages in a visible browser. Off by default: launching a second,
+# headed Chromium per thin page is pure thermal/CPU cost with no extraction
+# benefit for most sites. Enable only for sites that detect headless browsers.
+SCRAPE_RETRY_HEADED: bool = os.getenv("SCRAPE_RETRY_HEADED", "false").lower() == "true"
 # Playwright's browser-close handshake can hang indefinitely with no error
 # (a crawl4ai/Playwright issue, more likely under concurrent scraping). This
 # bounds how long we wait for it before giving up and moving on, so a stuck
@@ -308,6 +331,24 @@ MAX_SOURCES_PER_DOMAIN: int = int(os.getenv("MAX_SOURCES_PER_DOMAIN", "2"))
 # journal publishers legitimately supply many documents, and capping them
 # throws away primary sources to make room for blogs.
 AUTHORITATIVE_CREDIBILITY: float = float(os.getenv("AUTHORITATIVE_CREDIBILITY", "0.8"))
+
+# Query-to-source relevance. Credibility says a source is trustworthy; it says
+# nothing about whether the source is about the question, and retrieval only
+# ranks candidates relative to each other. Below this cosine similarity a
+# source is logged as likely off-topic however authoritative it scores.
+LOW_RELEVANCE_THRESHOLD: float = float(os.getenv("LOW_RELEVANCE_THRESHOLD", "0.35"))
+# Drop off-topic sources instead of only logging them. Credibility scores what
+# a URL *looks* like, not what it's about, so an off-topic source can still rate
+# highly and reach (and be charged for by) the Refiner. Set false to measure
+# without filtering.
+RELEVANCE_GATE_ENABLED: bool = os.getenv("RELEVANCE_GATE_ENABLED", "true").lower() == "true"
+# Floor, not a target: restoring a known off-topic source is the very harm the
+# gate exists to prevent, so it happens only when the alternative is no evidence
+# at all. Thin-but-relevant evidence is the Critic's job to re-search, not this
+# backstop's job to pad.
+RELEVANCE_GATE_MIN_SOURCES: int = int(os.getenv("RELEVANCE_GATE_MIN_SOURCES", "1"))
+# Characters of a source sampled for the relevance embedding.
+RELEVANCE_SAMPLE_CHARS: int = int(os.getenv("RELEVANCE_SAMPLE_CHARS", "2000"))
 
 # Below this average source credibility, the research loop re-searches broadly
 # (upgrading toward trusted sources) instead of chasing individual unverified
