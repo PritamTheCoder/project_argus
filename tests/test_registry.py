@@ -61,7 +61,10 @@ def test_default_registry_has_expected_tools():
 
 def test_default_registry_candidate_tools_are_search_backends():
     candidates = set(default_registry.candidate_tool_names())
-    assert candidates == {"web_search", "semantic_scholar_search", "arxiv_search", "crossref_search"}
+    assert candidates == {
+        "web_search", "semantic_scholar_search", "arxiv_search",
+        "crossref_search", "sec_edgar_search", "europe_pmc_search",
+    }
 
 
 def test_retrieval_tag_excludes_utility_tools():
@@ -69,6 +72,36 @@ def test_retrieval_tag_excludes_utility_tools():
     assert "calculator" not in names
     assert "kg_lookup" not in names
     assert "web_search" in names
+
+
+# ── kg_lookup session scoping ────────────────────────────────────────────────
+
+def test_kg_lookup_returns_empty_without_bound_session():
+    """Session-scoped by default: no run bound → returns [] without touching the DB."""
+    from unittest.mock import patch, MagicMock
+    from src.tools.research_tools import kg_lookup
+
+    store = MagicMock()
+    with patch("src.graph.kg.kg_store", store):
+        assert kg_lookup.invoke({"query": "anything"}) == []
+    store.retrieve_relevant_facts.assert_not_called()
+
+
+def test_kg_lookup_scopes_to_bound_session():
+    """A bound session id is passed through to KG retrieval (no cross-run leak)."""
+    from unittest.mock import patch, MagicMock
+    from src.tools.research_tools import kg_lookup, set_kg_session, reset_kg_session
+
+    store = MagicMock()
+    store.retrieve_relevant_facts.return_value = []
+    token = set_kg_session("run-abc")
+    try:
+        with patch("src.utils.embeddings.get_embeddings", return_value=[[0.1] * 384]), \
+             patch("src.graph.kg.kg_store", store):
+            kg_lookup.invoke({"query": "q"})
+    finally:
+        reset_kg_session(token)
+    assert store.retrieve_relevant_facts.call_args.kwargs["session_id"] == "run-abc"
 
 
 # ── Calculator pure logic ────────────────────────────────────────────────────

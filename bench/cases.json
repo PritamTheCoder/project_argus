@@ -1,0 +1,82 @@
+[
+  {
+    "id": "sci_solid_state_batteries",
+    "domain": "hard_science",
+    "query": "What are the latest breakthroughs in solid-state batteries as of 2024-2026, including energy density figures and the key companies involved?",
+    "must_include": ["solid-state", "energy density", "Wh/kg"],
+    "must_not_include": [],
+    "min_coverage": 0.6,
+    "min_credibility": 0.6,
+    "notes": "Baseline hard-science case. Academic backends should dominate; expect high credibility and quantitative figures."
+  },
+  {
+    "id": "sci_quantum_error_correction",
+    "domain": "hard_science",
+    "query": "What are the most recent advances in quantum error correction and their reported logical qubit error rates?",
+    "must_include": ["error correction", "qubit"],
+    "must_not_include": [],
+    "min_coverage": 0.5,
+    "min_credibility": 0.6,
+    "notes": "Fast-moving science. Probes recency handling and numeric claim extraction."
+  },
+  {
+    "id": "tech_hybrid_retrieval",
+    "domain": "cs_technical",
+    "query": "What is the current status of hybrid retrieval (BM25 plus dense embeddings) for RAG systems, and what do benchmarks show about its advantage over dense-only retrieval?",
+    "must_include": ["BM25", "embedding", "retrieval"],
+    "must_not_include": [],
+    "min_coverage": 0.6,
+    "min_credibility": 0.55,
+    "notes": "Applied CS. Mix of arXiv preprints and engineering blogs — tests tier separation."
+  },
+  {
+    "id": "fin_private_valuation",
+    "domain": "finance_private",
+    "query": "Analyse SpaceX's valuation growth over time, identifying the major valuation milestones, key events, and funding factors that drove each major increase.",
+    "must_include": ["valuation", "funding", "SpaceX"],
+    "must_not_include": [],
+    "min_coverage": 0.6,
+    "min_credibility": 0.5,
+    "notes": "The case that exposed the 0.4 floor. No public filing states a private valuation, so credibility should plateau below the science cases — a lower score here is correct, not a failure."
+  },
+  {
+    "id": "fin_public_filings",
+    "domain": "finance_public",
+    "query": "Analyse NVIDIA's revenue growth and gross margin trend over the last three fiscal years based on its SEC filings.",
+    "must_include": ["revenue", "margin", "NVIDIA"],
+    "must_not_include": [],
+    "min_coverage": 0.6,
+    "min_credibility": 0.65,
+    "notes": "Public company with real 10-K/10-Q filings. This is the case that should exercise CIK-scoped EDGAR properly — if credibility here is not high, the primary-source path is not working."
+  },
+  {
+    "id": "bio_glp1_outcomes",
+    "domain": "biomedical",
+    "query": "What does recent clinical trial evidence show about cardiovascular outcomes for GLP-1 receptor agonists?",
+    "must_include": ["GLP-1", "cardiovascular", "trial"],
+    "must_not_include": [],
+    "min_coverage": 0.6,
+    "min_credibility": 0.7,
+    "notes": "Biomedical evidence. Should route to peer-reviewed literature; low credibility here means medical queries are falling through to general web."
+  },
+  {
+    "id": "policy_ai_regulation",
+    "domain": "policy_regulatory",
+    "query": "What are the key compliance obligations imposed on general-purpose AI model providers by the EU AI Act, and when do they take effect?",
+    "must_include": ["AI Act", "obligation"],
+    "must_not_include": [],
+    "min_coverage": 0.5,
+    "min_credibility": 0.6,
+    "notes": "Regulatory. Primary sources are official EU texts (.europa.eu); tests whether the system reaches authoritative institutional sources rather than law-firm summaries."
+  },
+  {
+    "id": "news_recent_event",
+    "domain": "current_events",
+    "query": "What were the most significant developments in commercial spaceflight in the last six months, and which organisations were involved?",
+    "must_include": ["launch"],
+    "must_not_include": [],
+    "min_coverage": 0.5,
+    "min_credibility": 0.55,
+    "notes": "Recency-sensitive. Tests date handling and whether news-tier sources are correctly graded above blogs."
+  }
+]

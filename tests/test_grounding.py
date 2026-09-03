@@ -7,6 +7,7 @@ from src.utils.grounding import (
     quote_is_grounded,
     apply_quote_grounding,
     annotate_corroboration,
+    merged_source_keys,
 )
 
 
@@ -134,3 +135,43 @@ def test_corroboration_dissimilar_claims_not_grouped():
     annotate_corroboration(facts)
     assert facts[0]["corroboration_count"] == 1
     assert facts[1]["corroboration_count"] == 1
+
+
+# ── merged_source_keys ───────────────────────────────────────────────────────
+
+def test_merged_source_keys_falls_back_to_own_source():
+    assert merged_source_keys({"source_url": "http://a"}) == ["http://a"]
+    assert merged_source_keys({"source_id": "[1]"}) == ["[1]"]
+    assert merged_source_keys({}) == []
+
+
+def test_merged_source_keys_prefers_merged_list():
+    fact = {"source_url": "http://a", "merged_sources": ["http://a", "http://b"]}
+    assert merged_source_keys(fact) == ["http://a", "http://b"]
+
+
+def test_corroboration_counts_merged_sources_without_embedding():
+    """A merged fact is corroborated even when clustering is unavailable."""
+    facts = [{
+        "claim": "A", "source_url": "http://a",
+        "merged_sources": ["http://a", "http://b"],
+        "support_level": "SUPPORTED", "confidence": 0.95,
+    }]
+    annotate_corroboration(facts)
+    assert facts[0]["corroboration_count"] == 2
+    assert facts[0]["single_source_warning"] is False
+    assert facts[0]["confidence"] == 0.95  # not capped
+
+
+def test_corroboration_merged_sources_combine_across_cluster():
+    emb = [1.0] + [0.0] * 383
+    facts = [
+        {"claim": "A", "source_url": "http://a", "embedding": emb,
+         "merged_sources": ["http://a", "http://b"],
+         "support_level": "SUPPORTED", "confidence": 0.9},
+        {"claim": "A2", "source_url": "http://c", "embedding": emb,
+         "merged_sources": ["http://c"],
+         "support_level": "SUPPORTED", "confidence": 0.9},
+    ]
+    annotate_corroboration(facts)
+    assert facts[0]["corroboration_count"] == 3

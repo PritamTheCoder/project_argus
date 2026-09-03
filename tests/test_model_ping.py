@@ -19,6 +19,10 @@ from src.config import (
     REFINER_MODEL, REFINER_PROVIDER,
 )
 
+# Every test here calls a real provider API, so the whole module is a live probe:
+# skipped by default, run with `pytest --run-live` (see conftest.py).
+pytestmark = pytest.mark.live
+
 # Each tuple: (test_id, model_name, provider)
 AGENT_MODELS = [
     ("librarian", LIBRARIAN_MODEL, LIBRARIAN_PROVIDER),

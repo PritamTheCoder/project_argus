@@ -73,6 +73,33 @@ class ToolCallTracer:
             "by_tool": by_tool,
         }
 
+    def backend_health(self) -> Dict[str, Dict[str, Any]]:
+        """Per-retrieval-backend health for the whole run.
+
+        A backend that raises is already visible as a failure. The dangerous
+        case is one that succeeds and returns nothing: the pipeline then falls
+        through to whatever other backend answered, which may be the wrong
+        corpus entirely, and the run still reports high credibility. `degraded`
+        marks a backend that was called and never returned a single result.
+        """
+        health: Dict[str, Dict[str, Any]] = {}
+        for r in self.records:
+            h = health.setdefault(r.name, {
+                "calls": 0, "failures": 0, "empty_calls": 0,
+                "results": 0, "latency_ms": 0.0,
+            })
+            h["calls"] += 1
+            h["failures"] += 0 if r.success else 1
+            h["results"] += r.result_count or 0
+            h["latency_ms"] += r.latency_ms
+            if r.success and not (r.result_count or 0):
+                h["empty_calls"] += 1
+
+        for h in health.values():
+            h["latency_ms"] = round(h["latency_ms"], 1)
+            h["degraded"] = h["results"] == 0 and h["calls"] > 0
+        return health
+
 
 class timed_tool_call:
     """Async context manager that records one tool call into a tracer.

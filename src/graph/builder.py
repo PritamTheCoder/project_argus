@@ -3,6 +3,7 @@ Project Argus - Graph Builder
 
 Wires agent nodes into a cyclic LangGraph StateGraph:
     START → librarian → scout → refiner → verifier → fact_checker →(conditional)→
+        ├→ scout               (avg source credibility too low — broaden, don't chase claims)
         ├→ reflector → scout   (targeted gap-fill loop when gaps detected)
         ├→ scout               (broad re-search loop when no specific gaps)
         └→ ghostwriter → END
@@ -14,7 +15,7 @@ import logging
 from langgraph.graph import StateGraph, START, END
 
 from src.schema.state import AgentState
-from src.config import MAX_RESEARCH_LOOPS
+from src.config import MAX_RESEARCH_LOOPS, LOW_SOURCE_CREDIBILITY_THRESHOLD
 
 from src.agents.librarian import librarian_node
 from src.agents.scout import scout_node
@@ -31,6 +32,10 @@ logger = logging.getLogger(__name__)
 def route_after_critic(state: AgentState) -> str:
     """
     Decide what happens after the fact-checker:
+      • sources have been consistently low-credibility → "scout" (broad
+        re-search with the Critic's trusted-mode queries, not the Reflector's
+        claim-chasing ones — chasing an unverified claim tends to just re-find
+        the low-credibility source that made it)
       • gaps + specific claims detected → "reflector" (targeted sub-queries)
       • re-search requested but no specific gaps → "scout" (broad re-search)
       • loop cap hit or sufficient evidence → "consensus" (then Writer)
@@ -39,8 +44,16 @@ def route_after_critic(state: AgentState) -> str:
     gap_detected = state.get("knowledge_gap_detected", False)
     knowledge_gaps = state.get("knowledge_gaps", [])
     iteration = state.get("iteration_count", 0)
+    avg_credibility = (state.get("quality_score") or {}).get("avg_source_credibility", 1.0)
 
     if re_search and iteration < MAX_RESEARCH_LOOPS:
+        if avg_credibility < LOW_SOURCE_CREDIBILITY_THRESHOLD:
+            logger.info(
+                f"Router: avg source credibility {avg_credibility:.2f} is below "
+                f"{LOW_SOURCE_CREDIBILITY_THRESHOLD} (iteration {iteration}/{MAX_RESEARCH_LOOPS}). "
+                "Broadening search toward trusted sources instead of chasing claims."
+            )
+            return "scout"
         if gap_detected and knowledge_gaps:
             logger.info(
                 f"Router: {len(knowledge_gaps)} specific gap(s) detected "

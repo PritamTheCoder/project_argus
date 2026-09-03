@@ -80,6 +80,22 @@ def _fact_source_key(fact: Dict[str, Any]) -> str:
     return fact.get("source_url", "") or fact.get("source_id", "")
 
 
+def merged_source_keys(fact: Dict[str, Any]) -> List[str]:
+    """
+    Every distinct source backing a fact.
+
+    The Verifier folds near-duplicate claims from other sources into the
+    survivor's ``merged_sources``; those sources still corroborate the claim, so
+    they must count here. Falls back to the fact's own source when it was never
+    merged.
+    """
+    merged = fact.get("merged_sources")
+    if merged:
+        return [k for k in merged if k]
+    key = _fact_source_key(fact)
+    return [key] if key else []
+
+
 def annotate_corroboration(
     facts: List[Dict[str, Any]],
     sim_threshold: float = 0.85,
@@ -100,19 +116,18 @@ def annotate_corroboration(
     n = len(facts)
 
     for i, f in enumerate(facts):
-        if embs[i] is None:
-            f["corroboration_count"] = 1
-            f["single_source_warning"] = True
-            continue
+        # Sources already folded into this claim by the Verifier's merge step
+        # count even when no embedding is available to cluster on.
+        sources = set(merged_source_keys(f))
 
-        sources = {_fact_source_key(f)}
-        for j in range(n):
-            if j == i or embs[j] is None:
-                continue
-            if _cosine(embs[i], embs[j]) >= sim_threshold:
-                sources.add(_fact_source_key(facts[j]))
+        if embs[i] is not None:
+            for j in range(n):
+                if j == i or embs[j] is None:
+                    continue
+                if _cosine(embs[i], embs[j]) >= sim_threshold:
+                    sources.update(merged_source_keys(facts[j]))
 
-        count = len(sources)
+        count = max(len(sources), 1)
         f["corroboration_count"] = count
         if count < 2:
             f["single_source_warning"] = True

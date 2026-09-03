@@ -5,10 +5,14 @@ import os
 import asyncio
 import logging
 import warnings
+from contextlib import asynccontextmanager
 import aiohttp
 import fitz  # PyMuPDF
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-from src.config import SCRAPE_TIMEOUT
+from src.config import (
+    SCRAPE_TIMEOUT, CRAWLER_CLOSE_TIMEOUT,
+    SCRAPE_RETRY_SETTLE_S, SCRAPE_RETRY_HEADED,
+)
 from src.utils.cache import get_cached_markdown, set_cached_markdown, init_db
 import re
 
@@ -218,23 +222,28 @@ async def _scrape_single(
         if result.success:
             content = result.markdown or ""
 
-            # Some pages render near-empty on first load; retry headed.
+            # Some pages render near-empty on first load. Retry on the shared
+            # browser with a longer settle rather than launching a second,
+            # headed one — SCRAPE_RETRY_HEADED opts back into headed mode for
+            # sites that genuinely detect headless browsers.
             if len(content) < 1000:
-                logger.info(f"[!] Scrape of {url} yielded only {len(content)} chars. Retrying with headless=False...")
+                logger.info(
+                    f"[!] Scrape of {url} yielded only {len(content)} chars. Retrying with a longer settle..."
+                )
                 try:
-                    retry_browser_config = BrowserConfig(headless=False, verbose=False)
                     retry_run_config = CrawlerRunConfig(
                         word_count_threshold=run_config.word_count_threshold,
                         excluded_tags=run_config.excluded_tags,
                         exclude_external_links=run_config.exclude_external_links,
                         page_timeout=SCRAPE_TIMEOUT * 1000,  # ms
+                        delay_before_return_html=SCRAPE_RETRY_SETTLE_S,
                     )
-                    async with AsyncWebCrawler(config=retry_browser_config) as retry_crawler:
-                        retry_result = await retry_crawler.arun(
-                            url=url, config=retry_run_config
-                        )
-                        # Settle pending network requests/frames
-                        await asyncio.sleep(1.0)
+                    if SCRAPE_RETRY_HEADED:
+                        async with AsyncWebCrawler(config=BrowserConfig(headless=False, verbose=False)) as headed:
+                            retry_result = await headed.arun(url=url, config=retry_run_config)
+                    else:
+                        retry_result = await crawler.arun(url=url, config=retry_run_config)
+
                     if retry_result.success and retry_result.markdown and len(retry_result.markdown) > len(content):
                         content = retry_result.markdown
                         logger.info(f"    [+] Retry successful! Extracted {len(content)} chars.")
@@ -301,13 +310,45 @@ async def _scrape_single(
         }
 
 
-async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
+def _browser_config() -> BrowserConfig:
+    return BrowserConfig(headless=True, verbose=False)
+
+
+@asynccontextmanager
+async def shared_crawler():
+    """One browser instance for a whole batch of scrape_urls() calls, instead
+    of one Chromium process per call — avoids exhausting OS process limits
+    when Scout scrapes several sub-queries concurrently.
+
+    Uses explicit start()/close() rather than `async with AsyncWebCrawler(...)`
+    so close() can be time-boxed: Playwright's browser-close handshake can hang
+    indefinitely without raising. On timeout we log and move on — a leaked
+    browser process is a smaller problem than a permanently hung job.
+    """
+    crawler = AsyncWebCrawler(config=_browser_config())
+    await crawler.start()
+    try:
+        yield crawler
+    finally:
+        try:
+            await asyncio.wait_for(crawler.close(), timeout=CRAWLER_CLOSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(f"Browser close did not finish within {CRAWLER_CLOSE_TIMEOUT}s — continuing without it.")
+        except Exception as e:
+            logger.warning(f"Browser close raised {type(e).__name__}: {e}")
+
+
+async def scrape_urls(urls: list[str], query: str = "", crawler: AsyncWebCrawler | None = None) -> list[dict]:
     """
     Scrape multiple URLs concurrently using Crawl4AI.
 
     Fetches the full DOM, strips boilerplate (navbars, ads, footers),
     and returns clean Markdown for each page. Failed URLs return
     structured errors instead of crashing the pipeline.
+
+    ``crawler``: reuse an existing ``AsyncWebCrawler`` instead of opening a new
+    one. Omit for a one-off scrape; concurrent callers should share one via
+    ``shared_crawler()``.
 
     Returns:
         List of result dicts, each with keys:
@@ -321,11 +362,6 @@ async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
 
     logger.info(f"Scraping {len(urls)} URLs concurrently...")
 
-    browser_config = BrowserConfig(
-        headless=True,
-        verbose=False,
-    )
-
     run_config = CrawlerRunConfig(
         word_count_threshold=10,
         excluded_tags=["nav", "footer", "header", "aside", "script", "style"],
@@ -333,15 +369,11 @@ async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
         page_timeout=SCRAPE_TIMEOUT * 1000,  # ms — Playwright-native timeout
     )
 
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        tasks = [
-            _scrape_single(crawler, url, run_config, query)
-            for url in urls
-        ]
-        # Use return_exceptions=True to prevent a single TargetClosedError from crashing the batch
-        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
-        # Give Playwright time to clean up frames / pending navigations
-        await asyncio.sleep(1.0)
+    if crawler is not None:
+        raw_results = await _scrape_batch(crawler, urls, run_config, query)
+    else:
+        async with shared_crawler() as owned_crawler:
+            raw_results = await _scrape_batch(owned_crawler, urls, run_config, query)
 
     results = []
     for url, res in zip(urls, raw_results):
@@ -360,3 +392,12 @@ async def scrape_urls(urls: list[str], query: str = "") -> list[dict]:
     logger.info(f"Scraping complete: {successful}/{len(urls)} succeeded")
 
     return results
+
+
+async def _scrape_batch(crawler: AsyncWebCrawler, urls: list[str], run_config: CrawlerRunConfig, query: str) -> list:
+    tasks = [_scrape_single(crawler, url, run_config, query) for url in urls]
+    # Use return_exceptions=True to prevent a single TargetClosedError from crashing the batch
+    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Give Playwright time to clean up frames / pending navigations
+    await asyncio.sleep(1.0)
+    return raw_results
