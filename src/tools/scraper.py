@@ -9,7 +9,10 @@ from contextlib import asynccontextmanager
 import aiohttp
 import fitz  # PyMuPDF
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig
-from src.config import SCRAPE_TIMEOUT, CRAWLER_CLOSE_TIMEOUT
+from src.config import (
+    SCRAPE_TIMEOUT, CRAWLER_CLOSE_TIMEOUT,
+    SCRAPE_RETRY_SETTLE_S, SCRAPE_RETRY_HEADED,
+)
 from src.utils.cache import get_cached_markdown, set_cached_markdown, init_db
 import re
 
@@ -219,23 +222,28 @@ async def _scrape_single(
         if result.success:
             content = result.markdown or ""
 
-            # Some pages render near-empty on first load; retry headed.
+            # Some pages render near-empty on first load. Retry on the shared
+            # browser with a longer settle rather than launching a second,
+            # headed one — SCRAPE_RETRY_HEADED opts back into headed mode for
+            # sites that genuinely detect headless browsers.
             if len(content) < 1000:
-                logger.info(f"[!] Scrape of {url} yielded only {len(content)} chars. Retrying with headless=False...")
+                logger.info(
+                    f"[!] Scrape of {url} yielded only {len(content)} chars. Retrying with a longer settle..."
+                )
                 try:
-                    retry_browser_config = BrowserConfig(headless=False, verbose=False)
                     retry_run_config = CrawlerRunConfig(
                         word_count_threshold=run_config.word_count_threshold,
                         excluded_tags=run_config.excluded_tags,
                         exclude_external_links=run_config.exclude_external_links,
                         page_timeout=SCRAPE_TIMEOUT * 1000,  # ms
+                        delay_before_return_html=SCRAPE_RETRY_SETTLE_S,
                     )
-                    async with AsyncWebCrawler(config=retry_browser_config) as retry_crawler:
-                        retry_result = await retry_crawler.arun(
-                            url=url, config=retry_run_config
-                        )
-                        # Settle pending network requests/frames
-                        await asyncio.sleep(1.0)
+                    if SCRAPE_RETRY_HEADED:
+                        async with AsyncWebCrawler(config=BrowserConfig(headless=False, verbose=False)) as headed:
+                            retry_result = await headed.arun(url=url, config=retry_run_config)
+                    else:
+                        retry_result = await crawler.arun(url=url, config=retry_run_config)
+
                     if retry_result.success and retry_result.markdown and len(retry_result.markdown) > len(content):
                         content = retry_result.markdown
                         logger.info(f"    [+] Retry successful! Extracted {len(content)} chars.")

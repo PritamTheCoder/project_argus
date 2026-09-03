@@ -5,6 +5,7 @@ Tests for the search, scraper, and scout pipeline.
 Run with: python -m pytest tests/test_tools.py -v
 """
 
+import contextlib
 import pytest
 import asyncio
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -122,9 +123,8 @@ class TestScraper:
 
 class TestSharedCrawler:
     """shared_crawler()'s browser close is time-boxed: Playwright's close
-    handshake can hang indefinitely with no error, which has stalled a whole
-    research job with no log output. These mock AsyncWebCrawler directly so
-    the hang is simulated, not a real (slow, flaky) browser interaction."""
+    handshake can hang indefinitely without raising. These mock AsyncWebCrawler
+    directly so the hang is simulated, not a real browser interaction."""
 
     @pytest.mark.asyncio
     @patch("src.tools.scraper.AsyncWebCrawler")
@@ -319,3 +319,96 @@ class TestExtractFacts:
         assert isinstance(result["raw_jsonl"], str)
 
 
+
+
+class TestBackendHealth:
+    """A retrieval backend that answers every call while returning nothing is
+    invisible without this: the pipeline falls through to whatever else
+    responded, which may be the wrong corpus for the question."""
+
+    def test_flags_a_backend_that_returns_nothing(self):
+        from src.tools.tool_telemetry import ToolCallTracer
+        t = ToolCallTracer()
+        t.record("semantic_scholar_search", {}, 7000.0, True, result_count=0)
+        t.record("semantic_scholar_search", {}, 9000.0, True, result_count=0)
+        t.record("arxiv_search", {}, 900.0, True, result_count=8)
+
+        h = t.backend_health()
+        assert h["semantic_scholar_search"]["degraded"] is True
+        assert h["semantic_scholar_search"]["empty_calls"] == 2
+        assert h["arxiv_search"]["degraded"] is False
+
+    def test_a_raising_backend_counts_as_failure_not_just_empty(self):
+        from src.tools.tool_telemetry import ToolCallTracer
+        t = ToolCallTracer()
+        t.record("web_search", {}, 100.0, False, error="boom")
+        h = t.backend_health()
+        assert h["web_search"]["failures"] == 1
+        assert h["web_search"]["empty_calls"] == 0   # it never returned at all
+        assert h["web_search"]["degraded"] is True
+
+
+# ── Scraper: thin-page retry ─────────────────────────────────────────────────
+# The retry must reuse the shared browser, not launch a second, visible one.
+
+def _thin_then_full_crawler():
+    """A crawler whose first read is thin and whose settled retry is full."""
+    from unittest.mock import AsyncMock, MagicMock
+    crawler = MagicMock()
+    crawler.arun = AsyncMock(side_effect=[
+        MagicMock(success=True, markdown="short"),
+        MagicMock(success=True, markdown="x" * 5000),
+    ])
+    return crawler
+
+
+@contextlib.contextmanager
+def _stubbed_scrape_io():
+    """Bypass the cache and the HTML/PDF pre-flight so only the retry is exercised."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from src.tools import scraper
+
+    head = MagicMock()
+    head.__aenter__ = AsyncMock(return_value=MagicMock(
+        headers={"Content-Type": "text/html"}, status=200))
+    head.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.head = MagicMock(return_value=head)
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+
+    with patch.object(scraper, "get_cached_markdown", return_value=None), \
+         patch.object(scraper, "set_cached_markdown"), \
+         patch.object(scraper.aiohttp, "ClientSession", return_value=session):
+        yield
+
+
+@pytest.mark.asyncio
+async def test_thin_page_retry_reuses_the_shared_browser():
+    """No second browser: the retry runs on the crawler already open."""
+    from unittest.mock import patch
+    from src.tools import scraper
+
+    crawler = _thin_then_full_crawler()
+    with _stubbed_scrape_io(), \
+         patch.object(scraper, "AsyncWebCrawler") as new_browser, \
+         patch.object(scraper, "SCRAPE_RETRY_HEADED", False):
+        out = await scraper._scrape_single(crawler, "https://example.com",
+                                           scraper.CrawlerRunConfig(), "")
+    new_browser.assert_not_called()
+    assert crawler.arun.await_count == 2
+    assert len(out["content"]) > 1000
+
+
+@pytest.mark.asyncio
+async def test_thin_page_retry_waits_before_re_reading():
+    """A slow-rendering page needs settle time, which is what actually fixes it."""
+    from unittest.mock import patch
+    from src.tools import scraper
+
+    crawler = _thin_then_full_crawler()
+    with _stubbed_scrape_io(), patch.object(scraper, "SCRAPE_RETRY_HEADED", False):
+        await scraper._scrape_single(crawler, "https://example.com",
+                                     scraper.CrawlerRunConfig(), "")
+    retry_config = crawler.arun.await_args_list[1].kwargs["config"]
+    assert retry_config.delay_before_return_html == scraper.SCRAPE_RETRY_SETTLE_S
