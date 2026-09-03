@@ -37,7 +37,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from bench.analysis import (
-    diagnose, domain_rollup, efficiency, funnel, node_costs, overall_summary, source_tiers,
+    _backfill_legacy_efficiency, backend_rollup, diagnose, domain_rollup,
+    efficiency, funnel, node_costs, overall_summary, source_tiers,
 )
 from eval.metrics import RunMetrics
 from eval.scoring import score_case
@@ -118,9 +119,10 @@ def _analyse(case: dict, final_state: dict, metrics: RunMetrics,
     result["efficiency"] = efficiency(metrics.summary(), fnl, latency_s)
     result["node_costs"] = node_costs(node_deltas, final_state.get("node_seconds", {}) or {})
     result["by_model"] = metrics.summary().get("by_model", {})
+    result["backend_health"] = final_state.get("backend_health", {}) or {}
     result["sources"] = [
         {"url": v.get("url", ""), "credibility": v.get("credibility_score", 0),
-         "type": v.get("source_type", "")}
+         "type": v.get("source_type", ""), "relevance": v.get("relevance_score")}
         for v in source_map.values()
     ]
     return result
@@ -183,7 +185,8 @@ def _print_case(r: dict) -> None:
     print(
         f"           {e.get('total_tokens', 0):,} tok "
         f"({e.get('tokens_per_supported_fact', 0):,.0f}/fact) "
-        f"{e.get('llm_calls', 0)} calls, {e.get('failovers', 0)} failover, "
+        f"{e.get('llm_calls', 0)} calls, {e.get('billed_failures', 0)} billed-fail, "
+        f"{e.get('rejected_attempts', 0)} rejected, "
         f"{e.get('latency_s', 0)}s",
         flush=True,
     )
@@ -199,9 +202,13 @@ def _md_table(headers: List[str], rows: List[List[Any]]) -> List[str]:
 
 
 def build_report(results: List[dict], run_id: str) -> str:
+    # Backfilled once so the per-case appendix reads the same billed/rejected
+    # split as the headline and domain tables.
+    results = [_backfill_legacy_efficiency(r) for r in results]
     overall = overall_summary(results)
     rollup = domain_rollup(results)
-    findings = diagnose(rollup, overall)
+    backends = backend_rollup(results)
+    findings = diagnose(rollup, overall, backends)
 
     L = [f"# Argus Research Benchmark — {run_id}", ""]
 
@@ -219,11 +226,14 @@ def build_report(results: List[dict], run_id: str) -> str:
         ["Metric", "Value", "Reading"],
         [
             ["Avg source credibility", overall["avg_credibility"], "0–1; tier-weighted quality of evidence"],
+            ["Avg query relevance", overall.get("avg_relevance", 0), "0–1; is the source actually about the question"],
+            ["Off-topic share", f"{overall.get('off_topic_share', 0):.0%}", "credible sources on the wrong subject"],
             ["Authoritative share", f"{overall['authoritative_share']:.0%}", "primary + major-news sources"],
             ["Domain diversity", overall["domain_diversity"], "1.0 = every source a different site"],
             ["Grounding survival", f"{overall['grounding_survival']:.0%}", "extracted facts that survive verbatim-quote checks"],
             ["Corroboration rate", f"{overall['corroboration_rate']:.0%}", "supported facts backed by 2+ sources"],
-            ["Failover rate", f"{overall['failover_rate']:.0%}", "LLM attempts paid for twice"],
+            ["Billed failures", f"{overall.get('billed_failure_rate', 0):.0%}", "generated output that was unusable — paid for twice"],
+            ["Rejected attempts", f"{overall.get('rejected_rate', 0):.0%}", "refused before generating (quota/outage) — cost nothing"],
             ["Tokens per supported fact", f"{overall['tokens_per_fact']:,.0f}", "unit cost of trustworthy output"],
             ["Total", f"{overall['total_tokens']:,} tok / {overall['total_calls']} calls / {overall['total_latency_s']}s", "whole suite"],
         ],
@@ -243,19 +253,34 @@ def build_report(results: List[dict], run_id: str) -> str:
     else:
         L += ["No threshold breaches. Every measured dimension is within target.", ""]
 
+    # ── Backend health ──────────────────────────────────────────────────────
+    if backends:
+        L += ["", "## Retrieval backend health", "",
+              "A backend answering every call while returning nothing is the "
+              "dangerous case: the pipeline falls through to whatever else "
+              "responded, which may be the wrong corpus.", ""]
+        L += _md_table(
+            ["Backend", "Calls", "Results", "Results/call", "Empty calls", "Status"],
+            [[b["backend"], b["calls"], b["results"], b["results_per_call"],
+              b["empty_calls"], "**DEGRADED**" if b["degraded"] else "ok"]
+             for b in backends],
+        )
+
     # ── Per domain ──────────────────────────────────────────────────────────
     L += ["", "## Per-domain quality", ""]
     L += _md_table(
-        ["Domain", "Pass", "Cred", "Authoritative", "Diversity", "Facts", "Grounding", "Corrob"],
+        ["Domain", "Pass", "Cred", "Relevance", "Off-topic", "Authoritative", "Diversity", "Facts", "Grounding", "Corrob"],
         [[r["domain"], f"{r['passed']}/{r['cases']}", r["avg_credibility"],
+          r.get("avg_relevance", 0), f"{r.get('off_topic_share', 0):.0%}",
           f"{r['authoritative_share']:.0%}", r["domain_diversity"], r["facts_supported"],
           f"{r['grounding_survival']:.0%}", f"{r['corroboration_rate']:.0%}"] for r in rollup],
     )
 
     L += ["", "## Per-domain cost", ""]
     L += _md_table(
-        ["Domain", "Tokens/fact", "Failover", "Latency (s)"],
-        [[r["domain"], f"{r['tokens_per_fact']:,.0f}", f"{r['failover_rate']:.0%}", r["latency_s"]]
+        ["Domain", "Tokens/fact", "Billed fail", "Rejected", "Latency (s)"],
+        [[r["domain"], f"{r['tokens_per_fact']:,.0f}", f"{r.get('billed_failure_rate', 0):.0%}",
+          f"{r.get('rejected_rate', 0):.0%}", r["latency_s"]]
          for r in rollup],
     )
 
@@ -282,18 +307,27 @@ def build_report(results: List[dict], run_id: str) -> str:
 
     # ── Verdict on optimisation ─────────────────────────────────────────────
     L += ["", "## Do we need token / call optimisation?", ""]
-    tpf, fr = overall["tokens_per_fact"], overall["failover_rate"]
-    if fr > 0.1:
-        waste = int(overall["total_tokens"] * fr)
-        L += [f"**Yes — but fix reliability first.** {fr:.0%} of attempts failed and were "
-              f"retried, so roughly **{waste:,} tokens** bought nothing. That is the cheapest "
+    tpf = overall["tokens_per_fact"]
+    bfr = overall.get("billed_failure_rate", 0.0)
+    rr = overall.get("rejected_rate", 0.0)
+    waste = overall.get("wasted_tokens", 0)
+
+    if bfr > 0.1:
+        L += [f"**Yes — but fix reliability first.** {bfr:.0%} of attempts generated output that "
+              f"was then unusable, costing roughly **{waste:,} tokens**. That is the cheapest "
               "reduction available and needs no quality trade-off.", ""]
+    if rr > 0.1:
+        L += [f"**Read this run with care.** {rr:.0%} of attempts were refused before generating "
+              "(rate limit, auth or outage). Those cost no tokens, but the work shifted onto "
+              "whichever provider still had capacity — so the quality and latency numbers "
+              "describe that provider, not the intended configuration. Check the by-model split.", ""]
     if tpf > 4000:
         L += [f"**Token optimisation is justified**: {tpf:,.0f} tokens per supported fact. "
               "Target the top row of the node-cost table.", ""]
-    elif fr <= 0.1:
+    elif bfr <= 0.1 and rr <= 0.1:
         L += [f"**Not a priority.** {tpf:,.0f} tokens per supported fact with a "
-              f"{fr:.0%} failover rate is within target; spend effort on retrieval quality instead.", ""]
+              f"{bfr:.0%} billed-failure rate is within target; spend effort on retrieval "
+              "quality instead.", ""]
 
     # ── Per-case appendix ───────────────────────────────────────────────────
     L += ["", "## Per-case detail", ""]
@@ -314,7 +348,8 @@ def build_report(results: List[dict], run_id: str) -> str:
             f"{f.get('facts_extracted_last_pass', f.get('facts_extracted', 'n/a'))}; "
             f"verified counts accumulate across loop iterations)",
             f"- Cost: {e.get('total_tokens', 0):,} tok, {e.get('llm_calls', 0)} calls, "
-            f"{e.get('failovers', 0)} failover, {e.get('latency_s', 0)}s",
+            f"{e.get('billed_failures', 0)} billed-fail, "
+            f"{e.get('rejected_attempts', 0)} rejected, {e.get('latency_s', 0)}s",
         ]
         if r.get("coverage_missing"):
             L.append(f"- Missing keywords: {r['coverage_missing']}")
