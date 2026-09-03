@@ -19,6 +19,7 @@ def _initial_state(query: str, session_id: str) -> AgentState:
         "scraped_data": [],
         "structured_evidence": [],
         "source_map": {},
+        "backend_health": {},
         "critique": "",
         "report": "",
         "re_search_required": False,

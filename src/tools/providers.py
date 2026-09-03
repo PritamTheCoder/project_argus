@@ -10,6 +10,7 @@ Backends:
   - semantic_scholar_search : 200M+ papers, abstracts + metadata (free, optional key)
   - arxiv_search            : preprints, Atom XML (free, no key)
   - crossref_search         : DOI metadata across publishers (free, polite pool)
+  - europe_pmc_search       : PubMed/MEDLINE + PMC + preprints (free, no key)
   - edgar_search            : SEC filings, US regulatory primary sources (free, no key)
   - exa_search              : neural search with category filters (metered, cached)
   - web_search              : ladder over Exa → Brave → DuckDuckGo
@@ -44,6 +45,8 @@ from src.config import (
     EDGAR_MAX_RESULTS,
     EDGAR_ENRICH_CONCURRENCY,
     SEMANTIC_SCHOLAR_API_KEY,
+    SEMANTIC_SCHOLAR_RPS,
+    SEMANTIC_SCHOLAR_CACHE_TTL_HOURS,
     CROSSREF_MAILTO,
     TOOL_HTTP_TIMEOUT,
     ACADEMIC_MAX_RESULTS,
@@ -71,7 +74,7 @@ class SearchResult(BaseModel):
 
     def to_candidate(self) -> Dict[str, Any]:
         """Shape consumed by the Scout acquisition pipeline."""
-        is_academic = self.source in ("semantic_scholar", "arxiv", "crossref")
+        is_academic = self.source in ("semantic_scholar", "arxiv", "crossref", "europe_pmc")
         # Usable content is either full text a backend already fetched, or an
         # academic abstract. Anything else still has to be scraped.
         content = self.text or (self.snippet if is_academic else "")
@@ -153,7 +156,30 @@ def _parse_semantic_scholar(data: Dict[str, Any]) -> List[SearchResult]:
     return out
 
 
+# Semantic Scholar's introductory authenticated limit is 1 request/second, and
+# the Scout issues sub-queries concurrently — so requests are serialised through
+# a minimum-interval gate rather than relying on the server to reject bursts.
+_S2_LOCK = asyncio.Lock()
+_s2_last_request = 0.0
+
+
+async def _s2_throttle() -> None:
+    """Hold each Semantic Scholar request to at most SEMANTIC_SCHOLAR_RPS."""
+    global _s2_last_request
+    interval = 1.0 / max(SEMANTIC_SCHOLAR_RPS, 0.1)
+    async with _S2_LOCK:
+        wait = interval - (asyncio.get_event_loop().time() - _s2_last_request)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _s2_last_request = asyncio.get_event_loop().time()
+
+
 async def semantic_scholar_search(query: str, limit: int = ACADEMIC_MAX_RESULTS) -> List[SearchResult]:
+    """Search Semantic Scholar. Client-side throttled and cached.
+
+    A research run re-asks overlapping sub-queries across loop iterations, so
+    caching removes repeat requests entirely rather than re-spending quota.
+    """
     if not query.strip():
         return []
     params = {
@@ -161,17 +187,38 @@ async def semantic_scholar_search(query: str, limit: int = ACADEMIC_MAX_RESULTS)
         "limit": max(1, min(limit, 100)),
         "fields": "title,abstract,year,url,authors,citationCount,externalIds,openAccessPdf",
     }
+
+    from src.utils.cache import get_cached_search, set_cached_search
+    cache_key = "s2:" + hashlib.sha256(
+        json.dumps(params, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+    cached = get_cached_search(cache_key, SEMANTIC_SCHOLAR_CACHE_TTL_HOURS)
+    if cached is not None:
+        try:
+            logger.info("Semantic Scholar cache hit for %r (no request sent).", query)
+            return _parse_semantic_scholar(json.loads(cached))
+        except Exception as e:  # noqa: BLE001 — a bad entry must not block the query
+            logger.warning("Semantic Scholar cache entry unusable (%s); re-querying.", e)
+
     headers = {}
     if SEMANTIC_SCHOLAR_API_KEY:
         headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
+
+    await _s2_throttle()
     resp = await _request("GET", _SEMANTIC_SCHOLAR_URL, params=params, headers=headers)
     if resp is None:
         return []
     try:
-        return _parse_semantic_scholar(resp.json())
+        data = resp.json()
     except Exception as e:  # noqa: BLE001
         logger.warning("Semantic Scholar parse failed: %s", e)
         return []
+
+    results = _parse_semantic_scholar(data)
+    if results:  # never cache an empty/error-shaped response
+        set_cached_search(cache_key, json.dumps(data))
+    return results
 
 
 # ── arXiv ────────────────────────────────────────────────────────────────────
@@ -287,6 +334,64 @@ async def crossref_search(query: str, limit: int = ACADEMIC_MAX_RESULTS) -> List
 # ── Web (Brave → DuckDuckGo fallback) ────────────────────────────────────────
 
 _BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
+
+
+# ── Europe PMC (biomedical / life sciences) ──────────────────────────────────
+
+_EUROPE_PMC_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+_EUROPE_PMC_ARTICLE = "https://europepmc.org/article"
+
+
+def _parse_europe_pmc(data: Dict[str, Any]) -> List[SearchResult]:
+    out: List[SearchResult] = []
+    for r in ((data or {}).get("resultList") or {}).get("result", []) or []:
+        src, pid = r.get("source"), r.get("id")
+        if not src or not pid:
+            continue
+        journal = ((r.get("journalInfo") or {}).get("journal") or {}).get("title", "")
+        abstract = _clean_text(r.get("abstractText"))
+        # Preprints (source PPR) are not peer-reviewed; grade them below the
+        # published literature so the Writer hedges them accordingly.
+        is_preprint = src == "PPR"
+        out.append(SearchResult(
+            title=_clean_text(r.get("title")),
+            url=f"{_EUROPE_PMC_ARTICLE}/{src}/{pid}",
+            snippet=abstract,
+            source="europe_pmc",
+            as_of_date=str(r.get("pubYear") or ""),
+            authors=[a.strip() for a in (r.get("authorString") or "").split(",") if a.strip()],
+            extra={"journal": journal, "cited_by": r.get("citedByCount"),
+                   "is_preprint": is_preprint, "doi": r.get("doi")},
+            credibility_hint=0.75 if is_preprint else 0.95,
+            source_type_hint="Preprint/Biomedical" if is_preprint else "Academic/Biomedical",
+        ))
+    return out
+
+
+async def europe_pmc_search(query: str, limit: int = ACADEMIC_MAX_RESULTS) -> List[SearchResult]:
+    """Search Europe PMC — PubMed/MEDLINE, PMC full text, and preprints.
+
+    Free, no key, no advertised quota. This is the correct corpus for clinical
+    and life-sciences questions; arXiv does not cover them, and falling through
+    to it produces authoritative-looking sources on the wrong subject.
+    Returns [] on any failure so the caller keeps whatever else it gathered.
+    """
+    if not query.strip():
+        return []
+    params = {
+        "query": query,
+        "format": "json",
+        "pageSize": max(1, min(limit, 100)),
+        "resultType": "core",   # includes abstracts, so results need no scraping
+    }
+    resp = await _request("GET", _EUROPE_PMC_URL, params=params)
+    if resp is None:
+        return []
+    try:
+        return _parse_europe_pmc(resp.json())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Europe PMC parse failed: %s", e)
+        return []
 
 
 # ── Exa (neural search) ──────────────────────────────────────────────────────

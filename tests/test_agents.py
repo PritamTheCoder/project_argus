@@ -646,3 +646,177 @@ async def test_scout_does_not_cap_authoritative_domains(mock_embeddings, mock_sc
     sec_sources = [v for v in result["source_map"].values() if "sec.gov" in v["url"]]
     assert len(sec_sources) == 5, "all 5 filings should survive, not just MAX_SOURCES_PER_DOMAIN"
     assert all(v["credibility_score"] == 0.9 for v in sec_sources)
+
+
+# ── Scout: query relevance ───────────────────────────────────────────────────
+
+def test_relevance_scores_matching_content_above_unrelated():
+    """Credibility says a source is trustworthy; this says it is on-topic."""
+    from src.agents.scout import _relevance_to_query
+    from src.utils.embeddings import get_embeddings
+
+    qe = get_embeddings(["cardiovascular outcomes of GLP-1 receptor agonists"])[0]
+    on_topic = _relevance_to_query(
+        "GLP-1 receptor agonist cardiovascular outcomes trials in type 2 diabetes.", qe)
+    off_topic = _relevance_to_query(
+        "Quantum error correction with surface codes on superconducting qubits.", qe)
+    assert on_topic > off_topic
+    assert on_topic > 0.35 > off_topic
+
+
+def test_relevance_returns_none_without_a_query_embedding():
+    """The degraded path must report 'not measured', not 'irrelevant'."""
+    from src.agents.scout import _relevance_to_query
+    assert _relevance_to_query("some content", None) is None
+
+
+def test_relevance_returns_none_for_empty_content():
+    from src.agents.scout import _relevance_to_query
+    from src.utils.embeddings import get_embeddings
+    qe = get_embeddings(["anything"])[0]
+    assert _relevance_to_query("   ", qe) is None
+
+
+@patch("src.agents.scout.get_embeddings", side_effect=RuntimeError("embedding down"))
+def test_relevance_failure_does_not_break_the_run(mock_emb):
+    from src.agents.scout import _relevance_to_query
+    assert _relevance_to_query("content", [0.1] * 384) is None
+
+
+# ── Scout: relevance gate ────────────────────────────────────────────────────
+# Credibility scores what a URL looks like; an unrelated journal article rates
+# as highly as a relevant one. These cover dropping those before they reach the
+# Refiner, without ever leaving the run with no evidence.
+
+_ON, _OFF = "cardiology", "unrelated"
+
+
+def _topic_embeddings(texts):
+    """[1,0,...] for on-topic text, [0,1,...] for everything else."""
+    out = []
+    for t in texts:
+        vec = [0.0] * 384
+        vec[0 if _ON in t.lower() else 1] = 1.0
+        out.append(vec)
+    return out
+
+
+def _kg_with_two_docs():
+    """A KG returning one on-topic and one off-topic document."""
+    store = MagicMock()
+    store.store_document_and_chunks.side_effect = [1, 2]
+    store.retrieve_top_docs.return_value = [1, 2]
+    store.retrieve_top_chunks.return_value = [(1, f"{_ON} content"), (2, f"{_OFF} content")]
+    store.retrieve_top_chunks_bm25.return_value = []
+    store.get_all_chunks_for_docs.return_value = {1: [f"{_ON} content"], 2: [f"{_OFF} content"]}
+    store.get_doc_metadata.side_effect = lambda d: {
+        1: {"url": "https://journal.example/on"},
+        2: {"url": "https://journal.example/off"},
+    }[d]
+    return store
+
+
+def _scout_state():
+    return _base_state(query=f"{_ON} outcomes", plan=[f"{_ON} outcomes"])
+
+
+async def _run_scout_with_two_docs():
+    from src.agents.scout import scout_node
+    urls = ["https://journal.example/on", "https://journal.example/off"]
+    with patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock) as gather, \
+         patch("src.agents.scout.scrape_urls", new_callable=AsyncMock) as scrape, \
+         patch("src.agents.scout.get_embeddings", side_effect=_topic_embeddings), \
+         patch("src.agents.scout.rerank_chunks", side_effect=RuntimeError("no reranker")), \
+         patch("src.graph.kg.kg_store", _kg_with_two_docs()):
+        gather.return_value = [
+            {"url": u, "content": "", "needs_scrape": True, "source": "web"} for u in urls
+        ]
+        scrape.return_value = [
+            {"url": urls[0], "content": f"{_ON} content", "success": True},
+            {"url": urls[1], "content": f"{_OFF} content", "success": True},
+        ]
+        return await scout_node(_scout_state())
+
+
+@pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
+async def test_relevance_gate_drops_off_topic_sources():
+    """An off-topic source must not reach the Refiner, however credible it looks."""
+    result = await _run_scout_with_two_docs()
+    urls = {v["url"] for v in result["source_map"].values()}
+    assert "https://journal.example/on" in urls
+    assert "https://journal.example/off" not in urls
+
+
+@pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
+@patch("src.agents.scout.RELEVANCE_GATE_ENABLED", False)
+async def test_relevance_gate_can_be_disabled_for_measurement():
+    """With the gate off the score is still recorded, so a run can measure the
+    off-topic share without filtering on it."""
+    result = await _run_scout_with_two_docs()
+    by_url = {v["url"]: v for v in result["source_map"].values()}
+    assert "https://journal.example/off" in by_url
+    assert by_url["https://journal.example/off"]["relevance_score"] < 0.35
+
+
+@pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
+@patch("src.agents.scout.RELEVANCE_GATE_MIN_SOURCES", 2)
+async def test_relevance_gate_never_empties_the_run():
+    """If everything is off-topic, keep the closest matches so the Critic sees
+    weak evidence rather than none."""
+    from src.agents.scout import scout_node
+    store = _kg_with_two_docs()
+    store.retrieve_top_chunks.return_value = [(1, f"{_OFF} a"), (2, f"{_OFF} b")]
+    store.get_all_chunks_for_docs.return_value = {1: [f"{_OFF} a"], 2: [f"{_OFF} b"]}
+    urls = ["https://journal.example/on", "https://journal.example/off"]
+
+    with patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock) as gather, \
+         patch("src.agents.scout.scrape_urls", new_callable=AsyncMock) as scrape, \
+         patch("src.agents.scout.get_embeddings", side_effect=_topic_embeddings), \
+         patch("src.agents.scout.rerank_chunks", side_effect=RuntimeError("no reranker")), \
+         patch("src.graph.kg.kg_store", store):
+        gather.return_value = [
+            {"url": u, "content": "", "needs_scrape": True, "source": "web"} for u in urls
+        ]
+        scrape.return_value = [
+            {"url": u, "content": f"{_OFF} content", "success": True} for u in urls
+        ]
+        result = await scout_node(_scout_state())
+
+    assert len(result["source_map"]) > 0, "the gate must never starve the Refiner"
+
+
+@pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
+async def test_gated_source_does_not_consume_a_domain_slot():
+    """A rejected source is measured before anything is claimed, so it must not
+    use up the per-domain cap that a later on-topic source needs."""
+    from src.agents.scout import scout_node
+    store = _kg_with_two_docs()
+    # Both documents share a domain; the off-topic one is registered first.
+    store.retrieve_top_docs.return_value = [2, 1]
+    store.get_doc_metadata.side_effect = lambda d: {
+        1: {"url": "https://site.example/on"},
+        2: {"url": "https://site.example/off"},
+    }[d]
+    urls = ["https://site.example/off", "https://site.example/on"]
+
+    with patch("src.agents.scout.MAX_SOURCES_PER_DOMAIN", 1), \
+         patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock) as gather, \
+         patch("src.agents.scout.scrape_urls", new_callable=AsyncMock) as scrape, \
+         patch("src.agents.scout.get_embeddings", side_effect=_topic_embeddings), \
+         patch("src.agents.scout.rerank_chunks", side_effect=RuntimeError("no reranker")), \
+         patch("src.graph.kg.kg_store", store):
+        gather.return_value = [
+            {"url": u, "content": "", "needs_scrape": True, "source": "web"} for u in urls
+        ]
+        scrape.return_value = [
+            {"url": urls[0], "content": f"{_OFF} content", "success": True},
+            {"url": urls[1], "content": f"{_ON} content", "success": True},
+        ]
+        result = await scout_node(_scout_state())
+
+    urls_kept = {v["url"] for v in result["source_map"].values()}
+    assert "https://site.example/on" in urls_kept

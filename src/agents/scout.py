@@ -6,11 +6,17 @@ import logging
 from src.schema.state import AgentState
 from src.tools.scraper import scrape_urls, shared_crawler
 from src.agents.acquisition import gather_sources_for_query
+from src.tools.tool_telemetry import ToolCallTracer
 from src.utils.embeddings import get_embeddings
 from src.utils.rerank import rerank_chunks
 from src.utils.rrf import reciprocal_rank_fusion
+from src.utils.grounding import _cosine
 from src.utils.source_scoring import evaluate_source, registrable_domain
-from src.config import MAX_CHUNK_TOKENS, TOP_K_CHUNKS, SCOUT_CONCURRENCY, MAX_SOURCES_PER_DOMAIN, AUTHORITATIVE_CREDIBILITY
+from src.config import (
+    MAX_CHUNK_TOKENS, TOP_K_CHUNKS, SCOUT_CONCURRENCY, MAX_SOURCES_PER_DOMAIN,
+    AUTHORITATIVE_CREDIBILITY, LOW_RELEVANCE_THRESHOLD, RELEVANCE_SAMPLE_CHARS,
+    RELEVANCE_GATE_ENABLED, RELEVANCE_GATE_MIN_SOURCES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,29 @@ def _parse_intent(intent) -> tuple[str, str]:
     if isinstance(intent, dict):
         return intent.get("query", str(intent)), intent.get("mode", "MIXED")
     return str(intent), "MIXED"
+
+
+def _relevance_to_query(content: str, query_emb) -> float | None:
+    """Cosine similarity between the query and a source's content, 0..1.
+
+    Credibility answers "is this source trustworthy"; it says nothing about
+    whether the source is *about* the question, and retrieval only ranks
+    candidates against each other so it always yields a "best" result no
+    matter how poor the pool. This is the absolute check.
+
+    Returns None when no query embedding is available (the Scout's degraded
+    path), so callers can tell "not measured" from "measured as irrelevant".
+    """
+    if query_emb is None or not (content or "").strip():
+        return None
+    try:
+        # The local embedding model truncates anyway; cap the input so a long
+        # document doesn't cost more than the signal is worth.
+        emb = get_embeddings([content[:RELEVANCE_SAMPLE_CHARS]])[0]
+        return round(max(0.0, min(1.0, _cosine(query_emb, emb))), 3)
+    except Exception as e:  # noqa: BLE001 — a missing score must not fail a run
+        logger.warning("Scout: relevance scoring failed: %s", e)
+        return None
 
 
 def _align_reranked_to_docs(
@@ -83,10 +112,33 @@ async def scout_node(state: AgentState) -> dict:
         d = registrable_domain(v["url"])
         domain_counts[d] = domain_counts.get(d, 0) + 1
 
-    def _register_source(url: str, content: str, query: str) -> None:
+    # Sources held back as off-topic, best first. Kept so the gate can never
+    # leave the run with no evidence at all.
+    deferred_off_topic: list[tuple[float, str, str, str]] = []
+
+    def _register_source(
+        url: str, content: str, query: str, query_emb=None,
+        enforce_gate: bool = True, relevance: float | None = None,
+    ) -> None:
+        """``relevance`` is passed only when already known (the restore path
+        below), so a deferred source isn't re-embedded to learn what it scored."""
         nonlocal next_id
         if url in registered_urls:
             return  # first occurrence wins (matches the old per-query seen_urls dedup)
+
+        # Measured before anything is claimed, so a rejected source doesn't
+        # consume a slot in the per-domain cap.
+        if relevance is None:
+            relevance = _relevance_to_query(content, query_emb)
+        off_topic = relevance is not None and relevance < LOW_RELEVANCE_THRESHOLD
+        if off_topic:
+            logger.info(
+                "Scout: %s is only %.2f similar to the query — authoritative but "
+                "possibly off-topic.", url, relevance,
+            )
+            if RELEVANCE_GATE_ENABLED and enforce_gate:
+                deferred_off_topic.append((relevance, url, content, query))
+                return
 
         base = evaluate_source(url, query)
         score = base["score"]
@@ -122,6 +174,7 @@ async def scout_node(state: AgentState) -> dict:
             "credibility_score": score,
             "source_type": stype,
             "as_of_date": as_of,
+            "relevance_score": relevance,
         }
         all_scraped_data.append({
             "source_id": source_id,
@@ -138,13 +191,16 @@ async def scout_node(state: AgentState) -> dict:
     # per-provider rate limiter still caps actual API RPM.
     initial_seen = {v["url"] for v in source_map.values()}
     sem = asyncio.Semaphore(max(SCOUT_CONCURRENCY, 1))
+    # One tracer for every sub-query: a backend that returns nothing for the
+    # whole run is only visible at run scope, not per-query.
+    tracer = ToolCallTracer()
 
     async def _gather_and_scrape(intent, crawler) -> tuple[str, list, list]:
         q, mode_str = _parse_intent(intent)
         async with sem:
             logger.info(f"Scout: Processing query '{q}' with mode '{mode_str}'")
             candidates = await gather_sources_for_query(
-                q, mode_str, seen_urls=initial_seen, session_id=session_id
+                q, mode_str, seen_urls=initial_seen, session_id=session_id, tracer=tracer
             )
             if not candidates:
                 logger.info(f"Scout: No new candidate sources for query '{q}'.")
@@ -252,7 +308,7 @@ async def scout_node(state: AgentState) -> dict:
 
             for url, matched_chunks in source_content_map.items():
                 best_content = "\n\n".join(matched_chunks)
-                _register_source(url, best_content, q)
+                _register_source(url, best_content, q, query_emb=query_emb)
         else:
             # Graceful degradation: embeddings are unavailable so we cannot rank
             # or index. Rather than dropping every scraped page for this query,
@@ -267,13 +323,42 @@ async def scout_node(state: AgentState) -> dict:
                 content = res["content"][:DEGRADED_MAX_CHARS]
                 _register_source(res["url"], content, q)
 
+    # An empty source map would starve the Refiner and hide the failure. If the
+    # gate rejected everything, restore the closest matches so the Critic sees
+    # weak evidence and can re-search, rather than seeing none.
+    if deferred_off_topic and len(source_map) < RELEVANCE_GATE_MIN_SOURCES:
+        deferred_off_topic.sort(key=lambda d: d[0], reverse=True)
+        restore = deferred_off_topic[: RELEVANCE_GATE_MIN_SOURCES - len(source_map)]
+        logger.warning(
+            "Scout: every source scored below the relevance floor; restoring the "
+            "%d closest of %d so the run has evidence to critique.",
+            len(restore), len(deferred_off_topic),
+        )
+        for score, url, content, query in restore:
+            _register_source(url, content, query, enforce_gate=False, relevance=score)
+    elif deferred_off_topic:
+        logger.info(
+            "Scout: dropped %d off-topic source(s) below relevance %.2f.",
+            len(deferred_off_topic), LOW_RELEVANCE_THRESHOLD,
+        )
+
     logger.info(f"Scout: Collected {len(all_scraped_data)} highly relevant chunk sets across queries.")
     logger.info(f"Scout: Source map has {len(source_map)} entries:")
     for sid, data in source_map.items():
         logger.info(f"  {sid}: {data.get('url', '?')} (cred={data.get('credibility_score', '?')}, type={data.get('source_type', '?')})")
     
+    health = tracer.backend_health()
+    degraded = [name for name, h in health.items() if h["degraded"]]
+    if degraded:
+        logger.warning(
+            "Scout: retrieval backend(s) returned NO results all run: %s. "
+            "Sources came from the remaining backends, which may be the wrong corpus.",
+            ", ".join(sorted(degraded)),
+        )
+
     return {
         "scraped_data": all_scraped_data,
         "source_map": source_map,
+        "backend_health": health,
         "active_node": "scout"
     }

@@ -98,6 +98,17 @@ async def arxiv_search(query: str, limit: int = ACADEMIC_MAX_RESULTS) -> List[Di
 
 
 @tool
+async def europe_pmc_search(query: str, limit: int = ACADEMIC_MAX_RESULTS) -> List[Dict[str, Any]]:
+    """Search Europe PMC — PubMed/MEDLINE, PMC full text, and biomedical preprints.
+    THE tool for clinical, medical, drug, and life-sciences questions: trials,
+    outcomes, treatments, biology. arXiv does NOT cover these subjects, so use
+    this rather than a general academic search for anything medical.
+    Returns papers with abstracts (no scraping needed)."""
+    results = await providers.europe_pmc_search(query, limit=limit)
+    return [r.to_candidate() for r in results]
+
+
+@tool
 async def crossref_search(query: str, limit: int = ACADEMIC_MAX_RESULTS) -> List[Dict[str, Any]]:
     """Search Crossref DOI metadata across academic publishers (journals, conferences).
     Best for locating formally published work and its bibliographic details.
@@ -194,6 +205,9 @@ def _register_default_tools() -> None:
                  when_to_use="latest preprints in physics/CS/math", yields_candidates=True),
         ToolSpec(name="crossref_search", tool=crossref_search, tags=["retrieval", "academic"],
                  when_to_use="formally published papers across publishers", yields_candidates=True),
+        ToolSpec(name="europe_pmc_search", tool=europe_pmc_search, tags=["retrieval", "academic", "biomedical"],
+                 when_to_use="clinical trials, medicine, drugs, biology — PubMed/MEDLINE and PMC",
+                 yields_candidates=True),
         ToolSpec(name="sec_edgar_search", tool=sec_edgar_search, tags=["retrieval", "financial"],
                  when_to_use="company financials, funding rounds, ownership — official SEC filings as primary sources",
                  yields_candidates=True),

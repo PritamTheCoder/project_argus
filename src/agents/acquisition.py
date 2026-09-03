@@ -40,7 +40,9 @@ def build_gatherer_system_prompt(mode: str) -> str:
         "You may call several tools. You may call kg_lookup first to avoid re-finding "
         "facts already known. Stop once you have gathered enough good sources.\n\n"
         "Routing guidance:\n"
-        "- Scientific / technical / medical questions → semantic_scholar_search, arxiv_search, crossref_search.\n"
+        "- Clinical / medical / drug / life-sciences questions → europe_pmc_search FIRST "
+        "(arXiv does not cover medicine), then semantic_scholar_search.\n"
+        "- Physics / CS / maths / engineering questions → arxiv_search, semantic_scholar_search, crossref_search.\n"
         "- Company financials, funding rounds, ownership, regulatory risk → sec_edgar_search FIRST "
         "(official filings are primary sources), then web_search for context and reporting.\n"
         "- News / market / commercial / company / general questions → web_search.\n"
@@ -154,12 +156,15 @@ async def gather_sources_for_query(
     seen_urls: Optional[Set[str]] = None,
     max_steps: Optional[int] = None,
     session_id: str = "",
+    tracer: Optional[ToolCallTracer] = None,
 ) -> List[Dict[str, Any]]:
     """
     Gather candidate documents for one sub-query via model-driven tool selection,
     falling back to deterministic mode-aware search on any failure.
 
     ``session_id`` scopes the model's ``kg_lookup`` memory tool to the current run.
+    Pass ``tracer`` to accumulate tool telemetry across every sub-query of a run;
+    a backend that returns nothing all run is only visible at that scope.
 
     Returns a list of candidate dicts (see ``SearchResult.to_candidate``),
     deduplicated by URL and excluding ``seen_urls``.
@@ -171,7 +176,7 @@ async def gather_sources_for_query(
     session_token = set_kg_session(session_id)
     await ensure_mcp_loaded()
 
-    tracer = ToolCallTracer()
+    tracer = tracer if tracer is not None else ToolCallTracer()
     candidates: List[Dict[str, Any]] = []
     try:
         # Tool search: bind only the most relevant tools (RAG-over-tools). With a

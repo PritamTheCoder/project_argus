@@ -11,12 +11,15 @@ from unittest.mock import patch, AsyncMock, MagicMock
 from src.tools.providers import (
     SearchResult,
     _parse_semantic_scholar,
+    semantic_scholar_search,
     _parse_arxiv,
     _parse_crossref,
     _parse_brave,
     _ddgs_to_results,
     _clean_text,
     _parse_exa,
+    _parse_europe_pmc,
+    europe_pmc_search,
     _parse_edgar,
     _edgar_filing_url,
     _edgar_primary_doc_url,
@@ -603,3 +606,106 @@ async def test_edgar_falls_back_to_full_text_when_cik_unknown(mock_req, mock_enr
     params = mock_req.await_args.kwargs["params"]
     assert "ciks" not in params
     assert params["q"] == '"some private startup"'
+
+
+# ── Europe PMC ───────────────────────────────────────────────────────────────
+
+def test_parse_europe_pmc_builds_article_url_and_metadata():
+    data = {"resultList": {"result": [{
+        "source": "MED", "id": "31401015",
+        "title": "GLP-1 Receptor Agonist Cardiovascular Outcomes Trials.",
+        "abstractText": "<h4>Background</h4>The latest recommendations...",
+        "pubYear": "2019", "citedByCount": 43, "authorString": "Smith J, Doe A.",
+        "journalInfo": {"journal": {"title": "Trends in Endocrinology"}},
+    }]}}
+    r = _parse_europe_pmc(data)[0]
+    assert r.url == "https://europepmc.org/article/MED/31401015"
+    assert r.as_of_date == "2019"
+    assert r.authors == ["Smith J", "Doe A."]
+    assert r.extra["journal"] == "Trends in Endocrinology"
+    assert "<h4>" not in r.snippet          # tags stripped for the extractor
+    assert r.credibility_hint == 0.95
+    assert r.to_candidate()["needs_scrape"] is False   # abstract is usable content
+
+
+def test_parse_europe_pmc_grades_preprints_below_published_work():
+    data = {"resultList": {"result": [{
+        "source": "PPR", "id": "PPR1308671", "title": "A preprint",
+        "abstractText": "Not yet peer reviewed.", "pubYear": "2026",
+    }]}}
+    r = _parse_europe_pmc(data)[0]
+    assert r.extra["is_preprint"] is True
+    assert r.credibility_hint == 0.75          # below the 0.95 for published
+    assert r.source_type_hint == "Preprint/Biomedical"
+
+
+def test_parse_europe_pmc_skips_records_without_identifiers():
+    assert _parse_europe_pmc({"resultList": {"result": [{"title": "no ids"}]}}) == []
+
+
+def test_parse_europe_pmc_handles_empty_and_garbage():
+    assert _parse_europe_pmc({}) == []
+    assert _parse_europe_pmc({"resultList": None}) == []
+
+
+@pytest.mark.asyncio
+async def test_europe_pmc_empty_query_returns_empty():
+    assert await europe_pmc_search("   ") == []
+
+
+@pytest.mark.asyncio
+@patch("src.tools.providers._request", new_callable=AsyncMock, return_value=None)
+async def test_europe_pmc_degrades_on_network_failure(mock_req):
+    assert await europe_pmc_search("anything") == []
+
+
+# ── Semantic Scholar quota discipline ────────────────────────────────────────
+
+@pytest.mark.asyncio
+@patch("src.tools.providers.SEMANTIC_SCHOLAR_CACHE_TTL_HOURS", 24)
+@patch("src.utils.cache.set_cached_search")
+@patch("src.utils.cache.get_cached_search")
+@patch("src.tools.providers._request", new_callable=AsyncMock)
+async def test_semantic_scholar_cache_hit_sends_no_request(mock_req, mock_get, mock_set):
+    """A repeated sub-query must be served from cache, not re-spend quota."""
+    mock_get.return_value = '{"data": [{"title": "Cached paper", "url": "http://x"}]}'
+    results = await semantic_scholar_search("some query")
+    assert [r.title for r in results] == ["Cached paper"]
+    mock_req.assert_not_awaited()
+    mock_set.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("src.tools.providers.SEMANTIC_SCHOLAR_CACHE_TTL_HOURS", 24)
+@patch("src.utils.cache.set_cached_search")
+@patch("src.utils.cache.get_cached_search", return_value=None)
+@patch("src.tools.providers._request", new_callable=AsyncMock)
+async def test_semantic_scholar_caches_successful_response(mock_req, mock_get, mock_set):
+    mock_req.return_value = MagicMock(json=lambda: {"data": [{"title": "P", "url": "http://x"}]})
+    await semantic_scholar_search("q")
+    mock_set.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("src.tools.providers.SEMANTIC_SCHOLAR_CACHE_TTL_HOURS", 24)
+@patch("src.utils.cache.set_cached_search")
+@patch("src.utils.cache.get_cached_search", return_value=None)
+@patch("src.tools.providers._request", new_callable=AsyncMock)
+async def test_semantic_scholar_does_not_cache_a_throttled_response(mock_req, mock_get, mock_set):
+    """A 429 yields no results; caching that would suppress retries for hours."""
+    mock_req.return_value = None
+    assert await semantic_scholar_search("q") == []
+    mock_set.assert_not_called()
+
+
+@pytest.mark.asyncio
+@patch("src.tools.providers.SEMANTIC_SCHOLAR_RPS", 4.0)
+async def test_semantic_scholar_throttle_serialises_concurrent_callers():
+    """The Scout gathers sub-queries concurrently; the 1 RPS allowance is held
+    client-side rather than relying on the server to reject bursts."""
+    import asyncio, time
+    from src.tools.providers import _s2_throttle
+    start = time.perf_counter()
+    await asyncio.gather(*[_s2_throttle() for _ in range(4)])
+    elapsed = time.perf_counter() - start
+    assert elapsed >= 0.7, f"4 calls at 4 RPS should take ~0.75s, took {elapsed:.2f}s"
