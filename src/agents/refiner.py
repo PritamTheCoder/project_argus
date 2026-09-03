@@ -3,7 +3,7 @@ using an extraction schema generated dynamically from the research plan."""
 
 import logging
 from typing import Dict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from src.schema.state import AgentState
 from src.tools.refiner import extract_facts
 from src.config import (
@@ -15,6 +15,11 @@ from src.utils.llm_factory import get_llm_with_fallbacks
 logger = logging.getLogger(__name__)
 
 class ExtractionSchema(BaseModel):
+    # Groq rejects a schema whose nested objects omit additionalProperties:false,
+    # and a permissive schema also lets the model skip the wrapper and emit a bare
+    # array, which fails the tool call. extra="forbid" emits it and prevents both.
+    model_config = ConfigDict(extra="forbid")
+
     schema_dict: Dict[str, str] = Field(
         description="A dictionary where keys are entity types (e.g., 'dates', 'companies', 'metrics') and values are short descriptions of what to extract."
     )

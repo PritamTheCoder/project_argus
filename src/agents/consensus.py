@@ -22,7 +22,7 @@ Clustering is a pure function (unit-tested without an LLM).
 import logging
 from typing import Any, Dict, List, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.schema.state import AgentState
 from src.config import CRITIC_MODEL, CRITIC_PROVIDER, CRITIC_FALLBACK_CHAIN
@@ -93,6 +93,11 @@ def distinct_sources(cluster: List[Dict[str, Any]]) -> List[str]:
 # ── LLM judgement schema ─────────────────────────────────────────────────────
 
 class ClusterJudgment(BaseModel):
+    # Groq rejects a schema whose nested objects omit additionalProperties:false,
+    # and a permissive schema also lets the model skip the wrapper and emit a bare
+    # array, which fails the tool call. extra="forbid" emits it and prevents both.
+    model_config = ConfigDict(extra="forbid")
+
     index: int = Field(description="The cluster index from the input, to map the result back.")
     relationship: Literal["CONSENSUS", "CONTRADICTION", "UNRELATED"] = Field(
         description="CONSENSUS if the claims agree, CONTRADICTION if they conflict, UNRELATED if they aren't really about the same point."
@@ -103,6 +108,8 @@ class ClusterJudgment(BaseModel):
 
 
 class ConsensusBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     judgments: List[ClusterJudgment] = Field(default_factory=list)
 
 

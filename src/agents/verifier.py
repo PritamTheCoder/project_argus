@@ -7,10 +7,15 @@ from src.schema.state import AgentState
 from src.utils.llm_factory import get_llm_with_fallbacks
 from src.utils.grounding import _fact_source_key
 from src.config import VERIFY_BATCH_SIZE, MAX_FACTS_TO_VERIFY
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal, List
 
 class LLMVerificationResult(BaseModel):
+    # Groq rejects a schema whose nested objects omit additionalProperties:false,
+    # and a permissive schema also lets the model skip the wrapper and emit a bare
+    # array, which fails the tool call. extra="forbid" emits it and prevents both.
+    model_config = ConfigDict(extra="forbid")
+
     index: int = Field(description="The exact index matching the input fact.")
     reasoning: str = Field(description="Briefly explain why the excerpt does or does not support the claim.")
     support_quote: str = Field(
@@ -27,6 +32,8 @@ class LLMVerificationResult(BaseModel):
 
 class LLMBatchVerification(BaseModel):
     """Batch of verified facts with minimal output — returned by a single LLM call."""
+    model_config = ConfigDict(extra="forbid")
+
     results: List[LLMVerificationResult] = Field(
         description="List of verification results IN THE EXACT SAME ORDER as the input facts."
     )

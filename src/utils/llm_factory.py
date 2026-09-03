@@ -12,7 +12,7 @@ import itertools
 import logging
 import os
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.rate_limiters import InMemoryRateLimiter
+from src.utils.rate_limit import TokenAwareRateLimiter, TokenUsageReporter
 
 # Provider specific imports
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -22,6 +22,8 @@ from langchain_openai import ChatOpenAI
 from src.config import (
     GEMINI_DEFAULT_MODEL, GEMINI_MAX_RETRIES, GEMINI_TIMEOUT,
     GEMINI_RPM, GROQ_RPM, OPENAI_RPM, NVIDIA_RPM, NEMOTRON_RPM, STEP_RPM, KIMI_RPM, GLM_RPM,
+    GEMINI_TPM, GROQ_TPM, OPENAI_TPM, NVIDIA_TPM, NEMOTRON_TPM,
+    RATE_LIMIT_DEFAULT_CALL_TOKENS,
     RATE_LIMIT_BURST,
     NVIDIA_BASE_URL, NIM_TIMEOUT,
     NVIDIA_API_NEMOTRON3_KEY,
@@ -35,10 +37,12 @@ _FALLBACK_MODEL = GEMINI_DEFAULT_MODEL
 _FALLBACK_PROVIDER = "gemini"
 
 # ── Proactive client-side rate limiting ──────────────────────────────────────
-# One shared limiter per provider, applied to every model we build. LangChain's
-# InMemoryRateLimiter blocks (sync) / awaits (async) before each request so we
-# stay under provider RPM limits proactively rather than reacting to 429s. It
-# works transparently through .with_structured_output() and .bind_tools().
+# One shared limiter per provider, applied to every model we build. It blocks
+# (sync) / awaits (async) before each request so we stay under provider limits
+# proactively rather than reacting to 429s, and works transparently through
+# .with_structured_output() and .bind_tools().
+# Both requests/minute AND tokens/minute are gated: Groq's free tier rejects on
+# tokens first, so RPM alone let large prompts through and ate 429s.
 _PROVIDER_RPM = {
     "gemini": GEMINI_RPM,
     "groq": GROQ_RPM,
@@ -49,7 +53,15 @@ _PROVIDER_RPM = {
     "kimi": KIMI_RPM,
     "glm": GLM_RPM,
 }
-_rate_limiters: dict[str, InMemoryRateLimiter] = {}
+# Tokens/minute per provider; 0 = no token ceiling, gate on requests only.
+_PROVIDER_TPM = {
+    "gemini": GEMINI_TPM,
+    "groq": GROQ_TPM,
+    "openai": OPENAI_TPM,
+    "nvidia": NVIDIA_TPM,
+    "nemotron": NEMOTRON_TPM,
+}
+_rate_limiters: dict[str, TokenAwareRateLimiter] = {}
 
 # NVIDIA NIM providers reached via the OpenAI-compatible endpoint. Each maps to
 # its own key + optional reasoning `extra_body`. Keys/extra_body are read at
@@ -73,17 +85,27 @@ def _nim_spec(provider: str) -> tuple[str, dict | None]:
     return "", None
 
 
-def _get_rate_limiter(name: str, rpm: int | None = None) -> InMemoryRateLimiter:
-    """Shared limiter keyed by ``name``. ``rpm`` overrides the per-provider default
-    (used for the per-key Groq limiters, whose name isn't a plain provider)."""
+def _get_rate_limiter(
+    name: str, rpm: int | None = None, tpm: int | None = None
+) -> TokenAwareRateLimiter:
+    """Shared limiter keyed by ``name``. ``rpm``/``tpm`` override the per-provider
+    defaults (used for the per-key Groq limiters, whose name isn't a plain
+    provider)."""
     if name not in _rate_limiters:
         r = rpm if rpm is not None else _PROVIDER_RPM.get(name, 12)
-        _rate_limiters[name] = InMemoryRateLimiter(
-            requests_per_second=max(r / 60.0, 0.05),
-            check_every_n_seconds=0.1,
-            max_bucket_size=RATE_LIMIT_BURST,  # burst, then smooth; ladder backstops 429s
+        t = tpm if tpm is not None else _PROVIDER_TPM.get(name, 0)
+        _rate_limiters[name] = TokenAwareRateLimiter(
+            requests_per_minute=r,
+            tokens_per_minute=t,
+            burst=RATE_LIMIT_BURST,  # burst, then smooth; ladder backstops 429s
+            default_call_tokens=RATE_LIMIT_DEFAULT_CALL_TOKENS,
         )
     return _rate_limiters[name]
+
+
+def _usage_callbacks(limiter: TokenAwareRateLimiter) -> list:
+    """A reporter only earns its keep when the limiter actually gates on tokens."""
+    return [TokenUsageReporter(limiter)] if limiter.gates_on_tokens else []
 
 
 # ── Groq multi-key pool ──────────────────────────────────────────────────────
@@ -112,11 +134,28 @@ def _next_groq_key() -> tuple[str, int]:
     return keys[idx], idx
 
 
-def _create_llm(model_name: str, provider: str, temperature: float) -> BaseChatModel:
+def _groq_key_at(index: int) -> tuple[str, int]:
+    """The pool key at ``index``, wrapped. Returns ('', -1) if the pool is empty."""
+    keys = _groq_keys()
+    if not keys:
+        return "", -1
+    idx = index % len(keys)
+    return keys[idx], idx
+
+
+def _create_llm(
+    model_name: str, provider: str, temperature: float,
+    groq_key_index: int | None = None,
+) -> BaseChatModel:
     """
     Internal: create a single LLM instance for the given provider.
     Only passes provider-appropriate arguments. Every model is built with a
     shared per-provider rate limiter.
+
+    ``groq_key_index`` pins this instance to one account in the Groq pool.
+    Default (None) round-robins, which spreads load; the fallback ladder pins
+    each rung instead, so a key that 429s hands off to a *different account*
+    rather than to a different provider.
     """
     provider = provider.lower().strip()
     limiter = _get_rate_limiter(provider)
@@ -126,6 +165,7 @@ def _create_llm(model_name: str, provider: str, temperature: float) -> BaseChatM
             model=model_name,
             temperature=temperature,
             rate_limiter=limiter,
+            callbacks=_usage_callbacks(limiter),
             max_retries=GEMINI_MAX_RETRIES,  # 1 = no in-SDK retries → fail fast to the fallback ladder
             timeout=GEMINI_TIMEOUT,          # seconds; hard ceiling on a single request
         )
@@ -133,8 +173,10 @@ def _create_llm(model_name: str, provider: str, temperature: float) -> BaseChatM
     elif provider == "groq":
         # Round-robin across the account pool. Each key gets its OWN rate limiter
         # (its own RPM pool) so the two accounts' limits don't share a bucket.
-        key, idx = _next_groq_key()
-        groq_limiter = _get_rate_limiter(f"groq#{idx}", GROQ_RPM) if idx >= 0 else limiter
+        key, idx = (
+            _next_groq_key() if groq_key_index is None else _groq_key_at(groq_key_index)
+        )
+        groq_limiter = _get_rate_limiter(f"groq#{idx}", GROQ_RPM, GROQ_TPM) if idx >= 0 else limiter
         if idx >= 0:
             logger.debug(f"Groq: using account-pool key #{idx}.")
         return ChatGroq(
@@ -142,6 +184,11 @@ def _create_llm(model_name: str, provider: str, temperature: float) -> BaseChatM
             temperature=temperature,
             api_key=key or None,
             rate_limiter=groq_limiter,
+            callbacks=_usage_callbacks(groq_limiter),
+            # No in-SDK retries: the client honours retry-after and would sleep
+            # re-asking a quota-exhausted key. The next rung is a different
+            # account, so failing over immediately is faster and likelier to work.
+            max_retries=0,
         )
 
     elif provider == "openai":
@@ -149,6 +196,7 @@ def _create_llm(model_name: str, provider: str, temperature: float) -> BaseChatM
             model=model_name,
             temperature=temperature,
             rate_limiter=limiter,
+            callbacks=_usage_callbacks(limiter),
         )
 
     elif provider in _NIM_PROVIDERS:
@@ -162,6 +210,7 @@ def _create_llm(model_name: str, provider: str, temperature: float) -> BaseChatM
             temperature=temperature,
             max_tokens=16384,
             rate_limiter=limiter,
+            callbacks=_usage_callbacks(limiter),
             timeout=NIM_TIMEOUT,   # abort client-side before the gateway 504s (~5 min)
             max_retries=1,         # no in-SDK retries → fail fast to the fallback ladder
         )
@@ -179,6 +228,7 @@ def _create_llm(model_name: str, provider: str, temperature: float) -> BaseChatM
             top_p=0.95,
             max_tokens=16384,
             rate_limiter=limiter,
+            callbacks=_usage_callbacks(limiter),
         )
 
     else:
@@ -192,6 +242,7 @@ def get_llm(
     model_name: str,
     provider: str,
     temperature: float = 0.0,
+    groq_key_index: int | None = None,
     **kwargs  # Accepted for backward compat but not forwarded (prevents cross-provider kwarg issues)
 ) -> BaseChatModel:
     """
@@ -241,7 +292,7 @@ def get_llm(
 
     # Attempt primary provider
     try:
-        llm = _create_llm(model_name, provider_lower, temperature)
+        llm = _create_llm(model_name, provider_lower, temperature, groq_key_index)
         logger.info(f"LLM Factory: Initialized {model_name} via {provider_lower}")
         return llm
     except Exception as e:
@@ -276,6 +327,42 @@ def parse_fallback_chain(chain: str) -> list[tuple[str, str]]:
     return specs
 
 
+def _structured(llm: BaseChatModel, schema):
+    """Wrap a model for structured output using constrained decoding.
+
+    Prefers ``method="json_schema"``: the grammar constrains generation, so the
+    shape is guaranteed. The default on some providers is ``function_calling``,
+    where a wrapper schema like ``{results: [...]}`` invites the model to emit a
+    bare array instead of calling the tool — the request is then rejected with
+    `tool_use_failed` even though the content was correct.
+
+    Falls back to the provider default if it doesn't accept the argument, so an
+    unfamiliar provider degrades rather than failing to build.
+    """
+    try:
+        return llm.with_structured_output(schema, method="json_schema")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("json_schema structured output unavailable (%s); using provider default.", e)
+        return llm.with_structured_output(schema)
+
+
+def _groq_pool_rungs(model_name: str, provider: str) -> list[tuple[str, str, int | None]]:
+    """Ladder rungs for the primary model, one per Groq account when it has a pool.
+
+    Groq's daily token budget (TPD) is per *organization*, so separate accounts
+    hold separate budgets — a 429 on one should try its siblings before falling
+    over to another provider. The first rung follows the round-robin so load
+    still spreads across accounts; the rest are its siblings in order.
+    """
+    if provider.lower().strip() != "groq":
+        return [(model_name, provider, None)]
+    pool_size = len(_groq_keys())
+    if pool_size <= 1:
+        return [(model_name, provider, None)]
+    _, start = _next_groq_key()
+    return [(model_name, provider, (start + i) % pool_size) for i in range(pool_size)]
+
+
 def get_llm_with_fallbacks(
     model_name: str,
     provider: str,
@@ -302,26 +389,31 @@ def get_llm_with_fallbacks(
     if structured_schema is not None and tools is not None:
         raise ValueError("Pass only one of structured_schema / tools.")
 
-    def _build(m: str, p: str):
-        llm = get_llm(m, p, temperature)
+    def _build(m: str, p: str, groq_key_index: int | None = None):
+        llm = get_llm(m, p, temperature, groq_key_index=groq_key_index)
         if structured_schema is not None:
-            return llm.with_structured_output(structured_schema)
+            return _structured(llm, structured_schema)
         if tools is not None:
             return llm.bind_tools(tools)
         return llm
 
-    primary = _build(model_name, provider)
+    # Rungs to try in order, as (model, provider, groq_key_index).
+    rungs = _groq_pool_rungs(model_name, provider)
+    rungs += [(m, p, None) for m, p in parse_fallback_chain(fallback_chain)]
+
+    primary = _build(*rungs[0])
     fallbacks = []
-    for m, p in parse_fallback_chain(fallback_chain):
+    for m, p, key_index in rungs[1:]:
         try:
-            fallbacks.append(_build(m, p))
+            fallbacks.append(_build(m, p, key_index))
         except Exception as e:
             logger.warning(f"Skipping fallback {m}/{p}: failed to build ({e}).")
 
     if not fallbacks:
         return primary
+    sibling_keys = sum(1 for _, _, k in rungs[1:] if k is not None)
     logger.info(
         f"LLM Factory: {model_name}/{provider} armed with {len(fallbacks)} "
-        f"cross-provider fallback(s)."
+        f"fallback(s) ({sibling_keys} sibling Groq account(s))."
     )
     return primary.with_fallbacks(fallbacks)

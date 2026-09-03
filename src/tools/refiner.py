@@ -2,13 +2,18 @@
 
 import logging
 from typing import List, Dict, Any, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from src.config import REFINER_MODEL, REFINER_PROVIDER, REFINER_FALLBACK_CHAIN
 from src.utils.llm_factory import get_llm_with_fallbacks
 
 logger = logging.getLogger(__name__)
 
 class ExtractedFact(BaseModel):
+    # Groq rejects a schema whose nested objects omit additionalProperties:false,
+    # and a permissive schema also lets the model skip the wrapper and emit a bare
+    # array, which fails the tool call. extra="forbid" emits it and prevents both.
+    model_config = ConfigDict(extra="forbid")
+
     extraction_class: str = Field(default="", description="The category of the extracted fact (e.g., 'dates', 'metrics').")
     claim: str = Field(default="", description="A clear, standalone factual claim extracted from the document.")
     source_excerpt: str = Field(
@@ -30,6 +35,8 @@ class ExtractedFact(BaseModel):
     attributes: Dict[str, Any] = Field(description="Additional attributes summarizing the fact based on the schema.", default_factory=dict)
 
 class FactExtractionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     facts: List[ExtractedFact] = Field(description="List of all extracted facts from all provided documents.")
 
 def extract_facts(batched_text: str, schema: dict) -> dict:

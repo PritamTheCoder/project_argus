@@ -11,7 +11,7 @@ Two kinds of gap, prioritized in this order:
 """
 
 import logging
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List
 
 from src.schema.state import AgentState, SearchIntent
@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 
 class ReflectorOutput(BaseModel):
+    # Groq rejects a schema whose nested objects omit additionalProperties:false,
+    # and a permissive schema also lets the model skip the wrapper and emit a bare
+    # array, which fails the tool call. extra="forbid" emits it and prevents both.
+    model_config = ConfigDict(extra="forbid")
+
     search_queries: List[SearchIntent] = Field(
         description="2-4 highly specific, targeted search queries to fill identified knowledge gaps."
     )
