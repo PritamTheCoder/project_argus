@@ -432,6 +432,46 @@ def test_critic_leaves_mode_alone_when_credibility_fine(mock_kg, mock_embeddings
     assert result["plan"][0]["mode"] == "MIXED"
 
 
+# ── Critic: gap persistence ──────────────────────────────────────────────────
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_stores_coverage_and_knowledge_gaps(mock_kg, mock_embeddings, mock_get_llm):
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = []
+    mock_kg.store_gaps = MagicMock()
+    mock_get_llm.return_value.return_value = FactCheckResult(status="sufficient", new_queries=[], critique="ok")
+
+    state = _base_state(
+        original_plan=[{"query": "q1", "mode": "MIXED"}],
+        knowledge_gaps=["unverifiable claim X"],
+        iteration_count=1,
+        session_id="sess-1",
+    )
+    critic_node(state)
+
+    mock_kg.store_gaps.assert_called_once()
+    entries = mock_kg.store_gaps.call_args.args[0]
+    by_type = {e["gap_type"]: e["description"] for e in entries}
+    assert by_type == {"coverage_gap": "q1", "knowledge_gap": "unverifiable claim X"}
+    assert all(e["iteration"] == 1 for e in entries)
+
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_stores_empty_gaps_without_crashing(mock_kg, mock_embeddings, mock_get_llm):
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = []
+    mock_kg.store_gaps = MagicMock()
+    mock_get_llm.return_value.return_value = FactCheckResult(status="sufficient", new_queries=[], critique="ok")
+
+    critic_node(_base_state())
+
+    mock_kg.store_gaps.assert_called_once_with([], session_id="")
+
+
 # ── Reflector Tests ──────────────────────────────────────────────────────────
 
 @patch("src.agents.reflector.get_llm_with_fallbacks")

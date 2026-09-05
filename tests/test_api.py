@@ -152,3 +152,69 @@ def test_list_research_without_api_key_is_rejected(client):
     test_client, _, _, _ = client
     resp = test_client.get("/research/", headers={"Authorization": ""})
     assert resp.status_code == 401
+
+
+# ── Evidence graph endpoints ──────────────────────────────────────────────────
+
+def test_get_graph_not_found(client):
+    test_client, _, _, _ = client
+    resp = test_client.get("/research/does-not-exist/graph")
+    assert resp.status_code == 404
+
+
+def test_get_graph_hides_another_owners_job(client):
+    test_client, _, store, _ = client
+    job = store.create_job("not yours", owner_key_hash="someone-else")
+    resp = test_client.get(f"/research/{job['job_id']}/graph")
+    assert resp.status_code == 404
+
+
+def test_get_graph_returns_evidence_for_the_jobs_thread(client):
+    test_client, _, store, owner_key_hash = client
+    job = store.create_job("test query", owner_key_hash)
+
+    with patch("src.graph.kg.kg_store") as mock_kg:
+        mock_kg.get_evidence_graph.return_value = {
+            "facts": [{"id": 1, "claim": "x"}], "sources": [], "contradictions": [],
+            "consensus_findings": [], "gaps": [],
+        }
+        resp = test_client.get(f"/research/{job['job_id']}/graph")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["facts"] == [{"id": 1, "claim": "x"}]
+    # Queried by the job's internal thread_id, not the public job_id.
+    mock_kg.get_evidence_graph.assert_called_once_with(job["thread_id"])
+
+
+def test_get_fact_not_found(client):
+    test_client, _, store, owner_key_hash = client
+    job = store.create_job("test query", owner_key_hash)
+
+    with patch("src.graph.kg.kg_store") as mock_kg:
+        mock_kg.get_fact_detail.return_value = None
+        resp = test_client.get(f"/research/{job['job_id']}/facts/999")
+
+    assert resp.status_code == 404
+
+
+def test_get_fact_hides_another_owners_job(client):
+    test_client, _, store, _ = client
+    job = store.create_job("not yours", owner_key_hash="someone-else")
+    resp = test_client.get(f"/research/{job['job_id']}/facts/1")
+    assert resp.status_code == 404
+
+
+def test_get_fact_returns_detail(client):
+    test_client, _, store, owner_key_hash = client
+    job = store.create_job("test query", owner_key_hash)
+
+    with patch("src.graph.kg.kg_store") as mock_kg:
+        mock_kg.get_fact_detail.return_value = {
+            "id": 1, "claim": "SpaceX valued at $350B", "source": {"credibility_score": 0.9},
+            "contradictions": [],
+        }
+        resp = test_client.get(f"/research/{job['job_id']}/facts/1")
+
+    assert resp.status_code == 200
+    assert resp.json()["claim"] == "SpaceX valued at $350B"

@@ -74,3 +74,59 @@ def test_distinct_sources_deduplicates_across_merged_facts():
         {"claim": "A2", "source_url": "http://b", "merged_sources": ["http://b", "http://c"]},
     ]
     assert sorted(distinct_sources(cluster)) == ["http://a", "http://b", "http://c"]
+
+
+# ── consensus_node: evidence-graph persistence ───────────────────────────────
+
+from unittest.mock import MagicMock, patch
+from src.agents.consensus import consensus_node, ConsensusBatch, ClusterJudgment
+
+
+def _supported_fact(claim, url, embedding):
+    return {
+        "claim": claim, "source_url": url, "support_level": "SUPPORTED",
+        "confidence": 0.9, "embedding": embedding,
+    }
+
+
+@patch("src.agents.consensus.get_llm_with_fallbacks")
+@patch("src.graph.kg.kg_store")
+def test_consensus_stores_findings_and_contradictions_in_kg(mock_kg, mock_get_llm):
+    mock_kg.store_consensus_findings = MagicMock()
+    mock_kg.store_contradictions = MagicMock()
+    mock_get_llm.return_value.invoke.return_value = ConsensusBatch(judgments=[
+        ClusterJudgment(index=0, relationship="CONSENSUS", statement="Agreed: 400 Wh/kg"),
+    ])
+
+    emb = [1.0] + [0.0] * 383
+    state = {
+        "verified_facts": [
+            _supported_fact("400 Wh/kg", "http://a.com", emb),
+            _supported_fact("~400 Wh/kg", "http://b.com", emb),
+        ],
+        "source_map": {}, "session_id": "sess-1",
+    }
+
+    result = consensus_node(state)
+
+    assert len(result["consensus_findings"]) == 1
+    mock_kg.store_consensus_findings.assert_called_once()
+    findings_arg = mock_kg.store_consensus_findings.call_args.args[0]
+    assert findings_arg[0]["statement"] == "Agreed: 400 Wh/kg"
+    mock_kg.store_contradictions.assert_called_once_with([], session_id="sess-1")
+
+
+@patch("src.graph.kg.kg_store")
+def test_consensus_handles_no_candidate_clusters_without_crashing(mock_kg):
+    """Fewer than 2 supported facts means no LLM call and nothing to judge —
+    storage must still be attempted (harmlessly, with empty lists)."""
+    mock_kg.store_consensus_findings = MagicMock()
+    mock_kg.store_contradictions = MagicMock()
+
+    state = {"verified_facts": [], "source_map": {}, "session_id": "sess-1"}
+    result = consensus_node(state)
+
+    assert result["consensus_findings"] == []
+    assert result["contradictions"] == []
+    mock_kg.store_consensus_findings.assert_called_once_with([], session_id="sess-1")
+    mock_kg.store_contradictions.assert_called_once_with([], session_id="sess-1")

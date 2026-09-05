@@ -389,3 +389,82 @@ def test_verifier_returns_interim_quality_score(mock_kg, mock_embeddings, mock_g
     assert qs["verified_fact_count"] == 1
     assert qs["avg_source_credibility"] == 0.4
     assert qs["contradiction_count"] == 0
+
+
+# ── Evidence graph: sources persisted alongside facts ────────────────────────
+
+@patch("src.agents.verifier.get_llm_with_fallbacks")
+@patch("src.utils.embeddings.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_verifier_stores_sources_with_their_source_id(mock_kg, mock_embeddings, mock_get_llm):
+    """source_map is keyed by source_id ("[n]") but its values don't carry that
+    key inline — store_sources needs it attached for citation-linking."""
+    mock_get_llm.return_value.invoke.return_value = LLMBatchVerification(results=[
+        LLMVerificationResult(
+            index=0, reasoning="ok", support_quote="reached 400 Wh/kg",
+            support_level="SUPPORTED", confidence=0.9,
+        ),
+    ])
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.store_facts = MagicMock()
+    mock_kg.store_sources = MagicMock()
+
+    state = _make_state(
+        structured_evidence=[
+            {"claim": "Reached 400 Wh/kg", "source_excerpt": "...reached 400 Wh/kg...",
+             "source_url": "http://a.com", "source_id": "[1]"},
+        ],
+        source_map={"[1]": {"url": "http://a.com", "credibility_score": 0.9, "relevance_score": 0.7}},
+    )
+
+    verifier_node(state)
+
+    mock_kg.store_sources.assert_called_once()
+    stored = mock_kg.store_sources.call_args.args[0]
+    assert stored == [{"url": "http://a.com", "credibility_score": 0.9,
+                        "relevance_score": 0.7, "source_id": "[1]"}]
+
+
+@patch("src.graph.kg.kg_store")
+def test_verifier_stores_sources_even_with_no_extracted_facts(mock_kg):
+    """A pass where the Refiner extracted nothing still hits the early-exit
+    return — sources must be persisted before that return, not after, or a
+    source Scout found on the run's last iteration is never recorded."""
+    mock_kg.store_sources = MagicMock()
+    state = _make_state(
+        structured_evidence=[],
+        source_map={"[1]": {"url": "http://a.com", "credibility_score": 0.9}},
+    )
+
+    verifier_node(state)
+
+    mock_kg.store_sources.assert_called_once()
+
+
+@patch("src.agents.verifier.get_llm_with_fallbacks")
+@patch("src.utils.embeddings.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_verifier_stores_sources_even_when_none_end_up_supported(mock_kg, mock_embeddings, mock_get_llm):
+    """Facts were extracted and verified, but none were SUPPORTED — sources
+    must still persist; only fact storage is conditional on supported_facts."""
+    mock_get_llm.return_value.invoke.return_value = LLMBatchVerification(results=[
+        LLMVerificationResult(
+            index=0, reasoning="no support found", support_quote="",
+            support_level="NOT_SUPPORTED", confidence=0.1,
+        ),
+    ])
+    mock_kg.store_facts = MagicMock()
+    mock_kg.store_sources = MagicMock()
+
+    state = _make_state(
+        structured_evidence=[
+            {"claim": "unverifiable claim", "source_excerpt": "irrelevant text",
+             "source_url": "http://a.com", "source_id": "[1]"},
+        ],
+        source_map={"[1]": {"url": "http://a.com", "credibility_score": 0.9}},
+    )
+
+    verifier_node(state)
+
+    mock_kg.store_facts.assert_not_called()
+    mock_kg.store_sources.assert_called_once()
