@@ -11,6 +11,7 @@ invalid API key, falls back to Gemini as the guaranteed-available provider.
 import itertools
 import logging
 import os
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
 from src.utils.rate_limit import TokenAwareRateLimiter, TokenUsageReporter
 
@@ -103,9 +104,20 @@ def _get_rate_limiter(
     return _rate_limiters[name]
 
 
-def _usage_callbacks(limiter: TokenAwareRateLimiter) -> list:
-    """A reporter only earns its keep when the limiter actually gates on tokens."""
-    return [TokenUsageReporter(limiter)] if limiter.gates_on_tokens else []
+class RungFailureLogger(BaseCallbackHandler):
+    """Logs a ladder rung's real error even when a later rung masks it —
+    otherwise only a bare status line (e.g. "400 Bad Request") ever surfaces."""
+
+    def on_llm_error(self, error: BaseException, **kwargs) -> None:
+        logger.warning("LLM rung failed: %s", error)
+
+
+def _default_callbacks(limiter: TokenAwareRateLimiter) -> list:
+    """Callbacks attached to every LLM instance this factory builds."""
+    callbacks = [RungFailureLogger()]
+    if limiter.gates_on_tokens:
+        callbacks.append(TokenUsageReporter(limiter))
+    return callbacks
 
 
 # ── Groq multi-key pool ──────────────────────────────────────────────────────
@@ -165,7 +177,7 @@ def _create_llm(
             model=model_name,
             temperature=temperature,
             rate_limiter=limiter,
-            callbacks=_usage_callbacks(limiter),
+            callbacks=_default_callbacks(limiter),
             max_retries=GEMINI_MAX_RETRIES,  # 1 = no in-SDK retries → fail fast to the fallback ladder
             timeout=GEMINI_TIMEOUT,          # seconds; hard ceiling on a single request
         )
@@ -184,7 +196,7 @@ def _create_llm(
             temperature=temperature,
             api_key=key or None,
             rate_limiter=groq_limiter,
-            callbacks=_usage_callbacks(groq_limiter),
+            callbacks=_default_callbacks(groq_limiter),
             # No in-SDK retries: the client honours retry-after and would sleep
             # re-asking a quota-exhausted key. The next rung is a different
             # account, so failing over immediately is faster and likelier to work.
@@ -196,7 +208,7 @@ def _create_llm(
             model=model_name,
             temperature=temperature,
             rate_limiter=limiter,
-            callbacks=_usage_callbacks(limiter),
+            callbacks=_default_callbacks(limiter),
         )
 
     elif provider in _NIM_PROVIDERS:
@@ -210,7 +222,7 @@ def _create_llm(
             temperature=temperature,
             max_tokens=16384,
             rate_limiter=limiter,
-            callbacks=_usage_callbacks(limiter),
+            callbacks=_default_callbacks(limiter),
             timeout=NIM_TIMEOUT,   # abort client-side before the gateway 504s (~5 min)
             max_retries=1,         # no in-SDK retries → fail fast to the fallback ladder
         )
@@ -228,7 +240,7 @@ def _create_llm(
             top_p=0.95,
             max_tokens=16384,
             rate_limiter=limiter,
-            callbacks=_usage_callbacks(limiter),
+            callbacks=_default_callbacks(limiter),
         )
 
     else:

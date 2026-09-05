@@ -182,3 +182,47 @@ def test_groq_does_not_retry_a_quota_exhausted_key_in_sdk():
     with patch("src.utils.llm_factory._groq_keys", return_value=["gsk_a"]):
         llm = _create_llm("m", "groq", 0.0)
     assert llm.max_retries == 0
+
+
+# ── Per-rung failure logging ─────────────────────────────────────────────────
+# A rung that fails before a later rung succeeds never otherwise surfaces its
+# error text: httpx's own request log shows only method/URL/status, and
+# application code only sees the *last* rung's exception if every rung fails.
+
+def test_rung_failure_logger_fires_on_a_masked_failure(caplog):
+    """The exact case that was invisible: rung 1 fails, rung 2 succeeds, and
+    rung 1's real error must still be logged somewhere."""
+    import logging as _logging
+    from langchain_core.language_models.fake_chat_models import (
+        FakeChatModel, FakeMessagesListChatModel,
+    )
+    from langchain_core.messages import AIMessage
+    from src.utils.llm_factory import RungFailureLogger
+
+    class BrokenChatModel(FakeChatModel):
+        def _generate(self, *a, **kw):
+            raise RuntimeError("simulated 400 Bad Request: bad payload")
+
+    bad = BrokenChatModel()
+    good = FakeMessagesListChatModel(responses=[AIMessage(content="fallback ok")])
+    chain = bad.with_fallbacks([good])
+
+    with caplog.at_level(_logging.WARNING, logger="src.utils.llm_factory"):
+        result = chain.invoke("hi", config={"callbacks": [RungFailureLogger()]})
+
+    assert result.content == "fallback ok"
+    assert any("bad payload" in r.message for r in caplog.records)
+
+
+def test_default_callbacks_always_include_the_failure_logger():
+    from src.utils.llm_factory import _default_callbacks, RungFailureLogger, _get_rate_limiter
+    limiter = _get_rate_limiter("gemini")
+    names = [type(c).__name__ for c in _default_callbacks(limiter)]
+    assert "RungFailureLogger" in names
+
+
+def test_factory_built_llm_carries_the_failure_logger():
+    from src.utils.llm_factory import get_llm
+    llm = get_llm("openai/gpt-oss-120b", "groq")
+    names = [type(c).__name__ for c in llm.callbacks]
+    assert "RungFailureLogger" in names
