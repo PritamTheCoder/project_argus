@@ -42,6 +42,18 @@ class LLMBatchVerification(BaseModel):
 logger = logging.getLogger(__name__)
 
 
+def _store_sources(source_map: dict, session_id: str) -> None:
+    """Persist source_map into the KG's evidence graph. Called on every
+    Verifier pass, including the early-exit path, so a pass with no extracted
+    facts still doesn't lose whatever sources Scout has already registered."""
+    try:
+        from src.graph.kg import kg_store
+        sources = [{**v, "source_id": sid} for sid, v in (source_map or {}).items()]
+        kg_store.store_sources(sources, session_id=session_id)
+    except Exception as e:
+        logger.error(f"Error storing sources into KG: {e}")
+
+
 def _normalize_claim(text: str) -> str:
     """Lowercase, strip punctuation and extra whitespace for similarity comparison."""
     text = unicodedata.normalize("NFKD", text).lower()
@@ -210,6 +222,7 @@ def verifier_node(state: AgentState) -> dict:
     source_map = state.get("source_map", {})
 
     if not structured_evidence:
+        _store_sources(source_map, state.get("session_id", ""))
         return {"verified_facts": [], "knowledge_gap_detected": False, "knowledge_gaps": [], "active_node": "verifier"}
 
     for fact in structured_evidence:
@@ -307,9 +320,10 @@ def verifier_node(state: AgentState) -> dict:
         if f.get("support_level") in ("SUPPORTED", "PARTIALLY_SUPPORTED")
     ]
     try:
+        from src.graph.kg import kg_store
+
         if supported_facts:
             from src.utils.embeddings import get_embeddings
-            from src.graph.kg import kg_store
             texts_to_embed = [f["claim"] for f in supported_facts]
             embeddings = get_embeddings(texts_to_embed)
 
@@ -328,6 +342,11 @@ def verifier_node(state: AgentState) -> dict:
             kg_store.store_facts(supported_facts, session_id=session_id)
     except Exception as e:
         logger.error(f"Error embedding/corroborating/storing facts into KG: {e}")
+
+    # Independent of whether this pass had any supported facts — source_map
+    # accumulates across the whole run and store_sources is idempotent, so
+    # this just picks up whatever Scout has registered so far.
+    _store_sources(state.get("source_map", {}), session_id)
 
     knowledge_gaps = [
         f.get("claim", "")

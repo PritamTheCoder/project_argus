@@ -155,6 +155,17 @@ def critic_node(state: AgentState) -> dict:
             f"{LOW_SOURCE_CREDIBILITY_THRESHOLD} — upgraded re-search queries toward trusted sources."
         )
 
+    iteration = state.get("iteration_count", 0)
+    gap_entries = (
+        [{"gap_type": "coverage_gap", "description": g, "iteration": iteration} for g in coverage_gaps]
+        + [{"gap_type": "knowledge_gap", "description": g, "iteration": iteration}
+           for g in state.get("knowledge_gaps", []) or []]
+    )
+    try:
+        kg_store.store_gaps(gap_entries, session_id=session_id)
+    except Exception as e:
+        logger.error(f"Error storing gaps into KG: {e}")
+
     return {
         "critique": result.critique,
         "re_search_required": re_search_required,
