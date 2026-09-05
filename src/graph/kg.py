@@ -97,6 +97,63 @@ class KnowledgeGraph:
             self.fts_available = False
             logger.warning(f"FTS5 unavailable ({e}); BM25 chunk retrieval disabled, vector-only.")
 
+        # Evidence-graph tables: sources, contradictions, consensus findings,
+        # and gaps, so this data survives past the run that computed it.
+        self.db.execute("""
+        CREATE TABLE IF NOT EXISTS sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            source_id TEXT,
+            url TEXT,
+            credibility_score REAL,
+            source_type TEXT,
+            relevance_score REAL,
+            as_of_date TEXT,
+            snippet TEXT
+        )
+        """)
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_sources_session ON sources(session_id)")
+
+        self.db.execute("""
+        CREATE TABLE IF NOT EXISTS contradictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            statement TEXT,
+            claims TEXT,
+            sources TEXT,
+            source_count INTEGER
+        )
+        """)
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_contradictions_session ON contradictions(session_id)")
+
+        self.db.execute("""
+        CREATE TABLE IF NOT EXISTS consensus_findings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            statement TEXT,
+            claims TEXT,
+            sources TEXT,
+            source_count INTEGER
+        )
+        """)
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_consensus_session ON consensus_findings(session_id)")
+
+        # gap_type: "knowledge_gap" (a claim that failed verification) or
+        # "coverage_gap" (a planned sub-question no fact ever answered).
+        # iteration is the research-loop pass that produced it, so a gap
+        # closed by a later re-search pass is still visible as history rather
+        # than silently overwritten.
+        self.db.execute("""
+        CREATE TABLE IF NOT EXISTS gaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            gap_type TEXT,
+            description TEXT,
+            iteration INTEGER
+        )
+        """)
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_gaps_session ON gaps(session_id)")
+
         self.db.commit()
     
     def _ensure_column(self, table: str, column: str, col_type: str):
@@ -132,6 +189,151 @@ class KnowledgeGraph:
 
             self.db.commit()
         logger.info(f"Stored {len(facts_with_embeddings)} facts into Knowledge Graph (session={session_id or 'global'}).")
+
+    def store_sources(self, sources: List[Dict[str, Any]], session_id: str = "") -> None:
+        """Persist source_map entries. Each entry needs a ``source_id`` (the
+        "[n]" citation label) added by the caller, since source_map's dict
+        values don't carry their own key.
+
+        Idempotent per (session_id, source_id) — source_map accumulates across
+        research-loop iterations, so a naive insert would duplicate sources
+        already written on an earlier pass."""
+        if not sources:
+            return
+        with self._lock:
+            cursor = self.db.cursor()
+            cursor.execute("SELECT source_id FROM sources WHERE session_id = ?", (session_id,))
+            already_stored = {row[0] for row in cursor.fetchall()}
+            new_sources = [s for s in sources if s.get("source_id", "") not in already_stored]
+            for s in new_sources:
+                cursor.execute("""
+                INSERT INTO sources (session_id, source_id, url, credibility_score, source_type, relevance_score, as_of_date, snippet)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (session_id, s.get("source_id", ""), s.get("url", ""),
+                      s.get("credibility_score", 0.0), s.get("source_type", ""),
+                      s.get("relevance_score"), s.get("as_of_date", ""), s.get("snippet", "")))
+            self.db.commit()
+
+    def store_contradictions(self, entries: List[Dict[str, Any]], session_id: str = "") -> None:
+        """``entries`` is Consensus's contradiction list: statement, claims
+        (list of claim text), sources (list of URLs), source_count."""
+        self._store_cluster_entries("contradictions", entries, session_id)
+
+    def store_consensus_findings(self, entries: List[Dict[str, Any]], session_id: str = "") -> None:
+        """Same shape as ``store_contradictions``, for agreeing clusters."""
+        self._store_cluster_entries("consensus_findings", entries, session_id)
+
+    def _store_cluster_entries(self, table: str, entries: List[Dict[str, Any]], session_id: str) -> None:
+        if not entries:
+            return
+        with self._lock:
+            cursor = self.db.cursor()
+            for e in entries:
+                cursor.execute(f"""
+                INSERT INTO {table} (session_id, statement, claims, sources, source_count)
+                VALUES (?, ?, ?, ?, ?)
+                """, (session_id, e.get("statement", ""),
+                      json.dumps(e.get("claims", [])), json.dumps(e.get("sources", [])),
+                      e.get("source_count", 0)))
+            self.db.commit()
+
+    def store_gaps(self, gaps: List[Dict[str, Any]], session_id: str = "") -> None:
+        """``gaps`` entries: {"gap_type": "knowledge_gap"|"coverage_gap",
+        "description": str, "iteration": int}."""
+        if not gaps:
+            return
+        with self._lock:
+            cursor = self.db.cursor()
+            for g in gaps:
+                cursor.execute("""
+                INSERT INTO gaps (session_id, gap_type, description, iteration)
+                VALUES (?, ?, ?, ?)
+                """, (session_id, g.get("gap_type", ""), g.get("description", ""), g.get("iteration", 0)))
+            self.db.commit()
+
+    def get_evidence_graph(self, session_id: str) -> Dict[str, Any]:
+        """Everything the evidence-graph API needs for one run: facts, sources,
+        contradictions, consensus findings, and gaps, all scoped to session_id."""
+        with self._lock:
+            cursor = self.db.cursor()
+
+            cursor.execute(
+                "SELECT id, claim, source_url, source_excerpt, support_level, confidence, "
+                "credibility_score, source_type, support_quote, corroboration_count, as_of_date "
+                "FROM facts WHERE session_id = ?", (session_id,),
+            )
+            cols = [d[0] for d in cursor.description]
+            facts = [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+            cursor.execute(
+                "SELECT id, source_id, url, credibility_score, source_type, relevance_score, "
+                "as_of_date, snippet FROM sources WHERE session_id = ?", (session_id,),
+            )
+            cols = [d[0] for d in cursor.description]
+            sources = [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+            contradictions = self._read_cluster_entries(cursor, "contradictions", session_id)
+            consensus_findings = self._read_cluster_entries(cursor, "consensus_findings", session_id)
+
+            cursor.execute(
+                "SELECT id, gap_type, description, iteration FROM gaps WHERE session_id = ?",
+                (session_id,),
+            )
+            cols = [d[0] for d in cursor.description]
+            gaps = [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+        return {
+            "facts": facts, "sources": sources,
+            "contradictions": contradictions, "consensus_findings": consensus_findings,
+            "gaps": gaps,
+        }
+
+    def _read_cluster_entries(self, cursor, table: str, session_id: str) -> List[Dict[str, Any]]:
+        cursor.execute(
+            f"SELECT id, statement, claims, sources, source_count FROM {table} WHERE session_id = ?",
+            (session_id,),
+        )
+        cols = [d[0] for d in cursor.description]
+        rows = [dict(zip(cols, row)) for row in cursor.fetchall()]
+        for r in rows:
+            r["claims"] = json.loads(r["claims"]) if r["claims"] else []
+            r["sources"] = json.loads(r["sources"]) if r["sources"] else []
+        return rows
+
+    def get_fact_detail(self, session_id: str, fact_id: int) -> Optional[Dict[str, Any]]:
+        """One fact plus its source's full metadata and any contradiction
+        entries that name its claim. Corroboration is reported only as the
+        count already stored on the fact — the specific corroborating rows
+        are not persisted, so a list of them cannot be honestly reconstructed."""
+        with self._lock:
+            cursor = self.db.cursor()
+            cursor.execute(
+                "SELECT id, claim, source_url, source_excerpt, support_level, confidence, "
+                "credibility_score, source_type, support_quote, corroboration_count, as_of_date "
+                "FROM facts WHERE session_id = ? AND id = ?", (session_id, fact_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            cols = [d[0] for d in cursor.description]
+            fact = dict(zip(cols, row))
+
+            cursor.execute(
+                "SELECT source_id, url, credibility_score, source_type, relevance_score, as_of_date "
+                "FROM sources WHERE session_id = ? AND url = ? LIMIT 1",
+                (session_id, fact["source_url"]),
+            )
+            src_row = cursor.fetchone()
+            source = dict(zip([d[0] for d in cursor.description], src_row)) if src_row else None
+
+            contradictions = [
+                c for c in self._read_cluster_entries(cursor, "contradictions", session_id)
+                if fact["claim"] in c["claims"]
+            ]
+
+        fact["source"] = source
+        fact["contradictions"] = contradictions
+        return fact
 
     def retrieve_relevant_facts(self, query_embedding: List[float], k: int = 5, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
