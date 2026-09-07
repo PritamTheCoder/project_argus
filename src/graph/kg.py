@@ -335,6 +335,41 @@ class KnowledgeGraph:
         fact["contradictions"] = contradictions
         return fact
 
+    def copy_session(self, source_session_id: str, target_session_id: str) -> None:
+        """Copy one session's evidence-graph rows to another. A forked thread
+        gets its own session_id, so without this its evidence graph would
+        only show what's found after the fork, missing everything inherited.
+
+        Embeddings (``vec_facts``) are skipped — that index only serves
+        mid-run corroboration lookups, not evidence-graph display."""
+        with self._lock:
+            cursor = self.db.cursor()
+            cursor.execute("""
+                INSERT INTO facts (claim, source_url, source_excerpt, support_level, confidence,
+                    credibility_score, source_type, session_id, support_quote, corroboration_count, as_of_date)
+                SELECT claim, source_url, source_excerpt, support_level, confidence,
+                    credibility_score, source_type, ?, support_quote, corroboration_count, as_of_date
+                FROM facts WHERE session_id = ?
+            """, (target_session_id, source_session_id))
+            cursor.execute("""
+                INSERT INTO sources (session_id, source_id, url, credibility_score, source_type,
+                    relevance_score, as_of_date, snippet)
+                SELECT ?, source_id, url, credibility_score, source_type,
+                    relevance_score, as_of_date, snippet
+                FROM sources WHERE session_id = ?
+            """, (target_session_id, source_session_id))
+            for table in ("contradictions", "consensus_findings"):
+                cursor.execute(f"""
+                    INSERT INTO {table} (session_id, statement, claims, sources, source_count)
+                    SELECT ?, statement, claims, sources, source_count
+                    FROM {table} WHERE session_id = ?
+                """, (target_session_id, source_session_id))
+            cursor.execute("""
+                INSERT INTO gaps (session_id, gap_type, description, iteration)
+                SELECT ?, gap_type, description, iteration FROM gaps WHERE session_id = ?
+            """, (target_session_id, source_session_id))
+            self.db.commit()
+
     def retrieve_relevant_facts(self, query_embedding: List[float], k: int = 5, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Semantic search over stored facts.

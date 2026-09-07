@@ -34,23 +34,30 @@ def _initial_state(query: str, session_id: str) -> AgentState:
 
 
 async def astream_research(
-    query: str, thread_id: Optional[str] = None, callbacks: Optional[list[Any]] = None,
+    query: Optional[str] = None, thread_id: Optional[str] = None,
+    callbacks: Optional[list[Any]] = None, resume: bool = False,
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """Yield (node_name, state_update) per node, then ("__final__", full_state)
     with the complete AgentState plus a node_seconds timing breakdown.
-    callbacks is passed to the graph run config (e.g. a token-usage tracker)."""
+    callbacks is passed to the graph run config (e.g. a token-usage tracker).
+
+    ``resume=True`` continues an already-seeded thread (e.g. one written by
+    ``fork_thread``) instead of starting fresh: passing ``None`` as the graph
+    input tells LangGraph to read the existing checkpoint rather than
+    overwrite it with a new initial state. ``query`` is unused in that mode —
+    the seeded state already carries it."""
     thread_id = thread_id or generate_thread_id()
     config = get_run_config(thread_id)
     if callbacks:
         config["callbacks"] = callbacks
-    initial_state = _initial_state(query, thread_id)
+    graph_input = None if resume else _initial_state(query, thread_id)
 
     node_seconds: dict[str, float] = {}
     node_started_at = time.perf_counter()
 
     async with get_checkpointer() as checkpointer:
         graph = build_graph(checkpointer=checkpointer)
-        async for event in graph.astream(initial_state, config=config):
+        async for event in graph.astream(graph_input, config=config):
             now = time.perf_counter()
             elapsed = now - node_started_at
             for node_name, state_update in event.items():
