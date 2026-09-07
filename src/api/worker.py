@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 import threading
+from typing import Optional
 
 from eval.metrics import RunMetrics
 from src.api.jobs import job_store
@@ -14,11 +15,13 @@ from src.graph.pipeline import astream_research
 logger = logging.getLogger(__name__)
 
 
-async def _run(job_id: str, query: str, thread_id: str) -> None:
+async def _run(job_id: str, query: Optional[str], thread_id: str, resume: bool = False) -> None:
     job_store.update_job(job_id, status="running")
     metrics = RunMetrics()  # same tracker the eval harness uses
     try:
-        async for node_name, state_update in astream_research(query, thread_id=thread_id, callbacks=[metrics]):
+        async for node_name, state_update in astream_research(
+            query, thread_id=thread_id, callbacks=[metrics], resume=resume,
+        ):
             if node_name == "__final__":
                 job_store.update_job(
                     job_id,
@@ -36,12 +39,12 @@ async def _run(job_id: str, query: str, thread_id: str) -> None:
         job_store.update_job(job_id, status="error", error=str(e), usage={"llm": metrics.summary(), "node_seconds": {}})
 
 
-def run_job_in_background(job_id: str, query: str, thread_id: str) -> threading.Thread:
+def _start(job_id: str, query: Optional[str], thread_id: str, resume: bool) -> threading.Thread:
     def _worker():
         loop = asyncio.ProactorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(_run(job_id, query, thread_id))
+            loop.run_until_complete(_run(job_id, query, thread_id, resume=resume))
         finally:
             loop.close()
 
@@ -49,3 +52,13 @@ def run_job_in_background(job_id: str, query: str, thread_id: str) -> threading.
     t = threading.Thread(target=_worker, daemon=True, name=f"job-{job_id[:8]}")
     t.start()
     return t
+
+
+def run_job_in_background(job_id: str, query: str, thread_id: str) -> threading.Thread:
+    return _start(job_id, query, thread_id, resume=False)
+
+
+def run_branch_in_background(job_id: str, thread_id: str) -> threading.Thread:
+    """Continue an already-forked thread (see ``fork_thread``) rather than
+    starting a fresh run — the state is already seeded."""
+    return _start(job_id, None, thread_id, resume=True)

@@ -47,9 +47,12 @@ class JobStore:
         if column not in existing:
             self.db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {col_type}")
 
-    def create_job(self, query: str, owner_key_hash: str) -> dict:
+    def create_job(self, query: str, owner_key_hash: str, thread_id: Optional[str] = None) -> dict:
+        """``thread_id`` is normally auto-generated; a branch passes an
+        already-forked one so the job row points at the forked run, not a
+        fresh empty thread."""
         job_id = str(uuid.uuid4())
-        thread_id = str(uuid.uuid4())
+        thread_id = thread_id or str(uuid.uuid4())
         now = time.time()
         with self._lock:
             self.db.execute(

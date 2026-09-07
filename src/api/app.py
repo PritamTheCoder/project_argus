@@ -5,6 +5,8 @@ polls status/result; GET /research/ lists the caller's past jobs.
 Run with: uvicorn src.api.app:app --reload
 """
 
+from typing import Optional
+
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -14,13 +16,26 @@ configure_logging()  # before importing anything that logs, so nothing gets drop
 
 from src.api.auth import require_api_key  # noqa: E402
 from src.api.jobs import job_store  # noqa: E402
-from src.api.worker import run_job_in_background  # noqa: E402
+from src.api.worker import run_job_in_background, run_branch_in_background  # noqa: E402
 
 app = FastAPI(title="Project Argus API", version="0.1.0")
 
 
 class ResearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
+
+
+class BranchRequest(BaseModel):
+    checkpoint_id: str = Field(..., description="A checkpoint_id from GET /research/{job_id}/history")
+    query: str = Field(..., min_length=1, max_length=2000, description="The new direction to research from this point")
+    mode: str = Field(default="MIXED", description="TRUSTED_ONLY, TRUSTED_FIRST, or MIXED")
+
+
+class DigDeeperRequest(BaseModel):
+    fact_id: Optional[int] = Field(default=None, description="Target a specific fact from GET .../facts/{fact_id}")
+    gap_id: Optional[int] = Field(default=None, description="Target a specific gap from GET .../graph")
+    query: Optional[str] = Field(default=None, max_length=2000, description="Override: research this instead of deriving a query from fact_id/gap_id")
+    mode: str = Field(default="MIXED", description="TRUSTED_ONLY, TRUSTED_FIRST, or MIXED")
 
 
 class ResearchJobOut(BaseModel):
@@ -39,6 +54,9 @@ async def root():
             "GET /research/{job_id}": "poll job status/progress/result (requires an API key)",
             "GET /research/{job_id}/graph": "the evidence graph for a run: facts, sources, contradictions, consensus findings, gaps (requires an API key)",
             "GET /research/{job_id}/facts/{fact_id}": "one fact's quote, source, and contradictions (requires an API key)",
+            "GET /research/{job_id}/history": "the run's checkpoint history, for picking a branch point (requires an API key)",
+            "POST /research/{job_id}/branch": "fork a new run from a checkpoint with an injected direction; the source run is untouched (requires an API key)",
+            "POST /research/{job_id}/dig-deeper": "fork a targeted follow-up on one fact or gap from a finished run (requires an API key)",
             "GET /research/": "list your past research jobs (requires an API key)",
             "GET /health": "liveness check",
         },
@@ -100,3 +118,99 @@ async def get_research_fact(job_id: str, fact_id: int, owner: dict = Depends(req
     if fact is None:
         raise HTTPException(status_code=404, detail="fact not found")
     return fact
+
+
+@app.get("/research/{job_id}/history")
+async def get_research_history(job_id: str, owner: dict = Depends(require_api_key)):
+    """The run's checkpoint history — a branch point is a checkpoint_id from
+    this list."""
+    job = _get_owned_job_or_404(job_id, owner)
+    from src.graph.builder import build_graph
+    from src.graph.persistence import get_checkpointer, list_checkpoints
+
+    async with get_checkpointer() as checkpointer:
+        graph = build_graph(checkpointer=checkpointer)
+        return {"checkpoints": await list_checkpoints(graph, job["thread_id"])}
+
+
+@app.post("/research/{job_id}/branch", response_model=ResearchJobOut, status_code=202)
+async def branch_research(job_id: str, req: BranchRequest, owner: dict = Depends(require_api_key)):
+    """Fork a new run from one of this job's checkpoints, with an extra
+    sub-query injected into the plan. The source run is untouched — this
+    creates a new job the caller polls exactly like any other."""
+    job = _get_owned_job_or_404(job_id, owner)
+    from src.graph.builder import build_graph
+    from src.graph.kg import kg_store
+    from src.graph.persistence import fork_thread, get_checkpointer, get_run_config
+
+    try:
+        async with get_checkpointer() as checkpointer:
+            graph = build_graph(checkpointer=checkpointer)
+            source_config = {"configurable": {"thread_id": job["thread_id"], "checkpoint_id": req.checkpoint_id}}
+            snapshot = await graph.aget_state(source_config)
+            if snapshot is None or not snapshot.values:
+                raise HTTPException(status_code=404, detail="checkpoint not found")
+
+            # Appended, not replaced — the checkpoint's own plan (e.g. the
+            # Critic's follow-up queries) must survive alongside the injected
+            # direction, not be silently overwritten by it.
+            existing_plan = snapshot.values.get("plan", []) or []
+            injected = {"plan": existing_plan + [{"query": req.query, "mode": req.mode}]}
+
+            new_thread_id = await fork_thread(graph, job["thread_id"], injected, checkpoint_id=req.checkpoint_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="checkpoint not found")
+
+    kg_store.copy_session(job["thread_id"], new_thread_id)
+
+    new_job = job_store.create_job(job["query"], owner["key_hash"], thread_id=new_thread_id)
+    run_branch_in_background(new_job["job_id"], new_thread_id)
+    return {"job_id": new_job["job_id"], "status": new_job["status"]}
+
+
+def _dig_deeper_query(kg_store, thread_id: str, req: DigDeeperRequest) -> str:
+    """Resolve the request to a single query string. Priority: an explicit
+    override, then a fact, then a gap — checked in that order and the first
+    one present wins, since a caller passing more than one is asking to
+    override rather than to be told it's ambiguous."""
+    if req.query:
+        return req.query
+    if req.fact_id is not None:
+        fact = kg_store.get_fact_detail(thread_id, req.fact_id)
+        if fact is None:
+            raise HTTPException(status_code=404, detail="fact not found")
+        return f"Find additional corroborating or contradicting evidence for: {fact['claim']}"
+    if req.gap_id is not None:
+        gaps = kg_store.get_evidence_graph(thread_id)["gaps"]
+        gap = next((g for g in gaps if g["id"] == req.gap_id), None)
+        if gap is None:
+            raise HTTPException(status_code=404, detail="gap not found")
+        return f"Research and find evidence for: {gap['description']}"
+    raise HTTPException(status_code=422, detail="one of fact_id, gap_id, or query is required")
+
+
+@app.post("/research/{job_id}/dig-deeper", response_model=ResearchJobOut, status_code=202)
+async def dig_deeper(job_id: str, req: DigDeeperRequest, owner: dict = Depends(require_api_key)):
+    """Fork a targeted follow-up on one fact or gap from a finished run —
+    the human-triggered counterpart to the Reflector's automatic gap-fill.
+    Always re-enters at Scout, unlike branch, since the run has already ended."""
+    job = _get_owned_job_or_404(job_id, owner)
+    from src.graph.builder import build_graph
+    from src.graph.kg import kg_store
+    from src.graph.persistence import fork_thread, get_checkpointer
+
+    query_text = _dig_deeper_query(kg_store, job["thread_id"], req)
+    injected = {"plan": [{"query": query_text, "mode": req.mode}]}
+
+    async with get_checkpointer() as checkpointer:
+        graph = build_graph(checkpointer=checkpointer)
+        # as_node="reflector" forces re-entry at "scout" via reflector's plain
+        # edge — the run already ended, so there's no natural next node to
+        # preserve the way branch preserves one.
+        new_thread_id = await fork_thread(graph, job["thread_id"], injected, as_node="reflector")
+
+    kg_store.copy_session(job["thread_id"], new_thread_id)
+
+    new_job = job_store.create_job(job["query"], owner["key_hash"], thread_id=new_thread_id)
+    run_branch_in_background(new_job["job_id"], new_thread_id)
+    return {"job_id": new_job["job_id"], "status": new_job["status"]}
