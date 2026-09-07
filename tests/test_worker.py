@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 from src.api.worker import _run
 
 
-async def _fake_stream_success(query, thread_id=None, callbacks=None):
+async def _fake_stream_success(query, thread_id=None, callbacks=None, resume=False):
     yield "librarian", {"plan": [{"query": "q1", "mode": "MIXED"}]}
     yield "scout", {"scraped_data": [{"url": "http://a.com"}]}
     yield "__final__", {
@@ -15,7 +15,7 @@ async def _fake_stream_success(query, thread_id=None, callbacks=None):
     }
 
 
-async def _fake_stream_failure(query, thread_id=None, callbacks=None):
+async def _fake_stream_failure(query, thread_id=None, callbacks=None, resume=False):
     yield "librarian", {"plan": []}
     raise RuntimeError("provider outage")
 
@@ -51,3 +51,39 @@ async def test_run_marks_job_error_on_exception(mock_store):
     assert error_call["status"] == "error"
     assert "provider outage" in error_call["error"]
     assert "llm" in error_call["usage"]
+
+
+# ── Branch resume path (Phase 8B) ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@patch("src.api.worker.astream_research", _fake_stream_success)
+@patch("src.api.worker.job_store")
+async def test_run_with_resume_passes_resume_true_and_no_query(mock_store):
+    """A branch's run has no query of its own — the forked state already
+    carries it — and must tell astream_research to resume, not restart."""
+    captured = {}
+
+    async def _capture(query, thread_id=None, callbacks=None, resume=False):
+        captured["query"] = query
+        captured["resume"] = resume
+        yield "__final__", {"report": "r", "source_map": {}, "quality_score": {}, "node_seconds": {}}
+
+    with patch("src.api.worker.astream_research", _capture):
+        await _run("job-3", None, "forked-thread", resume=True)
+
+    assert captured["query"] is None
+    assert captured["resume"] is True
+
+
+def test_run_branch_in_background_starts_a_resume_run():
+    from src.api.worker import run_branch_in_background
+    with patch("src.api.worker._start") as mock_start:
+        run_branch_in_background("job-3", "forked-thread")
+    mock_start.assert_called_once_with("job-3", None, "forked-thread", resume=True)
+
+
+def test_run_job_in_background_still_starts_a_fresh_run():
+    from src.api.worker import run_job_in_background
+    with patch("src.api.worker._start") as mock_start:
+        run_job_in_background("job-1", "a query", "thread-1")
+    mock_start.assert_called_once_with("job-1", "a query", "thread-1", resume=False)

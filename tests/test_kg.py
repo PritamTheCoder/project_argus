@@ -354,3 +354,51 @@ def test_get_fact_detail_scoped_by_session():
         os.rmdir(tmp_dir)
     except PermissionError:
         pass
+
+
+def test_copy_session_duplicates_all_evidence_tables(kg):
+    kg.store_facts([_make_fact("original claim")], session_id="src")
+    kg.store_sources([{"source_id": "[1]", "url": "http://a.com", "credibility_score": 0.9}], session_id="src")
+    kg.store_contradictions(
+        [{"statement": "conflict", "claims": ["original claim"], "sources": ["http://a.com"], "source_count": 1}],
+        session_id="src",
+    )
+    kg.store_consensus_findings(
+        [{"statement": "agreed", "claims": ["original claim"], "sources": ["http://a.com"], "source_count": 1}],
+        session_id="src",
+    )
+    kg.store_gaps([{"gap_type": "coverage_gap", "description": "missing X", "iteration": 0}], session_id="src")
+
+    kg.copy_session("src", "forked")
+
+    graph = kg.get_evidence_graph("forked")
+    assert len(graph["facts"]) == 1
+    assert graph["facts"][0]["claim"] == "original claim"
+    assert len(graph["sources"]) == 1
+    assert len(graph["contradictions"]) == 1
+    assert len(graph["consensus_findings"]) == 1
+    assert len(graph["gaps"]) == 1
+
+    # Source session must be unaffected — this is a copy, not a move.
+    assert len(kg.get_evidence_graph("src")["facts"]) == 1
+
+
+def test_copy_session_does_not_copy_embeddings(kg):
+    """vec_facts is deliberately not copied — it only matters for mid-run
+    retrieval, not evidence-graph display, and remapping rowids across a
+    virtual table for no display benefit isn't worth the complexity."""
+    kg.store_facts([_make_fact("claim needing embedding")], session_id="src")
+    kg.copy_session("src", "forked")
+
+    copied_id = kg.get_evidence_graph("forked")["facts"][0]["id"]
+    # retrieve_relevant_facts joins facts to vec_facts by rowid; a copied fact
+    # with no vec_facts row must not appear in a similarity search.
+    results = kg.retrieve_relevant_facts([0.1] * 384, k=10, session_id="forked")
+    assert copied_id not in {r["id"] for r in results}
+
+
+def test_copy_session_from_empty_source_is_a_noop(kg):
+    kg.copy_session("nonexistent", "forked")
+    assert kg.get_evidence_graph("forked") == {
+        "facts": [], "sources": [], "contradictions": [], "consensus_findings": [], "gaps": [],
+    }

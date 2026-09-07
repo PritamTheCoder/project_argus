@@ -102,3 +102,20 @@ def test_list_jobs_empty_for_unknown_owner():
     store, tmp_dir, db_path = _make_store()
     assert store.list_jobs("nobody") == []
     _cleanup(store, tmp_dir, db_path)
+
+
+def test_create_job_accepts_an_explicit_thread_id():
+    """A branch already forked its thread before creating the job row — the
+    job must point at that thread, not generate its own."""
+    store, tmp_dir, db_path = _make_store()
+    job = store.create_job("query", owner_key_hash="owner-1", thread_id="already-forked-thread")
+    assert job["thread_id"] == "already-forked-thread"
+    _cleanup(store, tmp_dir, db_path)
+
+
+def test_create_job_without_thread_id_still_autogenerates():
+    store, tmp_dir, db_path = _make_store()
+    job = store.create_job("query", owner_key_hash="owner-1")
+    assert job["thread_id"]
+    assert job["thread_id"] != job["job_id"]
+    _cleanup(store, tmp_dir, db_path)
