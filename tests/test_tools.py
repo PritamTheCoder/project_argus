@@ -33,6 +33,7 @@ class TestSearchDDG:
         assert _is_junk_domain("https://nature.com/articles/s41586") is False
         assert _is_junk_domain("https://en.wikipedia.org/wiki/Battery") is False
 
+    @pytest.mark.live
     @pytest.mark.asyncio
     async def test_search_returns_urls(self):
         """search_ddg should return a non-empty list of URL strings."""
@@ -43,6 +44,7 @@ class TestSearchDDG:
         assert all(isinstance(u, str) for u in urls)
         assert all(u.startswith("http") for u in urls)
 
+    @pytest.mark.live
     @pytest.mark.asyncio
     async def test_search_filters_junk(self):
         """Returned URLs should not contain any junk domains."""
@@ -180,6 +182,7 @@ class TestSharedCrawler:
 class TestRunScout:
     """End-to-end tests for the full scout pipeline."""
 
+    @pytest.mark.live
     @pytest.mark.asyncio
     async def test_run_scout_returns_results(self):
         """
