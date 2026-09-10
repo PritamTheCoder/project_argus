@@ -475,3 +475,77 @@ def test_dig_deeper_query_overrides_fact_id_when_both_given(client):
     mock_kg.get_fact_detail.assert_not_called()
     injected = mock_fork.call_args.args[2]
     assert injected["plan"][0]["query"] == "explicit override"
+
+
+# ── Plan approval gate ───────────────────────────────────────────────────────
+
+def test_create_research_passes_require_approval_through(client):
+    test_client, mock_bg, store, _ = client
+    resp = test_client.post("/research", json={"query": "q", "require_approval": True})
+
+    assert resp.status_code == 202
+    mock_bg.assert_called_once()
+    assert mock_bg.call_args.kwargs["require_approval"] is True
+
+
+def test_create_research_defaults_require_approval_false(client):
+    test_client, mock_bg, store, _ = client
+    test_client.post("/research", json={"query": "q"})
+    assert mock_bg.call_args.kwargs["require_approval"] is False
+
+
+def test_approve_plan_not_found(client):
+    test_client, _, _, _ = client
+    resp = test_client.post("/research/does-not-exist/approve-plan",
+                            json={"plan": [{"query": "q1", "mode": "MIXED"}]})
+    assert resp.status_code == 404
+
+
+def test_approve_plan_hides_another_owners_job(client):
+    test_client, _, store, _ = client
+    job = store.create_job("not yours", owner_key_hash="someone-else")
+    resp = test_client.post(f"/research/{job['job_id']}/approve-plan",
+                            json={"plan": [{"query": "q1", "mode": "MIXED"}]})
+    assert resp.status_code == 404
+
+
+def test_approve_plan_rejects_a_job_not_awaiting_approval(client):
+    test_client, _, store, owner_key_hash = client
+    job = store.create_job("q", owner_key_hash)  # status: queued
+    resp = test_client.post(f"/research/{job['job_id']}/approve-plan",
+                            json={"plan": [{"query": "q1", "mode": "MIXED"}]})
+    assert resp.status_code == 409
+
+
+def test_approve_plan_requires_a_non_empty_plan(client):
+    test_client, _, store, owner_key_hash = client
+    job = store.create_job("q", owner_key_hash)
+    store.update_job(job["job_id"], status="awaiting_approval")
+    resp = test_client.post(f"/research/{job['job_id']}/approve-plan", json={"plan": []})
+    assert resp.status_code == 422
+
+
+def test_approve_plan_resumes_with_the_edited_plan(client):
+    test_client, _, store, owner_key_hash = client
+    job = store.create_job("q", owner_key_hash)
+    store.update_job(job["job_id"], status="awaiting_approval",
+                      pending_plan=[{"query": "q1", "mode": "MIXED"}])
+
+    edited = [{"query": "q1", "mode": "MIXED"}, {"query": "human added", "mode": "TRUSTED_FIRST"}]
+    with patch("src.api.app.run_approval_resume_in_background") as mock_resume:
+        resp = test_client.post(f"/research/{job['job_id']}/approve-plan", json={"plan": edited})
+
+    assert resp.status_code == 202
+    assert resp.json()["job_id"] == job["job_id"]  # same job, not a new one
+    mock_resume.assert_called_once_with(job["job_id"], job["thread_id"], edited)
+
+
+def test_get_research_exposes_pending_plan_when_awaiting_approval(client):
+    test_client, _, store, owner_key_hash = client
+    job = store.create_job("q", owner_key_hash)
+    store.update_job(job["job_id"], status="awaiting_approval",
+                      pending_plan=[{"query": "q1", "mode": "MIXED"}])
+
+    body = test_client.get(f"/research/{job['job_id']}").json()
+    assert body["status"] == "awaiting_approval"
+    assert body["pending_plan"] == [{"query": "q1", "mode": "MIXED"}]

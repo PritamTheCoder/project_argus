@@ -39,7 +39,7 @@ def test_graph_compiles(mock_writer, mock_consensus, mock_reflector, mock_critic
 def test_graph_node_names(mock_writer, mock_consensus, mock_reflector, mock_critic, mock_verifier, mock_refiner, mock_scout, mock_librarian):
     """Graph should contain all expected node names."""
     graph = build_graph()
-    expected_nodes = {"librarian", "scout", "refiner", "verifier", "fact_checker", "reflector", "consensus", "ghostwriter"}
+    expected_nodes = {"librarian", "plan_gate", "scout", "refiner", "verifier", "fact_checker", "reflector", "consensus", "ghostwriter"}
     graph_nodes = set(graph.get_graph().nodes.keys()) - {"__start__", "__end__"}
     assert expected_nodes == graph_nodes
 
