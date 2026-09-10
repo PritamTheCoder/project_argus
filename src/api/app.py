@@ -16,13 +16,27 @@ configure_logging()  # before importing anything that logs, so nothing gets drop
 
 from src.api.auth import require_api_key  # noqa: E402
 from src.api.jobs import job_store  # noqa: E402
-from src.api.worker import run_job_in_background, run_branch_in_background  # noqa: E402
+from src.api.worker import (  # noqa: E402
+    run_job_in_background, run_branch_in_background, run_approval_resume_in_background,
+)
 
 app = FastAPI(title="Project Argus API", version="0.1.0")
 
 
 class ResearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000)
+    require_approval: bool = Field(
+        default=False, description="Pause after planning for human review of the sub-queries before Scout runs"
+    )
+
+
+class PlanItem(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500)
+    mode: str = Field(default="MIXED", description="TRUSTED_ONLY, TRUSTED_FIRST, or MIXED")
+
+
+class ApprovePlanRequest(BaseModel):
+    plan: list[PlanItem] = Field(..., min_length=1, description="The final sub-query list to research — approved as-is, edited, or extended")
 
 
 class BranchRequest(BaseModel):
@@ -57,6 +71,7 @@ async def root():
             "GET /research/{job_id}/history": "the run's checkpoint history, for picking a branch point (requires an API key)",
             "POST /research/{job_id}/branch": "fork a new run from a checkpoint with an injected direction; the source run is untouched (requires an API key)",
             "POST /research/{job_id}/dig-deeper": "fork a targeted follow-up on one fact or gap from a finished run (requires an API key)",
+            "POST /research/{job_id}/approve-plan": "submit the approved/edited plan for a job awaiting_approval (requires an API key)",
             "GET /research/": "list your past research jobs (requires an API key)",
             "GET /health": "liveness check",
         },
@@ -71,7 +86,7 @@ async def health():
 @app.post("/research", response_model=ResearchJobOut, status_code=202)
 async def create_research(req: ResearchRequest, owner: dict = Depends(require_api_key)):
     job = job_store.create_job(req.query, owner["key_hash"])
-    run_job_in_background(job["job_id"], req.query, job["thread_id"])
+    run_job_in_background(job["job_id"], req.query, job["thread_id"], require_approval=req.require_approval)
     return {"job_id": job["job_id"], "status": job["status"]}
 
 
@@ -214,3 +229,17 @@ async def dig_deeper(job_id: str, req: DigDeeperRequest, owner: dict = Depends(r
     new_job = job_store.create_job(job["query"], owner["key_hash"], thread_id=new_thread_id)
     run_branch_in_background(new_job["job_id"], new_thread_id)
     return {"job_id": new_job["job_id"], "status": new_job["status"]}
+
+
+@app.post("/research/{job_id}/approve-plan", response_model=ResearchJobOut, status_code=202)
+async def approve_plan(job_id: str, req: ApprovePlanRequest, owner: dict = Depends(require_api_key)):
+    """Submit the final sub-query list for a job paused at plan_gate —
+    approved as-is, edited, or extended. Resumes the same job; unlike branch/
+    dig-deeper this does not create a new one, since nothing has run yet."""
+    job = _get_owned_job_or_404(job_id, owner)
+    if job["status"] != "awaiting_approval":
+        raise HTTPException(status_code=409, detail=f"job is '{job['status']}', not awaiting_approval")
+
+    approved_plan = [item.model_dump() for item in req.plan]
+    run_approval_resume_in_background(job_id, job["thread_id"], approved_plan)
+    return {"job_id": job_id, "status": "running"}
