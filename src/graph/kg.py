@@ -43,6 +43,9 @@ class KnowledgeGraph:
         self._ensure_column("facts", "support_quote", "TEXT")
         self._ensure_column("facts", "corroboration_count", "INTEGER")
         self._ensure_column("facts", "as_of_date", "TEXT")
+        self._ensure_column("facts", "disputed", "INTEGER DEFAULT 0")
+        self._ensure_column("facts", "dispute_reason", "TEXT DEFAULT ''")
+        self._ensure_column("facts", "owner_key_hash", "TEXT DEFAULT ''")
         # Index to keep per-session retrieval fast as the fact store grows.
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_facts_session ON facts(session_id)")
         # all-MiniLM-L6-v2 embeddings are 384-dim
@@ -169,7 +172,7 @@ class KnowledgeGraph:
     def _serialize_f32(self, vector: List[float]) -> bytes:
         return struct.pack(f"{len(vector)}f", *vector)
 
-    def store_facts(self, facts_with_embeddings: List[Dict[str, Any]], session_id: str = ""):
+    def store_facts(self, facts_with_embeddings: List[Dict[str, Any]], session_id: str = "", owner_key_hash: str = ""):
         if not facts_with_embeddings:
             return
 
@@ -177,9 +180,9 @@ class KnowledgeGraph:
             cursor = self.db.cursor()
             for fact in facts_with_embeddings:
                 cursor.execute("""
-                INSERT INTO facts (claim, source_url, source_excerpt, support_level, confidence, credibility_score, source_type, session_id, support_quote, corroboration_count, as_of_date)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (fact["claim"], fact["source_url"], fact["source_excerpt"], fact["support_level"], fact["confidence"], fact.get("credibility_score", 0.4), fact.get("source_type", "Unverified/Web"), session_id or fact.get("session_id", ""), fact.get("support_quote", ""), fact.get("corroboration_count"), fact.get("as_of_date", "")))
+                INSERT INTO facts (claim, source_url, source_excerpt, support_level, confidence, credibility_score, source_type, session_id, support_quote, corroboration_count, as_of_date, owner_key_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (fact["claim"], fact["source_url"], fact["source_excerpt"], fact["support_level"], fact["confidence"], fact.get("credibility_score", 0.4), fact.get("source_type", "Unverified/Web"), session_id or fact.get("session_id", ""), fact.get("support_quote", ""), fact.get("corroboration_count"), fact.get("as_of_date", ""), owner_key_hash))
 
                 fact_id = cursor.lastrowid
 
@@ -251,6 +254,21 @@ class KnowledgeGraph:
                 """, (session_id, g.get("gap_type", ""), g.get("description", ""), g.get("iteration", 0)))
             self.db.commit()
 
+    def flag_fact(self, session_id: str, fact_id: int, reason: str) -> bool:
+        """Mark a fact disputed and zero its confidence, so existing
+        confidence-threshold consumers (Librarian's cross-run reuse, the
+        Critic's KG lookup) stop trusting it without any new filtering logic.
+        Returns False if no such fact exists in this session."""
+        with self._lock:
+            cursor = self.db.cursor()
+            cursor.execute(
+                "UPDATE facts SET disputed = 1, dispute_reason = ?, confidence = 0.0 "
+                "WHERE session_id = ? AND id = ?",
+                (reason, session_id, fact_id),
+            )
+            self.db.commit()
+            return cursor.rowcount > 0
+
     def get_evidence_graph(self, session_id: str) -> Dict[str, Any]:
         """Everything the evidence-graph API needs for one run: facts, sources,
         contradictions, consensus findings, and gaps, all scoped to session_id."""
@@ -259,7 +277,8 @@ class KnowledgeGraph:
 
             cursor.execute(
                 "SELECT id, claim, source_url, source_excerpt, support_level, confidence, "
-                "credibility_score, source_type, support_quote, corroboration_count, as_of_date "
+                "credibility_score, source_type, support_quote, corroboration_count, as_of_date, "
+                "disputed, dispute_reason "
                 "FROM facts WHERE session_id = ?", (session_id,),
             )
             cols = [d[0] for d in cursor.description]
@@ -309,7 +328,8 @@ class KnowledgeGraph:
             cursor = self.db.cursor()
             cursor.execute(
                 "SELECT id, claim, source_url, source_excerpt, support_level, confidence, "
-                "credibility_score, source_type, support_quote, corroboration_count, as_of_date "
+                "credibility_score, source_type, support_quote, corroboration_count, as_of_date, "
+                "disputed, dispute_reason "
                 "FROM facts WHERE session_id = ? AND id = ?", (session_id, fact_id),
             )
             row = cursor.fetchone()
@@ -346,9 +366,11 @@ class KnowledgeGraph:
             cursor = self.db.cursor()
             cursor.execute("""
                 INSERT INTO facts (claim, source_url, source_excerpt, support_level, confidence,
-                    credibility_score, source_type, session_id, support_quote, corroboration_count, as_of_date)
+                    credibility_score, source_type, session_id, support_quote, corroboration_count, as_of_date,
+                    disputed, dispute_reason)
                 SELECT claim, source_url, source_excerpt, support_level, confidence,
-                    credibility_score, source_type, ?, support_quote, corroboration_count, as_of_date
+                    credibility_score, source_type, ?, support_quote, corroboration_count, as_of_date,
+                    disputed, dispute_reason
                 FROM facts WHERE session_id = ?
             """, (target_session_id, source_session_id))
             cursor.execute("""
@@ -370,17 +392,24 @@ class KnowledgeGraph:
             """, (target_session_id, source_session_id))
             self.db.commit()
 
-    def retrieve_relevant_facts(self, query_embedding: List[float], k: int = 5, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def retrieve_relevant_facts(
+        self, query_embedding: List[float], k: int = 5,
+        session_id: Optional[str] = None, owner_key_hash: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Semantic search over stored facts.
 
-        When ``session_id`` is provided, results are restricted to facts gathered
-        in that run. Because sqlite-vec applies the KNN ``MATCH`` cut before the
-        JOIN, we over-fetch a larger candidate pool and filter by session in
-        Python so the requested ``k`` is honoured per-session rather than globally.
+        ``session_id`` restricts results to one run. Leave it unset for a
+        global, cross-run lookup — then pass ``owner_key_hash`` to restrict
+        results to that owner's own facts, since the KG has no other way to
+        keep one API key's research from leaking into another's.
+
+        sqlite-vec applies the KNN ``MATCH`` cut before the JOIN, so we
+        over-fetch a larger candidate pool and filter in Python — otherwise
+        the scoping filter could leave fewer than ``k`` results.
         """
-        # Over-fetch when scoping so the session filter still yields up to k results.
-        fetch_k = k if not session_id else max(k * 10, 100)
+        # Over-fetch when scoping so the filter still yields up to k results.
+        fetch_k = k if not (session_id or owner_key_hash) else max(k * 10, 100)
 
         with self._lock:
             cursor = self.db.cursor()
@@ -395,6 +424,9 @@ class KnowledgeGraph:
                     f.credibility_score,
                     f.source_type,
                     f.session_id,
+                    f.disputed,
+                    f.dispute_reason,
+                    f.owner_key_hash,
                     DISTANCE
                 FROM vec_facts v
                 JOIN facts f ON f.id = v.rowid
@@ -407,6 +439,8 @@ class KnowledgeGraph:
         for row in rows:
             if session_id and row[8] != session_id:
                 continue
+            if not session_id and owner_key_hash and row[11] != owner_key_hash:
+                continue
             results.append({
                 "id": row[0],
                 "claim": row[1],
@@ -417,7 +451,10 @@ class KnowledgeGraph:
                 "credibility_score": row[6],
                 "source_type": row[7],
                 "session_id": row[8],
-                "distance": row[9]
+                "disputed": row[9],
+                "dispute_reason": row[10],
+                "owner_key_hash": row[11],
+                "distance": row[12]
             })
             if len(results) >= k:
                 break
