@@ -864,6 +864,31 @@ async def _run_scout_with_two_docs():
 
 @pytest.mark.asyncio
 @patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
+async def test_scout_passes_owner_key_hash_from_state():
+    """The run's owner_key_hash must reach gather_sources_for_query so a global
+    KG lookup (4A.2) stays scoped to the caller's own facts."""
+    from src.agents.scout import scout_node
+    urls = ["https://journal.example/on"]
+    with patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock) as gather, \
+         patch("src.agents.scout.scrape_urls", new_callable=AsyncMock) as scrape, \
+         patch("src.agents.scout.get_embeddings", side_effect=_topic_embeddings), \
+         patch("src.agents.scout.rerank_chunks", side_effect=RuntimeError("no reranker")), \
+         patch("src.graph.kg.kg_store", _kg_with_two_docs()):
+        gather.return_value = [
+            {"url": u, "content": "", "needs_scrape": True, "source": "web"} for u in urls
+        ]
+        scrape.return_value = [
+            {"url": urls[0], "content": f"{_ON} content", "success": True},
+        ]
+        state = _scout_state()
+        state["owner_key_hash"] = "owner-xyz"
+        await scout_node(state)
+
+    assert gather.call_args.kwargs["owner_key_hash"] == "owner-xyz"
+
+
+@pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
 async def test_relevance_gate_drops_off_topic_sources():
     """An off-topic source must not reach the Refiner, however credible it looks."""
     result = await _run_scout_with_two_docs()

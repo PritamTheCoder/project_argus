@@ -11,6 +11,7 @@ from src.utils.embeddings import get_embeddings
 from src.utils.rerank import rerank_chunks
 from src.utils.rrf import reciprocal_rank_fusion
 from src.utils.grounding import _cosine
+from src.utils.dates import sanitize_as_of_date
 from src.utils.source_scoring import evaluate_source, registrable_domain
 from src.config import (
     MAX_CHUNK_TOKENS, TOP_K_CHUNKS, SCOUT_CONCURRENCY, MAX_SOURCES_PER_DOMAIN,
@@ -86,6 +87,7 @@ async def scout_node(state: AgentState) -> dict:
     
     queries = state["plan"]
     session_id = state.get("session_id", "")
+    owner_key_hash = state.get("owner_key_hash", "")
     all_scraped_data = []
     source_map = state.get("source_map", {}).copy()
     

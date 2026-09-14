@@ -321,6 +321,20 @@ class TestExtractFacts:
         assert "raw_jsonl" in result
         assert isinstance(result["raw_jsonl"], str)
 
+    @patch("src.tools.refiner.get_llm_with_fallbacks")
+    def test_future_as_of_date_is_dropped(self, mock_get_llm):
+        """An LLM reading text like 'Q1 2026 funding' can extract that year
+        literally even when it's in the future — nulled, not propagated."""
+        mock_get_llm.return_value.invoke.return_value = FactExtractionResult(facts=[
+            ExtractedFact(
+                extraction_class="dates", claim="Funding round closed",
+                source_excerpt="closed a funding round", source_id="[1]",
+                as_of_date="2099-01-01",
+            ),
+        ])
+        result = extract_facts(_REFINER_SAMPLE, {"dates": "date"})
+        assert result["facts"][0]["as_of_date"] == ""
+
 
 
 

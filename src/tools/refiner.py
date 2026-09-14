@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, ConfigDict, Field
 from src.config import REFINER_MODEL, REFINER_PROVIDER, REFINER_FALLBACK_CHAIN
 from src.utils.llm_factory import get_llm_with_fallbacks
+from src.utils.dates import sanitize_as_of_date
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ def extract_facts(batched_text: str, schema: dict) -> dict:
                     "claim": fact.claim,
                     "source_excerpt": fact.source_excerpt,
                     "source_id": fact.source_id,
-                    "as_of_date": fact.as_of_date or "",
+                    "as_of_date": sanitize_as_of_date(fact.as_of_date or ""),
                     "attributes": fact.attributes or {},
                     "source_span": {"start": None, "end": None}
                 })
