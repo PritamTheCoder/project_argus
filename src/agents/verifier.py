@@ -339,7 +339,7 @@ def verifier_node(state: AgentState) -> dict:
                 f"claims corroborated by >=2 sources ({singles} single-source)."
             )
 
-            kg_store.store_facts(supported_facts, session_id=session_id)
+            kg_store.store_facts(supported_facts, session_id=session_id, owner_key_hash=state.get("owner_key_hash", ""))
     except Exception as e:
         logger.error(f"Error embedding/corroborating/storing facts into KG: {e}")
 

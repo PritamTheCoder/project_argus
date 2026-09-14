@@ -33,6 +33,14 @@ _current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "kg_lookup_session_id", default=""
 )
 
+# The current run's owner (API key hash), so a KG_LOOKUP_GLOBAL lookup can be
+# scoped to "this owner's facts" rather than every owner's — the KG has no
+# other tenant boundary. Empty for the CLI/Streamlit paths, which have no
+# owner concept; those callers implicitly share one "local" bucket.
+_current_owner_key_hash: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "kg_lookup_owner_key_hash", default=""
+)
+
 
 def set_kg_session(session_id: str) -> contextvars.Token:
     """Bind the session id kg_lookup should scope to. Returns a token for reset."""
@@ -41,6 +49,15 @@ def set_kg_session(session_id: str) -> contextvars.Token:
 
 def reset_kg_session(token: contextvars.Token) -> None:
     _current_session_id.reset(token)
+
+
+def set_kg_owner(owner_key_hash: str) -> contextvars.Token:
+    """Bind the owner kg_lookup's global mode should scope to. Returns a token for reset."""
+    return _current_owner_key_hash.set(owner_key_hash or "")
+
+
+def reset_kg_owner(token: contextvars.Token) -> None:
+    _current_owner_key_hash.reset(token)
 
 
 # ── Search tools (yield retrieval candidates) ────────────────────────────────
@@ -127,9 +144,13 @@ def kg_lookup(query: str, k: int = 5) -> List[Dict[str, Any]]:
     try:
         # Resolve scope first (before the embedding cost). Session-scoped by
         # default — consistent with the Critic/Reflector retrieval — so kg_lookup
-        # can't leak prior runs' facts. `global` opt-in enables cross-run memory.
+        # can't leak prior runs' facts. `global` opt-in enables cross-run memory,
+        # scoped to the current owner — the KG has no other tenant boundary, so
+        # an unscoped global lookup would leak one API key's research to another.
+        owner_key_hash = None
         if KG_LOOKUP_GLOBAL:
             session_id = None
+            owner_key_hash = _current_owner_key_hash.get()
         else:
             session_id = _current_session_id.get()
             if not session_id:
@@ -138,7 +159,7 @@ def kg_lookup(query: str, k: int = 5) -> List[Dict[str, Any]]:
         from src.utils.embeddings import get_embeddings
         from src.graph.kg import kg_store
         emb = get_embeddings([query])[0]
-        facts = kg_store.retrieve_relevant_facts(emb, k=k, session_id=session_id)
+        facts = kg_store.retrieve_relevant_facts(emb, k=k, session_id=session_id, owner_key_hash=owner_key_hash)
         return [
             {
                 "claim": f.get("claim", ""),

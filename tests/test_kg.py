@@ -429,3 +429,77 @@ def test_copy_session_from_empty_source_is_a_noop(kg):
     assert kg.get_evidence_graph("forked") == {
         "facts": [], "sources": [], "contradictions": [], "consensus_findings": [], "gaps": [],
     }
+
+
+# ── flag_fact: dispute a fact, downweight it, surface it downstream ──────────
+
+def test_flag_fact_sets_disputed_and_zeros_confidence(kg):
+    kg.store_facts([_make_fact("SpaceX valued at $350B", confidence=0.9)], session_id="s1")
+    fact_id = kg.get_evidence_graph("s1")["facts"][0]["id"]
+
+    ok = kg.flag_fact("s1", fact_id, "conflicts with the Q3 filing")
+    assert ok is True
+
+    fact = kg.get_fact_detail("s1", fact_id)
+    assert fact["disputed"] == 1
+    assert fact["dispute_reason"] == "conflicts with the Q3 filing"
+    assert fact["confidence"] == 0.0
+
+
+def test_flag_fact_returns_false_for_unknown_fact(kg):
+    assert kg.flag_fact("s1", 999, "reason") is False
+
+
+def test_flag_fact_scoped_by_session(kg):
+    """A fact_id from another session must not be flaggable — session_id is
+    the security boundary, same as get_fact_detail."""
+    kg.store_facts([_make_fact("secret to session A")], session_id="sessA")
+    fact_id = kg.get_evidence_graph("sessA")["facts"][0]["id"]
+
+    assert kg.flag_fact("sessB", fact_id, "reason") is False
+    # Untouched in its real session.
+    assert kg.get_fact_detail("sessA", fact_id)["disputed"] == 0
+
+
+def test_flag_fact_appears_in_evidence_graph(kg):
+    kg.store_facts([_make_fact("claim")], session_id="s1")
+    fact_id = kg.get_evidence_graph("s1")["facts"][0]["id"]
+    kg.flag_fact("s1", fact_id, "bad grounding")
+
+    facts = kg.get_evidence_graph("s1")["facts"]
+    assert facts[0]["disputed"] == 1
+    assert facts[0]["dispute_reason"] == "bad grounding"
+
+
+def test_copy_session_carries_disputed_forward(kg):
+    kg.store_facts([_make_fact("claim")], session_id="src")
+    fact_id = kg.get_evidence_graph("src")["facts"][0]["id"]
+    kg.flag_fact("src", fact_id, "wrong")
+
+    kg.copy_session("src", "forked")
+
+    copied = kg.get_evidence_graph("forked")["facts"][0]
+    assert copied["disputed"] == 1
+    assert copied["dispute_reason"] == "wrong"
+
+
+def test_retrieve_relevant_facts_includes_disputed_fields():
+    tmp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(tmp_dir, "test_kg_disputed_retrieve.db")
+    store = KnowledgeGraph(db_path)
+    store.store_facts([_make_fact("claim")], session_id="s1")
+    fact_id = store.get_evidence_graph("s1")["facts"][0]["id"]
+    store.flag_fact("s1", fact_id, "reason text")
+
+    results = store.retrieve_relevant_facts([0.1] * 384, k=5, session_id="s1")
+    assert results[0]["disputed"] == 1
+    assert results[0]["dispute_reason"] == "reason text"
+
+    store.db.close()
+    del store
+    gc.collect()
+    try:
+        os.remove(db_path)
+        os.rmdir(tmp_dir)
+    except PermissionError:
+        pass

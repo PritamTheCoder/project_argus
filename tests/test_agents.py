@@ -969,3 +969,42 @@ async def test_gated_source_does_not_consume_a_domain_slot():
 
     urls_kept = {v["url"] for v in result["source_map"].values()}
     assert "https://site.example/on" in urls_kept
+
+
+# ── Scout: future as_of_date is sanitized ────────────────────────────────────
+
+@pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
+@patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock)
+@patch("src.agents.scout.scrape_urls", new_callable=AsyncMock)
+@patch("src.agents.scout.get_embeddings")
+@patch("src.agents.scout.rerank_chunks")
+async def test_scout_drops_future_as_of_date(mock_rerank, mock_embeddings, mock_scrape, mock_gather):
+    """A backend-reported as_of_date in the future (e.g. a mis-parsed field)
+    must not reach source_map as-is."""
+    long_content = (
+        "This is a detailed paragraph about solid state batteries that exceeds fifty characters.\n\n"
+        "Another paragraph providing technical details about energy density improvements in research."
+    )
+    mock_gather.side_effect = [
+        [{"url": "http://b.com", "content": long_content, "needs_scrape": False,
+          "source": "semantic_scholar", "credibility_hint": 0.9,
+          "source_type_hint": "Academic/Scientific", "as_of_date": "2099-01-01"}],
+    ]
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_rerank.side_effect = lambda q, chunks, top_k: chunks[:top_k]
+    mock_scrape.return_value = []
+
+    mock_kg = MagicMock()
+    mock_kg.store_document_and_chunks.return_value = 1
+    mock_kg.retrieve_top_docs.return_value = [1]
+    mock_kg.retrieve_top_chunks.return_value = [(1, "chunk from b.com")]
+    mock_kg.get_doc_metadata.return_value = {"url": "http://b.com", "query": "q1", "summary": "summary"}
+    mock_kg.get_all_chunks_for_docs.return_value = {1: ["chunk from b.com"]}
+
+    state = _base_state(plan=["q1"])
+    with patch("src.graph.kg.kg_store", mock_kg):
+        result = await scout_node(state)
+
+    dates = [v["as_of_date"] for v in result["source_map"].values()]
+    assert dates == [""]

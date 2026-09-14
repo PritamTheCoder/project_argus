@@ -77,18 +77,20 @@ def test_retrieval_tag_excludes_utility_tools():
 # ── kg_lookup session scoping ────────────────────────────────────────────────
 
 def test_kg_lookup_returns_empty_without_bound_session():
-    """Session-scoped by default: no run bound → returns [] without touching the DB."""
+    """In session mode, no run bound → returns [] without touching the DB."""
     from unittest.mock import patch, MagicMock
     from src.tools.research_tools import kg_lookup
 
     store = MagicMock()
-    with patch("src.graph.kg.kg_store", store):
+    with patch("src.tools.research_tools.KG_LOOKUP_GLOBAL", False), \
+         patch("src.graph.kg.kg_store", store):
         assert kg_lookup.invoke({"query": "anything"}) == []
     store.retrieve_relevant_facts.assert_not_called()
 
 
 def test_kg_lookup_scopes_to_bound_session():
-    """A bound session id is passed through to KG retrieval (no cross-run leak)."""
+    """In session mode, a bound session id is passed through to KG retrieval
+    (no cross-run leak)."""
     from unittest.mock import patch, MagicMock
     from src.tools.research_tools import kg_lookup, set_kg_session, reset_kg_session
 
@@ -96,12 +98,34 @@ def test_kg_lookup_scopes_to_bound_session():
     store.retrieve_relevant_facts.return_value = []
     token = set_kg_session("run-abc")
     try:
-        with patch("src.utils.embeddings.get_embeddings", return_value=[[0.1] * 384]), \
+        with patch("src.tools.research_tools.KG_LOOKUP_GLOBAL", False), \
+             patch("src.utils.embeddings.get_embeddings", return_value=[[0.1] * 384]), \
              patch("src.graph.kg.kg_store", store):
             kg_lookup.invoke({"query": "q"})
     finally:
         reset_kg_session(token)
     assert store.retrieve_relevant_facts.call_args.kwargs["session_id"] == "run-abc"
+
+
+def test_kg_lookup_global_mode_scopes_to_bound_owner():
+    """KG_LOOKUP_GLOBAL=True switches kg_lookup to cross-run memory, scoped to
+    the bound owner rather than the session — the KG has no other tenant
+    boundary, so an unscoped global lookup would leak facts across API keys."""
+    from unittest.mock import patch, MagicMock
+    from src.tools.research_tools import kg_lookup, set_kg_owner, reset_kg_owner
+
+    store = MagicMock()
+    store.retrieve_relevant_facts.return_value = []
+    token = set_kg_owner("owner-xyz")
+    try:
+        with patch("src.tools.research_tools.KG_LOOKUP_GLOBAL", True), \
+             patch("src.utils.embeddings.get_embeddings", return_value=[[0.1] * 384]), \
+             patch("src.graph.kg.kg_store", store):
+            kg_lookup.invoke({"query": "q"})
+    finally:
+        reset_kg_owner(token)
+    assert store.retrieve_relevant_facts.call_args.kwargs["session_id"] is None
+    assert store.retrieve_relevant_facts.call_args.kwargs["owner_key_hash"] == "owner-xyz"
 
 
 # ── Calculator pure logic ────────────────────────────────────────────────────

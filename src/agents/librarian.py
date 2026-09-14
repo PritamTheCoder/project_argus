@@ -10,18 +10,22 @@ from src.utils.retry import retry_on_rate_limit
 logger = logging.getLogger(__name__)
 
 
-def _prior_knowledge_summary(query: str, k: int = 8, min_confidence: float = 0.6) -> str:
+def _prior_knowledge_summary(
+    query: str, owner_key_hash: str = "", k: int = 8, min_confidence: float = 0.6,
+) -> str:
     """Cross-session, high-confidence facts already covering this query, so the
     Librarian can steer sub-queries away from ground already researched. Planning
     signal only — never injected as this run's citable evidence. Gated on
-    KG_LOOKUP_GLOBAL (opt-in; same flag the kg_lookup tool uses)."""
+    KG_LOOKUP_GLOBAL (opt-in; same flag the kg_lookup tool uses), and scoped to
+    ``owner_key_hash`` — the KG has no other tenant boundary, so an unscoped
+    lookup would surface one API key's research to another."""
     if not KG_LOOKUP_GLOBAL:
         return ""
     try:
         from src.utils.embeddings import get_embeddings
         from src.graph.kg import kg_store
         emb = get_embeddings([query])[0]
-        facts = kg_store.retrieve_relevant_facts(emb, k=k * 3, session_id=None)
+        facts = kg_store.retrieve_relevant_facts(emb, k=k * 3, session_id=None, owner_key_hash=owner_key_hash)
         strong = [
             f for f in facts
             if f.get("support_level") == "SUPPORTED" and (f.get("confidence") or 0) >= min_confidence
@@ -72,7 +76,7 @@ def librarian_node(state: AgentState) -> dict:
         )
         logger.info(f"Librarian: Iteration {iteration} — injecting critique for targeted gap-fill queries.")
     elif iteration == 0:
-        prior_knowledge = _prior_knowledge_summary(query)
+        prior_knowledge = _prior_knowledge_summary(query, owner_key_hash=state.get("owner_key_hash", ""))
         if prior_knowledge:
             system_prompt += (
                 f"\n\nALREADY KNOWN (high-confidence, from prior research sessions):\n"

@@ -167,7 +167,7 @@ async def scout_node(state: AgentState) -> dict:
                 score = hint_score
                 if hint_type:
                     stype = hint_type
-            as_of = meta.get("as_of_date", "") or ""
+            as_of = sanitize_as_of_date(meta.get("as_of_date", "") or "")
 
         source_id = f"[{next_id}]"
         source_map[source_id] = {
@@ -202,7 +202,8 @@ async def scout_node(state: AgentState) -> dict:
         async with sem:
             logger.info(f"Scout: Processing query '{q}' with mode '{mode_str}'")
             candidates = await gather_sources_for_query(
-                q, mode_str, seen_urls=initial_seen, session_id=session_id, tracer=tracer
+                q, mode_str, seen_urls=initial_seen, session_id=session_id,
+                owner_key_hash=owner_key_hash, tracer=tracer,
             )
             if not candidates:
                 logger.info(f"Scout: No new candidate sources for query '{q}'.")

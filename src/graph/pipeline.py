@@ -12,7 +12,9 @@ from src.graph.persistence import get_checkpointer, generate_thread_id, get_run_
 from src.schema.state import AgentState
 
 
-def _initial_state(query: str, session_id: str, require_approval: bool = False) -> AgentState:
+def _initial_state(
+    query: str, session_id: str, require_approval: bool = False, owner_key_hash: str = "",
+) -> AgentState:
     return {
         "session_id": session_id,
         "query": query,
@@ -33,13 +35,14 @@ def _initial_state(query: str, session_id: str, require_approval: bool = False) 
         "iteration_count": 0,
         "active_node": "",
         "require_approval": require_approval,
+        "owner_key_hash": owner_key_hash,
     }
 
 
 async def astream_research(
     query: Optional[str] = None, thread_id: Optional[str] = None,
     callbacks: Optional[list[Any]] = None, resume: bool = False,
-    resume_value: Any = None, require_approval: bool = False,
+    resume_value: Any = None, require_approval: bool = False, owner_key_hash: str = "",
 ) -> AsyncGenerator[tuple[str, dict], None]:
     """Yield (node_name, state_update) per node, then either ("__final__",
     full_state) or ("__interrupt__", {"pending_plan": [...]}) if the run
@@ -61,7 +64,7 @@ async def astream_research(
     elif resume:
         graph_input = None
     else:
-        graph_input = _initial_state(query, thread_id, require_approval)
+        graph_input = _initial_state(query, thread_id, require_approval, owner_key_hash)
 
     node_seconds: dict[str, float] = {}
     node_started_at = time.perf_counter()

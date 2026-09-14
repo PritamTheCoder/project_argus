@@ -208,11 +208,12 @@ GATHER_MAX_STEPS: int = int(os.getenv("GATHER_MAX_STEPS", "2"))
 # per-provider rate limiter still caps actual API RPM. Keep modest so we don't
 # open too many simultaneous scrapes.
 SCOUT_CONCURRENCY: int = int(os.getenv("SCOUT_CONCURRENCY", "4"))
-# kg_lookup scope. Default "session": the memory tool sees only THIS run's facts,
-# consistent with the session-scoped Critic/Reflector retrieval (no cross-run
-# contamination). Set "global" to opt into cross-run memory (the future
-# memory-first path — reuses prior runs' verified facts).
-KG_LOOKUP_GLOBAL: bool = os.getenv("KG_LOOKUP_SCOPE", "session").lower() == "global"
+# kg_lookup scope. Default "global": the memory tool and Librarian's pre-flight
+# check reuse prior runs' verified facts, scoped to the caller's own
+# owner_key_hash (the KG has no other tenant boundary). Set "session" to fall
+# back to this-run-only lookups, consistent with the session-scoped
+# Critic/Reflector retrieval.
+KG_LOOKUP_GLOBAL: bool = os.getenv("KG_LOOKUP_SCOPE", "global").lower() == "global"
 
 # Scraper Settings
 SCRAPE_TIMEOUT: int = int(os.getenv("SCRAPE_TIMEOUT", "15"))

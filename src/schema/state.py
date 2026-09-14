@@ -39,6 +39,7 @@ class AgentState(TypedDict):
         iteration_count: int  # Loop-safety counter for fact-checker re-search cycles
         active_node: str
         require_approval: bool  # Pause at plan_gate for human plan review before Scout runs.
+        owner_key_hash: str  # API-key owner, for scoping global cross-run KG lookups per tenant.
     """
     session_id: str
     query: str
@@ -63,6 +64,7 @@ class AgentState(TypedDict):
     iteration_count: int  # Loop-safety counter for fact-checker re-search cycles
     active_node: str
     require_approval: bool
+    owner_key_hash: str
 
 
 class VerifiedFact(BaseModel):

@@ -219,30 +219,37 @@ def _dig_deeper_query(kg_store, thread_id: str, req: DigDeeperRequest) -> str:
     raise HTTPException(status_code=422, detail="one of fact_id, gap_id, or query is required")
 
 
-@app.post("/research/{job_id}/dig-deeper", response_model=ResearchJobOut, status_code=202)
-async def dig_deeper(job_id: str, req: DigDeeperRequest, owner: dict = Depends(require_api_key)):
-    """Fork a targeted follow-up on one fact or gap from a finished run —
-    the human-triggered counterpart to the Reflector's automatic gap-fill.
-    Always re-enters at Scout, unlike branch, since the run has already ended."""
-    job = _get_owned_job_or_404(job_id, owner)
+async def _fork_followup_job(job: dict, owner: dict, query_text: str, mode: str = "MIXED") -> dict:
+    """Fork a targeted follow-up from a finished run into its own job — shared
+    by dig-deeper and flag-as-wrong's re-verify. A finished run's checkpoint
+    has no natural "next node" to resume into, so this always re-enters at
+    Scout instead, by forking as if resuming from Reflector (whose only
+    outgoing edge goes straight to Scout)."""
     from src.graph.builder import build_graph
     from src.graph.kg import kg_store
     from src.graph.persistence import fork_thread, get_checkpointer
 
-    query_text = _dig_deeper_query(kg_store, job["thread_id"], req)
-    injected = {"plan": [{"query": query_text, "mode": req.mode}]}
-
+    injected = {"plan": [{"query": query_text, "mode": mode}]}
     async with get_checkpointer() as checkpointer:
         graph = build_graph(checkpointer=checkpointer)
-        # as_node="reflector" forces re-entry at "scout" via reflector's plain
-        # edge — the run already ended, so there's no natural next node to
-        # preserve the way branch preserves one.
         new_thread_id = await fork_thread(graph, job["thread_id"], injected, as_node="reflector")
 
     kg_store.copy_session(job["thread_id"], new_thread_id)
 
     new_job = job_store.create_job(job["query"], owner["key_hash"], thread_id=new_thread_id)
     run_branch_in_background(new_job["job_id"], new_thread_id)
+    return new_job
+
+
+@app.post("/research/{job_id}/dig-deeper", response_model=ResearchJobOut, status_code=202)
+async def dig_deeper(job_id: str, req: DigDeeperRequest, owner: dict = Depends(require_api_key)):
+    """Fork a targeted follow-up on one fact or gap from a finished run —
+    the human-triggered counterpart to the Reflector's automatic gap-fill."""
+    job = _get_owned_job_or_404(job_id, owner)
+    from src.graph.kg import kg_store
+
+    query_text = _dig_deeper_query(kg_store, job["thread_id"], req)
+    new_job = await _fork_followup_job(job, owner, query_text, req.mode)
     return {"job_id": new_job["job_id"], "status": new_job["status"]}
 
 
@@ -258,3 +265,28 @@ async def approve_plan(job_id: str, req: ApprovePlanRequest, owner: dict = Depen
     approved_plan = [item.model_dump() for item in req.plan]
     run_approval_resume_in_background(job_id, job["thread_id"], approved_plan)
     return {"job_id": job_id, "status": "running"}
+
+
+@app.post("/research/{job_id}/facts/{fact_id}/flag", response_model=FlagFactOut, status_code=202)
+async def flag_fact(job_id: str, fact_id: int, req: FlagFactRequest, owner: dict = Depends(require_api_key)):
+    """Mark a fact disputed — its confidence drops to 0, so existing
+    confidence thresholds already stop trusting it, no new filtering needed —
+    and, by default, fork a targeted re-verification of the claim."""
+    job = _get_owned_job_or_404(job_id, owner)
+    from src.graph.kg import kg_store
+
+    fact = kg_store.get_fact_detail(job["thread_id"], fact_id)
+    if fact is None:
+        raise HTTPException(status_code=404, detail="fact not found")
+    kg_store.flag_fact(job["thread_id"], fact_id, req.reason)
+
+    if not req.trigger_reverify:
+        return {"flagged": True}
+
+    query_text = (
+        f"This claim was flagged as disputed: \"{fact['claim']}\" "
+        f"(reason: {req.reason}). Verify it against the evidence, and note any "
+        f"contradicting evidence explicitly."
+    )
+    new_job = await _fork_followup_job(job, owner, query_text)
+    return {"flagged": True, "job_id": new_job["job_id"], "status": new_job["status"]}

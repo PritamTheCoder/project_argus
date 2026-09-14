@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 async def _run(
     job_id: str, query: Optional[str], thread_id: str, resume: bool = False,
-    resume_value=None, require_approval: bool = False,
+    resume_value=None, require_approval: bool = False, owner_key_hash: str = "",
 ) -> None:
     job_store.update_job(job_id, status="running")
     metrics = RunMetrics()  # same tracker the eval harness uses
@@ -25,6 +25,7 @@ async def _run(
         async for node_name, state_update in astream_research(
             query, thread_id=thread_id, callbacks=[metrics], resume=resume,
             resume_value=resume_value, require_approval=require_approval,
+            owner_key_hash=owner_key_hash,
         ):
             if node_name == "__final__":
                 job_store.update_job(
@@ -50,7 +51,7 @@ async def _run(
 
 def _start(
     job_id: str, query: Optional[str], thread_id: str, resume: bool,
-    resume_value=None, require_approval: bool = False,
+    resume_value=None, require_approval: bool = False, owner_key_hash: str = "",
 ) -> threading.Thread:
     def _worker():
         loop = asyncio.ProactorEventLoop() if sys.platform == "win32" else asyncio.new_event_loop()
@@ -59,6 +60,7 @@ def _start(
             loop.run_until_complete(_run(
                 job_id, query, thread_id, resume=resume,
                 resume_value=resume_value, require_approval=require_approval,
+                owner_key_hash=owner_key_hash,
             ))
         finally:
             loop.close()
@@ -69,8 +71,11 @@ def _start(
     return t
 
 
-def run_job_in_background(job_id: str, query: str, thread_id: str, require_approval: bool = False) -> threading.Thread:
-    return _start(job_id, query, thread_id, resume=False, require_approval=require_approval)
+def run_job_in_background(
+    job_id: str, query: str, thread_id: str, require_approval: bool = False, owner_key_hash: str = "",
+) -> threading.Thread:
+    return _start(job_id, query, thread_id, resume=False,
+                  require_approval=require_approval, owner_key_hash=owner_key_hash)
 
 
 def run_branch_in_background(job_id: str, thread_id: str) -> threading.Thread:

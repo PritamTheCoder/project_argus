@@ -557,3 +557,70 @@ def test_get_research_exposes_pending_plan_when_awaiting_approval(client):
     body = test_client.get(f"/research/{job['job_id']}").json()
     assert body["status"] == "awaiting_approval"
     assert body["pending_plan"] == [{"query": "q1", "mode": "MIXED"}]
+
+
+# ── Flag as wrong ─────────────────────────────────────────────────────────────
+
+def test_flag_fact_not_found(client):
+    test_client, _, _, _ = client
+    resp = test_client.post("/research/does-not-exist/facts/1/flag", json={"reason": "wrong"})
+    assert resp.status_code == 404
+
+
+def test_flag_fact_hides_another_owners_job(client):
+    test_client, _, store, _ = client
+    job = store.create_job("not yours", owner_key_hash="someone-else")
+    resp = test_client.post(f"/research/{job['job_id']}/facts/1/flag", json={"reason": "wrong"})
+    assert resp.status_code == 404
+
+
+def test_flag_fact_unknown_fact_id_returns_404(client):
+    test_client, _, store, owner_key_hash = client
+    job = store.create_job("q", owner_key_hash)
+
+    with patch("src.graph.kg.kg_store") as mock_kg:
+        mock_kg.get_fact_detail.return_value = None
+        resp = test_client.post(f"/research/{job['job_id']}/facts/999/flag", json={"reason": "wrong"})
+
+    assert resp.status_code == 404
+
+
+def test_flag_fact_without_reverify_only_flags(client):
+    test_client, _, store, owner_key_hash = client
+    job = store.create_job("q", owner_key_hash)
+
+    with patch("src.graph.kg.kg_store") as mock_kg, \
+         patch("src.api.app._fork_followup_job") as mock_fork_followup:
+        mock_kg.get_fact_detail.return_value = {"id": 1, "claim": "SpaceX valued at $350B"}
+        resp = test_client.post(
+            f"/research/{job['job_id']}/facts/1/flag",
+            json={"reason": "conflicts with the Q3 filing", "trigger_reverify": False},
+        )
+
+    assert resp.status_code == 202
+    body = resp.json()
+    assert body == {"flagged": True, "job_id": None, "status": None}
+    mock_kg.flag_fact.assert_called_once_with(job["thread_id"], 1, "conflicts with the Q3 filing")
+    mock_fork_followup.assert_not_called()
+
+
+def test_flag_fact_default_triggers_reverify(client):
+    test_client, _, store, owner_key_hash = client
+    job = store.create_job("q", owner_key_hash)
+
+    with patch("src.graph.kg.kg_store") as mock_kg, \
+         patch("src.api.app._fork_followup_job") as mock_fork_followup:
+        mock_kg.get_fact_detail.return_value = {"id": 1, "claim": "SpaceX valued at $350B"}
+        mock_fork_followup.return_value = {"job_id": "new-job-id", "status": "queued"}
+
+        resp = test_client.post(
+            f"/research/{job['job_id']}/facts/1/flag",
+            json={"reason": "conflicts with the Q3 filing"},
+        )
+
+    assert resp.status_code == 202
+    assert resp.json() == {"flagged": True, "job_id": "new-job-id", "status": "queued"}
+
+    query_text = mock_fork_followup.call_args.args[2]
+    assert "SpaceX valued at $350B" in query_text
+    assert "conflicts with the Q3 filing" in query_text
