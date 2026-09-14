@@ -83,7 +83,8 @@ def critic_node(state: AgentState) -> dict:
             else:
                 source_stats[source_url]["count"] += 1
 
-            kg_facts += f"- ({support}) [Cred: {cred}, Type: {stype}] {claim}\n"
+            disputed = f" [DISPUTED: {fact['dispute_reason']}]" if fact.get("disputed") else ""
+            kg_facts += f"- ({support}) [Cred: {cred}, Type: {stype}]{disputed} {claim}\n"
     except Exception as e:
         logger.error(f"Critic failed to retrieve KG facts: {e}")
         kg_facts = "(No KG facts available.)"

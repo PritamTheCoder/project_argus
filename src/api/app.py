@@ -52,9 +52,22 @@ class DigDeeperRequest(BaseModel):
     mode: str = Field(default="MIXED", description="TRUSTED_ONLY, TRUSTED_FIRST, or MIXED")
 
 
+class FlagFactRequest(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=1000, description="Why this fact is disputed")
+    trigger_reverify: bool = Field(
+        default=True, description="Also fork a targeted re-verification run on this claim"
+    )
+
+
 class ResearchJobOut(BaseModel):
     job_id: str
     status: str
+
+
+class FlagFactOut(BaseModel):
+    flagged: bool
+    job_id: Optional[str] = None
+    status: Optional[str] = None
 
 
 @app.get("/")
@@ -72,6 +85,7 @@ async def root():
             "POST /research/{job_id}/branch": "fork a new run from a checkpoint with an injected direction; the source run is untouched (requires an API key)",
             "POST /research/{job_id}/dig-deeper": "fork a targeted follow-up on one fact or gap from a finished run (requires an API key)",
             "POST /research/{job_id}/approve-plan": "submit the approved/edited plan for a job awaiting_approval (requires an API key)",
+            "POST /research/{job_id}/facts/{fact_id}/flag": "mark a fact disputed and optionally fork a targeted re-verification (requires an API key)",
             "GET /research/": "list your past research jobs (requires an API key)",
             "GET /health": "liveness check",
         },
@@ -86,7 +100,8 @@ async def health():
 @app.post("/research", response_model=ResearchJobOut, status_code=202)
 async def create_research(req: ResearchRequest, owner: dict = Depends(require_api_key)):
     job = job_store.create_job(req.query, owner["key_hash"])
-    run_job_in_background(job["job_id"], req.query, job["thread_id"], require_approval=req.require_approval)
+    run_job_in_background(job["job_id"], req.query, job["thread_id"],
+                          require_approval=req.require_approval, owner_key_hash=owner["key_hash"])
     return {"job_id": job["job_id"], "status": job["status"]}
 
 

@@ -80,6 +80,33 @@ def test_kg_session_scoping():
         pass
 
 
+def test_kg_owner_scoping():
+    """owner_key_hash scoping (used for the global cross-run KG lookup, since
+    the KG has no other tenant boundary) must not leak facts across owners."""
+    tmp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(tmp_dir, "test_kg_owner.db")
+    kg = KnowledgeGraph(db_path)
+
+    kg.store_facts([_make_fact("Owner1 fact")], owner_key_hash="owner1")
+    kg.store_facts([_make_fact("Owner2 fact")], owner_key_hash="owner2")
+
+    emb = [0.1] * 384
+    scoped = kg.retrieve_relevant_facts(emb, k=10, session_id=None, owner_key_hash="owner1")
+    assert {r["claim"] for r in scoped} == {"Owner1 fact"}
+
+    full = kg.retrieve_relevant_facts(emb, k=10)
+    assert {r["claim"] for r in full} == {"Owner1 fact", "Owner2 fact"}
+
+    kg.db.close()
+    del kg
+    gc.collect()
+    try:
+        os.remove(db_path)
+        os.rmdir(tmp_dir)
+    except PermissionError:
+        pass
+
+
 def test_kg_docs_session_scoping():
     """retrieve_top_docs is scoped like facts: concurrent runs can't see each other's docs."""
     tmp_dir = tempfile.mkdtemp()

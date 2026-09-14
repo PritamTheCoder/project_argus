@@ -137,8 +137,8 @@ def test_librarian_checks_prior_knowledge_on_first_iteration_only(mock_summary, 
     mock_summary.assert_not_called()
 
 
-def test_prior_knowledge_summary_disabled_by_default():
-    """KG_LOOKUP_GLOBAL off (the default) means no cross-run lookup happens at all."""
+def test_prior_knowledge_summary_disabled_when_scope_is_session():
+    """KG_LOOKUP_GLOBAL off (KG_LOOKUP_SCOPE=session) means no cross-run lookup happens at all."""
     from src.agents.librarian import _prior_knowledge_summary
     with patch("src.agents.librarian.KG_LOOKUP_GLOBAL", False):
         assert _prior_knowledge_summary("any query") == ""
@@ -164,6 +164,39 @@ def test_prior_knowledge_summary_filters_weak_facts():
     assert "Unsupported fact" not in summary
     # Global reuse must query without session scoping.
     assert store.retrieve_relevant_facts.call_args.kwargs["session_id"] is None
+
+
+def test_prior_knowledge_summary_scopes_to_owner():
+    """The owner_key_hash param must reach retrieve_relevant_facts — the KG has
+    no other tenant boundary, so global reuse without this would leak one API
+    key's facts into another's planning context."""
+    from src.agents.librarian import _prior_knowledge_summary
+
+    store = MagicMock()
+    store.retrieve_relevant_facts.return_value = []
+    with patch("src.agents.librarian.KG_LOOKUP_GLOBAL", True), \
+         patch("src.utils.embeddings.get_embeddings", return_value=[[0.1] * 384]), \
+         patch("src.graph.kg.kg_store", store):
+        _prior_knowledge_summary("query", owner_key_hash="owner-xyz")
+
+    assert store.retrieve_relevant_facts.call_args.kwargs["owner_key_hash"] == "owner-xyz"
+
+
+@patch("src.agents.librarian.get_llm_with_fallbacks")
+@patch("src.agents.librarian._prior_knowledge_summary")
+def test_librarian_node_passes_owner_key_hash_from_state(mock_summary, mock_get_llm):
+    """librarian_node must forward the run's owner_key_hash into the prior-
+    knowledge lookup rather than defaulting it away."""
+    mock_summary.return_value = ""
+    mock_get_llm.return_value.return_value = ResearchPlan(search_queries=[
+        SearchIntent(query="q", mode="MIXED"),
+    ])
+
+    state = _base_state(iteration_count=0)
+    state["owner_key_hash"] = "owner-xyz"
+    librarian_node(state)
+
+    mock_summary.assert_called_once_with(state["query"], owner_key_hash="owner-xyz")
 
 
 def test_prior_knowledge_summary_degrades_on_failure():
@@ -430,6 +463,57 @@ def test_critic_leaves_mode_alone_when_credibility_fine(mock_kg, mock_embeddings
     result = critic_node(state)
 
     assert result["plan"][0]["mode"] == "MIXED"
+
+
+# ── Critic: disputed facts surfaced explicitly ───────────────────────────────
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_flags_disputed_facts_in_the_prompt(mock_kg, mock_embeddings, mock_get_llm):
+    """A disputed fact must read as disputed in the Critic's prompt, not just
+    as a low, easy-to-miss confidence number among a dozen other facts."""
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = [{
+        "claim": "SpaceX valued at $350B", "credibility_score": 0.9, "source_type": "Government",
+        "source_url": "http://sec.gov", "support_level": "SUPPORTED",
+        "disputed": 1, "dispute_reason": "conflicts with the Q3 filing",
+    }]
+
+    captured = {}
+
+    def _capture(prompt_value):
+        captured["text"] = str(prompt_value)
+        return FactCheckResult(status="sufficient", new_queries=[], critique="ok")
+
+    mock_get_llm.return_value.side_effect = _capture
+
+    critic_node(_base_state())
+
+    assert "DISPUTED: conflicts with the Q3 filing" in captured["text"]
+
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_does_not_mark_undisputed_facts(mock_kg, mock_embeddings, mock_get_llm):
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = [{
+        "claim": "clean claim", "credibility_score": 0.9, "source_type": "Government",
+        "source_url": "http://sec.gov", "support_level": "SUPPORTED", "disputed": 0,
+    }]
+
+    captured = {}
+
+    def _capture(prompt_value):
+        captured["text"] = str(prompt_value)
+        return FactCheckResult(status="sufficient", new_queries=[], critique="ok")
+
+    mock_get_llm.return_value.side_effect = _capture
+
+    critic_node(_base_state())
+
+    assert "DISPUTED" not in captured["text"]
 
 
 # ── Critic: gap persistence ──────────────────────────────────────────────────

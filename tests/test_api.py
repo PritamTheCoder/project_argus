@@ -494,6 +494,14 @@ def test_create_research_defaults_require_approval_false(client):
     assert mock_bg.call_args.kwargs["require_approval"] is False
 
 
+def test_create_research_passes_owner_key_hash_through(client):
+    """create_research must scope the run to the caller's own owner_key_hash —
+    otherwise a global KG lookup (4A.2) would surface other API keys' facts."""
+    test_client, mock_bg, store, owner_key_hash = client
+    test_client.post("/research", json={"query": "q"})
+    assert mock_bg.call_args.kwargs["owner_key_hash"] == owner_key_hash
+
+
 def test_approve_plan_not_found(client):
     test_client, _, _, _ = client
     resp = test_client.post("/research/does-not-exist/approve-plan",
