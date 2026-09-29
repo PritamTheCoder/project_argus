@@ -83,7 +83,8 @@ def critic_node(state: AgentState) -> dict:
             else:
                 source_stats[source_url]["count"] += 1
 
-            kg_facts += f"- ({support}) [Cred: {cred}, Type: {stype}] {claim}\n"
+            disputed = f" [DISPUTED: {fact['dispute_reason']}]" if fact.get("disputed") else ""
+            kg_facts += f"- ({support}) [Cred: {cred}, Type: {stype}]{disputed} {claim}\n"
     except Exception as e:
         logger.error(f"Critic failed to retrieve KG facts: {e}")
         kg_facts = "(No KG facts available.)"
@@ -154,6 +155,17 @@ def critic_node(state: AgentState) -> dict:
             f"Critic: avg source credibility {avg_credibility:.2f} is below "
             f"{LOW_SOURCE_CREDIBILITY_THRESHOLD} — upgraded re-search queries toward trusted sources."
         )
+
+    iteration = state.get("iteration_count", 0)
+    gap_entries = (
+        [{"gap_type": "coverage_gap", "description": g, "iteration": iteration} for g in coverage_gaps]
+        + [{"gap_type": "knowledge_gap", "description": g, "iteration": iteration}
+           for g in state.get("knowledge_gaps", []) or []]
+    )
+    try:
+        kg_store.store_gaps(gap_entries, session_id=session_id)
+    except Exception as e:
+        logger.error(f"Error storing gaps into KG: {e}")
 
     return {
         "critique": result.critique,

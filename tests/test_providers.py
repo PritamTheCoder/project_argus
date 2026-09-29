@@ -354,6 +354,7 @@ def test_exa_categories_match_canonical_reference():
 
 @pytest.mark.asyncio
 @patch("src.tools.providers.EXA_API_KEY", "k")
+@patch("src.tools.providers.EXA_CACHE_TTL_HOURS", 0)
 @patch("src.tools.providers._request", new_callable=AsyncMock)
 async def test_exa_search_sends_type_and_nested_contents(mock_req):
     """`text`/`highlights` must be nested under `contents`, and a search type sent."""
@@ -369,6 +370,7 @@ async def test_exa_search_sends_type_and_nested_contents(mock_req):
 
 @pytest.mark.asyncio
 @patch("src.tools.providers.EXA_API_KEY", "k")
+@patch("src.tools.providers.EXA_CACHE_TTL_HOURS", 0)
 @patch("src.tools.providers._request", new_callable=AsyncMock)
 async def test_exa_search_drops_invalid_category(mock_req):
     """An invalid category degrades to an ordinary search rather than a 400."""
@@ -379,6 +381,7 @@ async def test_exa_search_drops_invalid_category(mock_req):
 
 @pytest.mark.asyncio
 @patch("src.tools.providers.EXA_API_KEY", "k")
+@patch("src.tools.providers.EXA_CACHE_TTL_HOURS", 0)
 @patch("src.tools.providers._request", new_callable=AsyncMock)
 async def test_exa_search_passes_valid_category(mock_req):
     mock_req.return_value = MagicMock(json=lambda: {"results": []})

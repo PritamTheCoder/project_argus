@@ -1,5 +1,5 @@
-"""Shared logging setup for every entrypoint (CLI, API, Streamlit) — console
-plus a rotating file, so logs survive after the terminal/process closes."""
+"""Shared logging setup for the CLI and HTTP API — console plus a rotating
+file, so logs survive after the terminal/process closes."""
 
 import logging
 import logging.handlers

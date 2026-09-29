@@ -80,6 +80,33 @@ def test_kg_session_scoping():
         pass
 
 
+def test_kg_owner_scoping():
+    """owner_key_hash scoping (used for the global cross-run KG lookup, since
+    the KG has no other tenant boundary) must not leak facts across owners."""
+    tmp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(tmp_dir, "test_kg_owner.db")
+    kg = KnowledgeGraph(db_path)
+
+    kg.store_facts([_make_fact("Owner1 fact")], owner_key_hash="owner1")
+    kg.store_facts([_make_fact("Owner2 fact")], owner_key_hash="owner2")
+
+    emb = [0.1] * 384
+    scoped = kg.retrieve_relevant_facts(emb, k=10, session_id=None, owner_key_hash="owner1")
+    assert {r["claim"] for r in scoped} == {"Owner1 fact"}
+
+    full = kg.retrieve_relevant_facts(emb, k=10)
+    assert {r["claim"] for r in full} == {"Owner1 fact", "Owner2 fact"}
+
+    kg.db.close()
+    del kg
+    gc.collect()
+    try:
+        os.remove(db_path)
+        os.rmdir(tmp_dir)
+    except PermissionError:
+        pass
+
+
 def test_kg_docs_session_scoping():
     """retrieve_top_docs is scoped like facts: concurrent runs can't see each other's docs."""
     tmp_dir = tempfile.mkdtemp()
@@ -194,6 +221,282 @@ def test_kg_find_gaps_session_scoping():
 
     kg.db.close()
     del kg
+    gc.collect()
+    try:
+        os.remove(db_path)
+        os.rmdir(tmp_dir)
+    except PermissionError:
+        pass
+
+
+# ── Evidence graph: sources, contradictions, consensus findings, gaps ────────
+
+@pytest.fixture()
+def kg():
+    tmp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(tmp_dir, "test_kg_evidence.db")
+    store = KnowledgeGraph(db_path)
+    yield store
+    store.db.close()
+    del store
+    gc.collect()
+    try:
+        os.remove(db_path)
+        os.rmdir(tmp_dir)
+    except PermissionError:
+        pass
+
+
+def test_store_and_read_sources(kg):
+    kg.store_sources(
+        [{"source_id": "[1]", "url": "http://a.com", "credibility_score": 0.9,
+          "source_type": "Academic", "relevance_score": 0.8, "as_of_date": "2026",
+          "snippet": "..."}],
+        session_id="s1",
+    )
+    graph = kg.get_evidence_graph("s1")
+    assert len(graph["sources"]) == 1
+    assert graph["sources"][0]["url"] == "http://a.com"
+    assert graph["sources"][0]["relevance_score"] == 0.8
+
+
+def test_store_sources_is_idempotent_per_source_id(kg):
+    """source_map accumulates across research-loop iterations; Verifier calls
+    store_sources once per iteration, so re-storing the same source_id must
+    not duplicate it."""
+    source = {"source_id": "[1]", "url": "http://a.com", "credibility_score": 0.9}
+    kg.store_sources([source], session_id="s1")
+    kg.store_sources([source], session_id="s1")  # second pass, same source
+    graph = kg.get_evidence_graph("s1")
+    assert len(graph["sources"]) == 1
+
+
+def test_store_sources_adds_only_new_ones_on_a_later_pass(kg):
+    kg.store_sources([{"source_id": "[1]", "url": "http://a.com"}], session_id="s1")
+    kg.store_sources(
+        [{"source_id": "[1]", "url": "http://a.com"}, {"source_id": "[2]", "url": "http://b.com"}],
+        session_id="s1",
+    )
+    graph = kg.get_evidence_graph("s1")
+    assert {s["source_id"] for s in graph["sources"]} == {"[1]", "[2]"}
+
+
+def test_sources_scoped_by_session(kg):
+    kg.store_sources([{"source_id": "[1]", "url": "http://a.com"}], session_id="s1")
+    kg.store_sources([{"source_id": "[1]", "url": "http://b.com"}], session_id="s2")
+    assert len(kg.get_evidence_graph("s1")["sources"]) == 1
+    assert kg.get_evidence_graph("s1")["sources"][0]["url"] == "http://a.com"
+
+
+def test_store_and_read_contradictions(kg):
+    kg.store_contradictions(
+        [{"statement": "Conflicting valuations", "claims": ["A", "B"],
+          "sources": ["http://a.com", "http://b.com"], "source_count": 2}],
+        session_id="s1",
+    )
+    graph = kg.get_evidence_graph("s1")
+    assert len(graph["contradictions"]) == 1
+    entry = graph["contradictions"][0]
+    assert entry["claims"] == ["A", "B"]  # JSON round-trips back to a list
+    assert entry["source_count"] == 2
+
+
+def test_store_and_read_consensus_findings(kg):
+    kg.store_consensus_findings(
+        [{"statement": "Agreed figure", "claims": ["A", "B"], "sources": ["u1"], "source_count": 2}],
+        session_id="s1",
+    )
+    graph = kg.get_evidence_graph("s1")
+    assert len(graph["consensus_findings"]) == 1
+    assert graph["consensus_findings"][0]["statement"] == "Agreed figure"
+
+
+def test_store_and_read_gaps(kg):
+    kg.store_gaps(
+        [{"gap_type": "coverage_gap", "description": "no data on X", "iteration": 0},
+         {"gap_type": "knowledge_gap", "description": "claim Y unverified", "iteration": 1}],
+        session_id="s1",
+    )
+    graph = kg.get_evidence_graph("s1")
+    assert len(graph["gaps"]) == 2
+    types = {g["gap_type"] for g in graph["gaps"]}
+    assert types == {"coverage_gap", "knowledge_gap"}
+
+
+def test_empty_store_calls_are_no_ops(kg):
+    """None of the new store_* methods should touch the DB (or raise) on an
+    empty list — Consensus/Critic call these even when nothing was found."""
+    kg.store_sources([], session_id="s1")
+    kg.store_contradictions([], session_id="s1")
+    kg.store_consensus_findings([], session_id="s1")
+    kg.store_gaps([], session_id="s1")
+    graph = kg.get_evidence_graph("s1")
+    assert graph == {"facts": [], "sources": [], "contradictions": [], "consensus_findings": [], "gaps": []}
+
+
+def test_get_fact_detail_returns_none_for_unknown_fact(kg):
+    assert kg.get_fact_detail("s1", 999) is None
+
+
+def test_get_fact_detail_joins_source_and_contradictions(kg):
+    kg.store_facts([_make_fact("SpaceX valued at $350B")], session_id="s1")
+    kg.store_sources(
+        [{"source_id": "[1]", "url": "http://test.com", "credibility_score": 0.9,
+          "relevance_score": 0.7}],
+        session_id="s1",
+    )
+    kg.store_contradictions(
+        [{"statement": "conflict", "claims": ["SpaceX valued at $350B"],
+          "sources": ["http://test.com"], "source_count": 1}],
+        session_id="s1",
+    )
+
+    graph = kg.get_evidence_graph("s1")
+    fact_id = graph["facts"][0]["id"]
+
+    detail = kg.get_fact_detail("s1", fact_id)
+    assert detail["claim"] == "SpaceX valued at $350B"
+    assert detail["source"]["credibility_score"] == 0.9
+    assert detail["source"]["relevance_score"] == 0.7
+    assert len(detail["contradictions"]) == 1
+
+
+def test_get_fact_detail_scoped_by_session():
+    """A fact_id from another session must 404, not leak cross-session data —
+    ids are globally auto-incrementing, session_id is the security boundary."""
+    tmp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(tmp_dir, "test_kg_fact_scope.db")
+    store = KnowledgeGraph(db_path)
+    store.store_facts([_make_fact("secret to session A")], session_id="sessA")
+    graph = store.get_evidence_graph("sessA")
+    fact_id = graph["facts"][0]["id"]
+
+    assert store.get_fact_detail("sessB", fact_id) is None
+
+    store.db.close()
+    del store
+    gc.collect()
+    try:
+        os.remove(db_path)
+        os.rmdir(tmp_dir)
+    except PermissionError:
+        pass
+
+
+def test_copy_session_duplicates_all_evidence_tables(kg):
+    kg.store_facts([_make_fact("original claim")], session_id="src")
+    kg.store_sources([{"source_id": "[1]", "url": "http://a.com", "credibility_score": 0.9}], session_id="src")
+    kg.store_contradictions(
+        [{"statement": "conflict", "claims": ["original claim"], "sources": ["http://a.com"], "source_count": 1}],
+        session_id="src",
+    )
+    kg.store_consensus_findings(
+        [{"statement": "agreed", "claims": ["original claim"], "sources": ["http://a.com"], "source_count": 1}],
+        session_id="src",
+    )
+    kg.store_gaps([{"gap_type": "coverage_gap", "description": "missing X", "iteration": 0}], session_id="src")
+
+    kg.copy_session("src", "forked")
+
+    graph = kg.get_evidence_graph("forked")
+    assert len(graph["facts"]) == 1
+    assert graph["facts"][0]["claim"] == "original claim"
+    assert len(graph["sources"]) == 1
+    assert len(graph["contradictions"]) == 1
+    assert len(graph["consensus_findings"]) == 1
+    assert len(graph["gaps"]) == 1
+
+    # Source session must be unaffected — this is a copy, not a move.
+    assert len(kg.get_evidence_graph("src")["facts"]) == 1
+
+
+def test_copy_session_does_not_copy_embeddings(kg):
+    """vec_facts is deliberately not copied — it only matters for mid-run
+    retrieval, not evidence-graph display, and remapping rowids across a
+    virtual table for no display benefit isn't worth the complexity."""
+    kg.store_facts([_make_fact("claim needing embedding")], session_id="src")
+    kg.copy_session("src", "forked")
+
+    copied_id = kg.get_evidence_graph("forked")["facts"][0]["id"]
+    # retrieve_relevant_facts joins facts to vec_facts by rowid; a copied fact
+    # with no vec_facts row must not appear in a similarity search.
+    results = kg.retrieve_relevant_facts([0.1] * 384, k=10, session_id="forked")
+    assert copied_id not in {r["id"] for r in results}
+
+
+def test_copy_session_from_empty_source_is_a_noop(kg):
+    kg.copy_session("nonexistent", "forked")
+    assert kg.get_evidence_graph("forked") == {
+        "facts": [], "sources": [], "contradictions": [], "consensus_findings": [], "gaps": [],
+    }
+
+
+# ── flag_fact: dispute a fact, downweight it, surface it downstream ──────────
+
+def test_flag_fact_sets_disputed_and_zeros_confidence(kg):
+    kg.store_facts([_make_fact("SpaceX valued at $350B", confidence=0.9)], session_id="s1")
+    fact_id = kg.get_evidence_graph("s1")["facts"][0]["id"]
+
+    ok = kg.flag_fact("s1", fact_id, "conflicts with the Q3 filing")
+    assert ok is True
+
+    fact = kg.get_fact_detail("s1", fact_id)
+    assert fact["disputed"] == 1
+    assert fact["dispute_reason"] == "conflicts with the Q3 filing"
+    assert fact["confidence"] == 0.0
+
+
+def test_flag_fact_returns_false_for_unknown_fact(kg):
+    assert kg.flag_fact("s1", 999, "reason") is False
+
+
+def test_flag_fact_scoped_by_session(kg):
+    """A fact_id from another session must not be flaggable — session_id is
+    the security boundary, same as get_fact_detail."""
+    kg.store_facts([_make_fact("secret to session A")], session_id="sessA")
+    fact_id = kg.get_evidence_graph("sessA")["facts"][0]["id"]
+
+    assert kg.flag_fact("sessB", fact_id, "reason") is False
+    # Untouched in its real session.
+    assert kg.get_fact_detail("sessA", fact_id)["disputed"] == 0
+
+
+def test_flag_fact_appears_in_evidence_graph(kg):
+    kg.store_facts([_make_fact("claim")], session_id="s1")
+    fact_id = kg.get_evidence_graph("s1")["facts"][0]["id"]
+    kg.flag_fact("s1", fact_id, "bad grounding")
+
+    facts = kg.get_evidence_graph("s1")["facts"]
+    assert facts[0]["disputed"] == 1
+    assert facts[0]["dispute_reason"] == "bad grounding"
+
+
+def test_copy_session_carries_disputed_forward(kg):
+    kg.store_facts([_make_fact("claim")], session_id="src")
+    fact_id = kg.get_evidence_graph("src")["facts"][0]["id"]
+    kg.flag_fact("src", fact_id, "wrong")
+
+    kg.copy_session("src", "forked")
+
+    copied = kg.get_evidence_graph("forked")["facts"][0]
+    assert copied["disputed"] == 1
+    assert copied["dispute_reason"] == "wrong"
+
+
+def test_retrieve_relevant_facts_includes_disputed_fields():
+    tmp_dir = tempfile.mkdtemp()
+    db_path = os.path.join(tmp_dir, "test_kg_disputed_retrieve.db")
+    store = KnowledgeGraph(db_path)
+    store.store_facts([_make_fact("claim")], session_id="s1")
+    fact_id = store.get_evidence_graph("s1")["facts"][0]["id"]
+    store.flag_fact("s1", fact_id, "reason text")
+
+    results = store.retrieve_relevant_facts([0.1] * 384, k=5, session_id="s1")
+    assert results[0]["disputed"] == 1
+    assert results[0]["dispute_reason"] == "reason text"
+
+    store.db.close()
+    del store
     gc.collect()
     try:
         os.remove(db_path)

@@ -20,7 +20,9 @@ from src.config import (
     GATHER_MAX_STEPS, TOOL_SEARCH_MAX_TOOLS,
 )
 from src.tools import providers
-from src.tools.research_tools import registry, set_kg_session, reset_kg_session  # importing also registers the tools
+from src.tools.research_tools import (  # importing also registers the tools
+    registry, set_kg_session, reset_kg_session, set_kg_owner, reset_kg_owner,
+)
 from src.tools.tool_search import select_tools
 from src.tools.tool_telemetry import ToolCallTracer, timed_tool_call
 from src.tools.mcp_loader import ensure_mcp_loaded
@@ -156,6 +158,7 @@ async def gather_sources_for_query(
     seen_urls: Optional[Set[str]] = None,
     max_steps: Optional[int] = None,
     session_id: str = "",
+    owner_key_hash: str = "",
     tracer: Optional[ToolCallTracer] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -174,6 +177,7 @@ async def gather_sources_for_query(
 
     # Scope the model-invoked kg_lookup tool to this run for the duration of the call.
     session_token = set_kg_session(session_id)
+    owner_token = set_kg_owner(owner_key_hash)
     await ensure_mcp_loaded()
 
     tracer = tracer if tracer is not None else ToolCallTracer()
@@ -201,6 +205,7 @@ async def gather_sources_for_query(
         candidates = await _fallback_gather(query, mode)
     finally:
         reset_kg_session(session_token)
+        reset_kg_owner(owner_token)
 
     deduped = _dedup_candidates(candidates, seen_urls)
     if tracer.records:

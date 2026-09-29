@@ -17,6 +17,7 @@ from src.config import (
     VERIFIER_MODEL, VERIFIER_PROVIDER,
     WRITER_MODEL, WRITER_PROVIDER,
     REFINER_MODEL, REFINER_PROVIDER,
+    CITATION_AUDITOR_MODEL, CITATION_AUDITOR_PROVIDER,
 )
 
 # Every test here calls a real provider API, so the whole module is a live probe:
@@ -30,6 +31,7 @@ AGENT_MODELS = [
     ("verifier", VERIFIER_MODEL, VERIFIER_PROVIDER),
     ("writer", WRITER_MODEL, WRITER_PROVIDER),
     ("refiner", REFINER_MODEL, REFINER_PROVIDER),
+    ("citation_auditor", CITATION_AUDITOR_MODEL, CITATION_AUDITOR_PROVIDER),
 ]
 
 

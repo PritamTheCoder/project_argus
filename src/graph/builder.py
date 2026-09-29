@@ -2,17 +2,18 @@
 Project Argus - Graph Builder
 
 Wires agent nodes into a cyclic LangGraph StateGraph:
-    START → librarian → scout → refiner → verifier → fact_checker →(conditional)→
+    START → librarian → plan_gate → scout → refiner → verifier → fact_checker →(conditional)→
         ├→ scout               (avg source credibility too low — broaden, don't chase claims)
         ├→ reflector → scout   (targeted gap-fill loop when gaps detected)
         ├→ scout               (broad re-search loop when no specific gaps)
-        └→ ghostwriter → END
+        └→ ghostwriter → citation_auditor → END
 
 The conditional edge honours MAX_RESEARCH_LOOPS to prevent infinite loops.
 """
 
 import logging
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt
 
 from src.schema.state import AgentState
 from src.config import MAX_RESEARCH_LOOPS, LOW_SOURCE_CREDIBILITY_THRESHOLD
@@ -25,6 +26,7 @@ from src.agents.critic import critic_node
 from src.agents.reflector import reflector_node
 from src.agents.consensus import consensus_node
 from src.agents.writer import writer_node
+from src.agents.citation_auditor import citation_auditor_node
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +40,8 @@ def route_after_critic(state: AgentState) -> str:
         the low-credibility source that made it)
       • gaps + specific claims detected → "reflector" (targeted sub-queries)
       • re-search requested but no specific gaps → "scout" (broad re-search)
-      • loop cap hit or sufficient evidence → "consensus" (then Writer)
+      • loop cap hit or sufficient evidence → "consensus" (then Writer,
+        then the citation auditor)
     """
     re_search = state.get("re_search_required", False)
     gap_detected = state.get("knowledge_gap_detected", False)
@@ -84,6 +87,16 @@ def _critic_with_counter(state: AgentState) -> dict:
     return result
 
 
+def plan_gate_node(state: AgentState) -> dict:
+    """Pauses for plan approval when ``require_approval`` is set, else a
+    pass-through. LangGraph re-runs a node's code from the top on every
+    resume, so nothing before ``interrupt()`` may have a side effect."""
+    if not state.get("require_approval"):
+        return {}
+    approved_plan = interrupt({"pending_plan": state.get("plan", [])})
+    return {"plan": approved_plan}
+
+
 def build_graph(checkpointer=None):
     """
     Construct and compile the Project Argus StateGraph.
@@ -98,6 +111,7 @@ def build_graph(checkpointer=None):
     builder = StateGraph(AgentState)
 
     builder.add_node("librarian", librarian_node)
+    builder.add_node("plan_gate", plan_gate_node)
     builder.add_node("scout", scout_node)
     builder.add_node("refiner", refiner_node)
     builder.add_node("verifier", verifier_node)
@@ -105,9 +119,11 @@ def build_graph(checkpointer=None):
     builder.add_node("reflector", reflector_node)
     builder.add_node("consensus", consensus_node)
     builder.add_node("ghostwriter", writer_node)
+    builder.add_node("citation_auditor", citation_auditor_node)
 
     builder.add_edge(START, "librarian")
-    builder.add_edge("librarian", "scout")
+    builder.add_edge("librarian", "plan_gate")
+    builder.add_edge("plan_gate", "scout")
     builder.add_edge("scout", "refiner")
     builder.add_edge("refiner", "verifier")
     builder.add_edge("verifier", "fact_checker")
@@ -125,9 +141,12 @@ def build_graph(checkpointer=None):
         },
     )
 
-    # Consensus runs once on the final evidence, then the Writer synthesizes.
+    # Consensus runs once on the final evidence, then the Writer synthesizes,
+    # then the citation auditor checks the Writer's own sentences against
+    # what they actually cite (Phase 10.A) before the run ends.
     builder.add_edge("consensus", "ghostwriter")
-    builder.add_edge("ghostwriter", END)
+    builder.add_edge("ghostwriter", "citation_auditor")
+    builder.add_edge("citation_auditor", END)
 
     compile_kwargs = {}
     if checkpointer is not None:

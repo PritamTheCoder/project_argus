@@ -61,12 +61,14 @@ def test_update_job_patches_fields_and_json_encodes_dicts():
         report="final report text",
         source_map={"[1]": {"url": "http://a.com"}},
         quality_score={"coverage": 0.9},
+        citation_audit=[{"sentence": "x", "verdict": "SUPPORTED"}],
     )
     fetched = store.get_job(job["job_id"])
     assert fetched["status"] == "done"
     assert fetched["report"] == "final report text"
     assert fetched["source_map"] == {"[1]": {"url": "http://a.com"}}
     assert fetched["quality_score"] == {"coverage": 0.9}
+    assert fetched["citation_audit"] == [{"sentence": "x", "verdict": "SUPPORTED"}]
     _cleanup(store, tmp_dir, db_path)
 
 
@@ -101,4 +103,21 @@ def test_list_jobs_orders_newest_first():
 def test_list_jobs_empty_for_unknown_owner():
     store, tmp_dir, db_path = _make_store()
     assert store.list_jobs("nobody") == []
+    _cleanup(store, tmp_dir, db_path)
+
+
+def test_create_job_accepts_an_explicit_thread_id():
+    """A branch already forked its thread before creating the job row — the
+    job must point at that thread, not generate its own."""
+    store, tmp_dir, db_path = _make_store()
+    job = store.create_job("query", owner_key_hash="owner-1", thread_id="already-forked-thread")
+    assert job["thread_id"] == "already-forked-thread"
+    _cleanup(store, tmp_dir, db_path)
+
+
+def test_create_job_without_thread_id_still_autogenerates():
+    store, tmp_dir, db_path = _make_store()
+    job = store.create_job("query", owner_key_hash="owner-1")
+    assert job["thread_id"]
+    assert job["thread_id"] != job["job_id"]
     _cleanup(store, tmp_dir, db_path)

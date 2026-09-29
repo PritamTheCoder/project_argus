@@ -194,6 +194,17 @@ def consensus_node(state: AgentState) -> dict:
         f"{len(contradictions)} contradiction(s). Quality: {quality_score}"
     )
 
+    # Consensus runs once per research run (after the loop exits), so a plain
+    # insert is correct — unlike Verifier's sources, there's no repeat-pass
+    # duplication to guard against.
+    try:
+        from src.graph.kg import kg_store
+        session_id = state.get("session_id", "")
+        kg_store.store_consensus_findings(consensus_findings, session_id=session_id)
+        kg_store.store_contradictions(contradictions, session_id=session_id)
+    except Exception as e:
+        logger.error(f"Error storing consensus/contradictions into KG: {e}")
+
     return {
         "consensus_findings": consensus_findings,
         "contradictions": contradictions,

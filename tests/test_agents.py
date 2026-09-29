@@ -8,13 +8,14 @@ scrape) are mocked — no API keys or network access required.
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
-from src.schema.state import AgentState, ResearchPlan, SearchIntent, FactCheckResult
+from src.schema.state import AgentState, ResearchPlan, SearchIntent, FactCheckResult, CitationAuditBatch, CitationVerdict
 from src.agents.librarian import librarian_node
 from src.agents.scout import scout_node
 from src.agents.refiner import refiner_node, _split_into_batches
 from src.agents.critic import critic_node, _compute_coverage_gaps
 from src.agents.reflector import reflector_node, ReflectorOutput
-from src.agents.writer import writer_node
+from src.agents.writer import writer_node, build_citation_remap, resolve_fact_citation_id
+from src.agents.citation_auditor import citation_auditor_node, _split_citable_sentences
 
 
 # ── Shared state builder ──────────────────────────────────────────────────────
@@ -137,8 +138,8 @@ def test_librarian_checks_prior_knowledge_on_first_iteration_only(mock_summary, 
     mock_summary.assert_not_called()
 
 
-def test_prior_knowledge_summary_disabled_by_default():
-    """KG_LOOKUP_GLOBAL off (the default) means no cross-run lookup happens at all."""
+def test_prior_knowledge_summary_disabled_when_scope_is_session():
+    """KG_LOOKUP_GLOBAL off (KG_LOOKUP_SCOPE=session) means no cross-run lookup happens at all."""
     from src.agents.librarian import _prior_knowledge_summary
     with patch("src.agents.librarian.KG_LOOKUP_GLOBAL", False):
         assert _prior_knowledge_summary("any query") == ""
@@ -164,6 +165,39 @@ def test_prior_knowledge_summary_filters_weak_facts():
     assert "Unsupported fact" not in summary
     # Global reuse must query without session scoping.
     assert store.retrieve_relevant_facts.call_args.kwargs["session_id"] is None
+
+
+def test_prior_knowledge_summary_scopes_to_owner():
+    """The owner_key_hash param must reach retrieve_relevant_facts — the KG has
+    no other tenant boundary, so global reuse without this would leak one API
+    key's facts into another's planning context."""
+    from src.agents.librarian import _prior_knowledge_summary
+
+    store = MagicMock()
+    store.retrieve_relevant_facts.return_value = []
+    with patch("src.agents.librarian.KG_LOOKUP_GLOBAL", True), \
+         patch("src.utils.embeddings.get_embeddings", return_value=[[0.1] * 384]), \
+         patch("src.graph.kg.kg_store", store):
+        _prior_knowledge_summary("query", owner_key_hash="owner-xyz")
+
+    assert store.retrieve_relevant_facts.call_args.kwargs["owner_key_hash"] == "owner-xyz"
+
+
+@patch("src.agents.librarian.get_llm_with_fallbacks")
+@patch("src.agents.librarian._prior_knowledge_summary")
+def test_librarian_node_passes_owner_key_hash_from_state(mock_summary, mock_get_llm):
+    """librarian_node must forward the run's owner_key_hash into the prior-
+    knowledge lookup rather than defaulting it away."""
+    mock_summary.return_value = ""
+    mock_get_llm.return_value.return_value = ResearchPlan(search_queries=[
+        SearchIntent(query="q", mode="MIXED"),
+    ])
+
+    state = _base_state(iteration_count=0)
+    state["owner_key_hash"] = "owner-xyz"
+    librarian_node(state)
+
+    mock_summary.assert_called_once_with(state["query"], owner_key_hash="owner-xyz")
 
 
 def test_prior_knowledge_summary_degrades_on_failure():
@@ -432,6 +466,97 @@ def test_critic_leaves_mode_alone_when_credibility_fine(mock_kg, mock_embeddings
     assert result["plan"][0]["mode"] == "MIXED"
 
 
+# ── Critic: disputed facts surfaced explicitly ───────────────────────────────
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_flags_disputed_facts_in_the_prompt(mock_kg, mock_embeddings, mock_get_llm):
+    """A disputed fact must read as disputed in the Critic's prompt, not just
+    as a low, easy-to-miss confidence number among a dozen other facts."""
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = [{
+        "claim": "SpaceX valued at $350B", "credibility_score": 0.9, "source_type": "Government",
+        "source_url": "http://sec.gov", "support_level": "SUPPORTED",
+        "disputed": 1, "dispute_reason": "conflicts with the Q3 filing",
+    }]
+
+    captured = {}
+
+    def _capture(prompt_value):
+        captured["text"] = str(prompt_value)
+        return FactCheckResult(status="sufficient", new_queries=[], critique="ok")
+
+    mock_get_llm.return_value.side_effect = _capture
+
+    critic_node(_base_state())
+
+    assert "DISPUTED: conflicts with the Q3 filing" in captured["text"]
+
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_does_not_mark_undisputed_facts(mock_kg, mock_embeddings, mock_get_llm):
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = [{
+        "claim": "clean claim", "credibility_score": 0.9, "source_type": "Government",
+        "source_url": "http://sec.gov", "support_level": "SUPPORTED", "disputed": 0,
+    }]
+
+    captured = {}
+
+    def _capture(prompt_value):
+        captured["text"] = str(prompt_value)
+        return FactCheckResult(status="sufficient", new_queries=[], critique="ok")
+
+    mock_get_llm.return_value.side_effect = _capture
+
+    critic_node(_base_state())
+
+    assert "DISPUTED" not in captured["text"]
+
+
+# ── Critic: gap persistence ──────────────────────────────────────────────────
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_stores_coverage_and_knowledge_gaps(mock_kg, mock_embeddings, mock_get_llm):
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = []
+    mock_kg.store_gaps = MagicMock()
+    mock_get_llm.return_value.return_value = FactCheckResult(status="sufficient", new_queries=[], critique="ok")
+
+    state = _base_state(
+        original_plan=[{"query": "q1", "mode": "MIXED"}],
+        knowledge_gaps=["unverifiable claim X"],
+        iteration_count=1,
+        session_id="sess-1",
+    )
+    critic_node(state)
+
+    mock_kg.store_gaps.assert_called_once()
+    entries = mock_kg.store_gaps.call_args.args[0]
+    by_type = {e["gap_type"]: e["description"] for e in entries}
+    assert by_type == {"coverage_gap": "q1", "knowledge_gap": "unverifiable claim X"}
+    assert all(e["iteration"] == 1 for e in entries)
+
+
+@patch("src.agents.critic.get_llm_with_fallbacks")
+@patch("src.agents.critic.get_embeddings")
+@patch("src.graph.kg.kg_store")
+def test_critic_stores_empty_gaps_without_crashing(mock_kg, mock_embeddings, mock_get_llm):
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_kg.retrieve_relevant_facts.return_value = []
+    mock_kg.store_gaps = MagicMock()
+    mock_get_llm.return_value.return_value = FactCheckResult(status="sufficient", new_queries=[], critique="ok")
+
+    critic_node(_base_state())
+
+    mock_kg.store_gaps.assert_called_once_with([], session_id="")
+
+
 # ── Reflector Tests ──────────────────────────────────────────────────────────
 
 @patch("src.agents.reflector.get_llm_with_fallbacks")
@@ -562,6 +687,158 @@ def test_writer_handles_list_content_response(mock_get_llm):
     result = writer_node(state)
 
     assert "Report from a list-content response." in result["report"]
+
+
+# ── Citation remap helpers (shared by Writer and CitationAuditor) ────────────
+
+def test_build_citation_remap_collapses_duplicate_urls():
+    source_map = {
+        "[1]": {"url": "http://a.com"},
+        "[4]": {"url": "http://a.com"},  # same URL, different original id
+        "[2]": {"url": "http://b.com"},
+    }
+    new_source_map, old_to_new_id_map = build_citation_remap(source_map)
+
+    assert old_to_new_id_map["[1]"] == old_to_new_id_map["[4]"]
+    assert old_to_new_id_map["[1]"] != old_to_new_id_map["[2]"]
+    assert len(new_source_map) == 2
+    # The URL itself resolves too, not just the original source_id.
+    assert old_to_new_id_map["http://a.com"] == old_to_new_id_map["[1]"]
+
+
+def test_resolve_fact_citation_id_falls_back_to_source_url():
+    source_map = {"[1]": {"url": "http://a.com"}}
+    _, old_to_new_id_map = build_citation_remap(source_map)
+
+    # A fact with an unresolvable source_id but a matching source_url still resolves.
+    fact = {"source_id": "[99]", "source_url": "http://a.com"}
+    assert resolve_fact_citation_id(fact, old_to_new_id_map) == "[1]"
+
+    assert resolve_fact_citation_id({"source_id": "[99]", "source_url": "http://nowhere.com"}, old_to_new_id_map) is None
+
+
+# ── Citation Auditor Tests (Phase 10.A) ───────────────────────────────────────
+
+def _report_with_two_citations() -> str:
+    return (
+        "> **Research Quality** — 2 verified facts\n\n"
+        "SpaceX achieved a valuation of $350 billion in December 2024 [1]. "
+        "The company continues to expand Starlink coverage globally [2].\n\n"
+        "---\n### References\n"
+        "- **[1]**: http://a.com *(Credibility: 0.9, Academic/Scientific)*\n"
+        "- **[2]**: http://b.com *(Credibility: 0.7, Major News)*\n"
+    )
+
+
+def test_split_citable_sentences_excludes_references_and_uncited_lines():
+    sentences = _split_citable_sentences(_report_with_two_citations())
+    assert len(sentences) == 2
+    assert all("[1]" in s or "[2]" in s for s in sentences)
+    assert not any("References" in s or "Credibility" in s for s in sentences)
+
+
+def test_split_citable_sentences_empty_when_nothing_to_check():
+    report = "\n\n---\n### References\n- **[1]**: http://a.com\n"
+    assert _split_citable_sentences(report) == []
+
+
+@patch("src.agents.citation_auditor.get_llm_with_fallbacks")
+def test_citation_auditor_skips_llm_call_when_no_citations(mock_get_llm):
+    state = _base_state(report="A report with no citations at all.")
+    result = citation_auditor_node(state)
+
+    assert result == {"citation_audit": [], "active_node": "citation_auditor"}
+    mock_get_llm.assert_not_called()
+
+
+@patch("src.agents.citation_auditor.get_llm_with_fallbacks")
+def test_citation_auditor_all_supported_banner(mock_get_llm):
+    mock_get_llm.return_value.return_value = CitationAuditBatch(results=[
+        CitationVerdict(sentence="SpaceX achieved a valuation of $350 billion in December 2024 [1].",
+                        cited_ids=["[1]"], verdict="SUPPORTED", reason="matches source"),
+        CitationVerdict(sentence="The company continues to expand Starlink coverage globally [2].",
+                        cited_ids=["[2]"], verdict="SUPPORTED", reason="matches source"),
+    ])
+
+    state = _base_state(
+        report=_report_with_two_citations(),
+        verified_facts=[
+            {"claim": "SpaceX valued at $350B", "source_id": "[1]", "source_url": "http://a.com",
+             "support_level": "SUPPORTED"},
+            {"claim": "Starlink expands globally", "source_id": "[2]", "source_url": "http://b.com",
+             "support_level": "SUPPORTED"},
+        ],
+        source_map={"[1]": {"url": "http://a.com"}, "[2]": {"url": "http://b.com"}},
+    )
+    result = citation_auditor_node(state)
+
+    assert len(result["citation_audit"]) == 2
+    assert all(v["verdict"] == "SUPPORTED" for v in result["citation_audit"])
+    assert "Citation Integrity" in result["report"]
+    assert "2/2 cited sentences fully supported" in result["report"]
+    assert "flagged" not in result["report"]
+    assert result["active_node"] == "citation_auditor"
+
+
+@patch("src.agents.citation_auditor.get_llm_with_fallbacks")
+def test_citation_auditor_flags_unsupported_sentence(mock_get_llm):
+    """A sentence broader than its evidence must show up as flagged in the
+    banner, not silently pass — this is the whole point of Phase 10.A."""
+    mock_get_llm.return_value.return_value = CitationAuditBatch(results=[
+        CitationVerdict(sentence="SpaceX achieved a valuation of $350 billion in December 2024 [1].",
+                        cited_ids=["[1]"], verdict="SUPPORTED", reason="matches source"),
+        CitationVerdict(sentence="The company continues to expand Starlink coverage globally [2].",
+                        cited_ids=["[2]"], verdict="UNSUPPORTED", reason="evidence says nothing about Starlink"),
+    ])
+
+    state = _base_state(
+        report=_report_with_two_citations(),
+        verified_facts=[
+            {"claim": "SpaceX valued at $350B", "source_id": "[1]", "source_url": "http://a.com",
+             "support_level": "SUPPORTED"},
+        ],
+        source_map={"[1]": {"url": "http://a.com"}, "[2]": {"url": "http://b.com"}},
+    )
+    result = citation_auditor_node(state)
+
+    assert result["citation_audit"][1]["verdict"] == "UNSUPPORTED"
+    assert "1/2 cited sentences fully supported" in result["report"]
+    assert "1 flagged" in result["report"]
+
+
+@patch("src.agents.citation_auditor.get_llm_with_fallbacks")
+@patch("src.agents.citation_auditor.CITATION_AUDIT_BATCH_SIZE", 1)
+def test_citation_auditor_batches_sentences(mock_get_llm):
+    """More sentences than the batch size must produce multiple LLM calls,
+    not one oversized prompt."""
+    mock_get_llm.return_value.return_value = CitationAuditBatch(results=[
+        CitationVerdict(sentence="x", cited_ids=["[1]"], verdict="SUPPORTED", reason="ok"),
+    ])
+
+    state = _base_state(
+        report=_report_with_two_citations(),
+        verified_facts=[],
+        source_map={"[1]": {"url": "http://a.com"}, "[2]": {"url": "http://b.com"}},
+    )
+    result = citation_auditor_node(state)
+
+    assert mock_get_llm.return_value.call_count == 2
+    assert len(result["citation_audit"]) == 2  # one verdict per batch, two batches
+
+
+@patch("src.agents.citation_auditor.get_llm_with_fallbacks")
+def test_citation_auditor_degrades_on_batch_failure(mock_get_llm):
+    """A failed batch must not crash the run — it's skipped, not fatal."""
+    mock_get_llm.return_value.side_effect = RuntimeError("provider outage")
+
+    state = _base_state(
+        report=_report_with_two_citations(),
+        verified_facts=[],
+        source_map={"[1]": {"url": "http://a.com"}, "[2]": {"url": "http://b.com"}},
+    )
+    result = citation_auditor_node(state)
+
+    assert result == {"citation_audit": [], "active_node": "citation_auditor"}
 
 
 # ── Refiner batching ─────────────────────────────────────────────────────────
@@ -740,6 +1017,31 @@ async def _run_scout_with_two_docs():
 
 @pytest.mark.asyncio
 @patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
+async def test_scout_passes_owner_key_hash_from_state():
+    """The run's owner_key_hash must reach gather_sources_for_query so a global
+    KG lookup (4A.2) stays scoped to the caller's own facts."""
+    from src.agents.scout import scout_node
+    urls = ["https://journal.example/on"]
+    with patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock) as gather, \
+         patch("src.agents.scout.scrape_urls", new_callable=AsyncMock) as scrape, \
+         patch("src.agents.scout.get_embeddings", side_effect=_topic_embeddings), \
+         patch("src.agents.scout.rerank_chunks", side_effect=RuntimeError("no reranker")), \
+         patch("src.graph.kg.kg_store", _kg_with_two_docs()):
+        gather.return_value = [
+            {"url": u, "content": "", "needs_scrape": True, "source": "web"} for u in urls
+        ]
+        scrape.return_value = [
+            {"url": urls[0], "content": f"{_ON} content", "success": True},
+        ]
+        state = _scout_state()
+        state["owner_key_hash"] = "owner-xyz"
+        await scout_node(state)
+
+    assert gather.call_args.kwargs["owner_key_hash"] == "owner-xyz"
+
+
+@pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
 async def test_relevance_gate_drops_off_topic_sources():
     """An off-topic source must not reach the Refiner, however credible it looks."""
     result = await _run_scout_with_two_docs()
@@ -820,3 +1122,42 @@ async def test_gated_source_does_not_consume_a_domain_slot():
 
     urls_kept = {v["url"] for v in result["source_map"].values()}
     assert "https://site.example/on" in urls_kept
+
+
+# ── Scout: future as_of_date is sanitized ────────────────────────────────────
+
+@pytest.mark.asyncio
+@patch("src.agents.scout.shared_crawler", _fake_shared_crawler)
+@patch("src.agents.scout.gather_sources_for_query", new_callable=AsyncMock)
+@patch("src.agents.scout.scrape_urls", new_callable=AsyncMock)
+@patch("src.agents.scout.get_embeddings")
+@patch("src.agents.scout.rerank_chunks")
+async def test_scout_drops_future_as_of_date(mock_rerank, mock_embeddings, mock_scrape, mock_gather):
+    """A backend-reported as_of_date in the future (e.g. a mis-parsed field)
+    must not reach source_map as-is."""
+    long_content = (
+        "This is a detailed paragraph about solid state batteries that exceeds fifty characters.\n\n"
+        "Another paragraph providing technical details about energy density improvements in research."
+    )
+    mock_gather.side_effect = [
+        [{"url": "http://b.com", "content": long_content, "needs_scrape": False,
+          "source": "semantic_scholar", "credibility_hint": 0.9,
+          "source_type_hint": "Academic/Scientific", "as_of_date": "2099-01-01"}],
+    ]
+    mock_embeddings.return_value = [[0.1] * 384]
+    mock_rerank.side_effect = lambda q, chunks, top_k: chunks[:top_k]
+    mock_scrape.return_value = []
+
+    mock_kg = MagicMock()
+    mock_kg.store_document_and_chunks.return_value = 1
+    mock_kg.retrieve_top_docs.return_value = [1]
+    mock_kg.retrieve_top_chunks.return_value = [(1, "chunk from b.com")]
+    mock_kg.get_doc_metadata.return_value = {"url": "http://b.com", "query": "q1", "summary": "summary"}
+    mock_kg.get_all_chunks_for_docs.return_value = {1: ["chunk from b.com"]}
+
+    state = _base_state(plan=["q1"])
+    with patch("src.graph.kg.kg_store", mock_kg):
+        result = await scout_node(state)
+
+    dates = [v["as_of_date"] for v in result["source_map"].values()]
+    assert dates == [""]

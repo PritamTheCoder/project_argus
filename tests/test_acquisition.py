@@ -16,6 +16,7 @@ from src.agents.acquisition import (
     _dedup_candidates,
 )
 from src.tools.providers import SearchResult
+from src.tools.research_tools import _current_owner_key_hash
 
 
 def _tool_call(name, args):
@@ -43,6 +44,27 @@ def test_dedup_drops_seen_and_duplicate_urls():
     ]
     out = _dedup_candidates(cands, seen_urls={"http://b"})
     assert [c["url"] for c in out] == ["http://a"]
+
+
+# ── Owner scoping (Phase 4A.2 prerequisite) ─────────────────────────────────
+
+@pytest.mark.asyncio
+@patch("src.agents.acquisition.get_llm_with_fallbacks")
+async def test_gather_binds_and_resets_owner_context(mock_get_llm):
+    """owner_key_hash must be visible to kg_lookup for the call's duration and
+    cleared afterward, so it can never leak into an unrelated later call."""
+    seen = {}
+
+    async def _capture_ainvoke(*args, **kwargs):
+        seen["owner"] = _current_owner_key_hash.get()
+        return AIMessage(content="done")
+
+    mock_get_llm.return_value.ainvoke = _capture_ainvoke
+
+    await gather_sources_for_query("q", "MIXED", owner_key_hash="owner-xyz")
+
+    assert seen["owner"] == "owner-xyz"
+    assert _current_owner_key_hash.get() == ""
 
 
 # ── Tool-calling loop ────────────────────────────────────────────────────────

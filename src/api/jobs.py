@@ -12,7 +12,7 @@ from typing import Optional
 
 from src.config import JOBS_DB_PATH
 
-_JSON_FIELDS = ("source_map", "quality_score", "usage")
+_JSON_FIELDS = ("source_map", "quality_score", "usage", "pending_plan", "citation_audit")
 
 
 class JobStore:
@@ -38,6 +38,8 @@ class JobStore:
         """)
         self._ensure_column("owner_key_hash", "TEXT")
         self._ensure_column("usage", "TEXT")
+        self._ensure_column("pending_plan", "TEXT")
+        self._ensure_column("citation_audit", "TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs(owner_key_hash)")
         self.db.commit()
 
@@ -47,9 +49,12 @@ class JobStore:
         if column not in existing:
             self.db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {col_type}")
 
-    def create_job(self, query: str, owner_key_hash: str) -> dict:
+    def create_job(self, query: str, owner_key_hash: str, thread_id: Optional[str] = None) -> dict:
+        """``thread_id`` is normally auto-generated; a branch passes an
+        already-forked one so the job row points at the forked run, not a
+        fresh empty thread."""
         job_id = str(uuid.uuid4())
-        thread_id = str(uuid.uuid4())
+        thread_id = thread_id or str(uuid.uuid4())
         now = time.time()
         with self._lock:
             self.db.execute(
@@ -62,7 +67,8 @@ class JobStore:
 
     def update_job(self, job_id: str, **fields) -> None:
         """Patch arbitrary columns: status, active_node, report, source_map,
-        quality_score, usage, error. Dict-valued fields are JSON-encoded on write."""
+        quality_score, usage, pending_plan, citation_audit, error. Dict-valued
+        fields are JSON-encoded on write."""
         if not fields:
             return
         fields = dict(fields)
