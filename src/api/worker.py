@@ -1,6 +1,6 @@
-"""Runs one research job in its own OS thread + event loop (same trick as
-src/ui/runner.py), since Playwright needs a ProactorEventLoop on Windows
-that uvicorn's own loop doesn't guarantee."""
+"""Runs one research job in its own OS thread + event loop, since Playwright
+needs a ProactorEventLoop on Windows that uvicorn's own loop doesn't
+guarantee."""
 
 import asyncio
 import logging
@@ -35,6 +35,7 @@ async def _run(
                     report=state_update.get("report", ""),
                     source_map=state_update.get("source_map", {}),
                     quality_score=state_update.get("quality_score", {}),
+                    citation_audit=state_update.get("citation_audit", []),
                     usage={"llm": metrics.summary(), "node_seconds": state_update.get("node_seconds", {})},
                 )
             elif node_name == "__interrupt__":

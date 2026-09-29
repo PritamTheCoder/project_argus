@@ -12,7 +12,7 @@ from typing import Optional
 
 from src.config import JOBS_DB_PATH
 
-_JSON_FIELDS = ("source_map", "quality_score", "usage", "pending_plan")
+_JSON_FIELDS = ("source_map", "quality_score", "usage", "pending_plan", "citation_audit")
 
 
 class JobStore:
@@ -39,6 +39,7 @@ class JobStore:
         self._ensure_column("owner_key_hash", "TEXT")
         self._ensure_column("usage", "TEXT")
         self._ensure_column("pending_plan", "TEXT")
+        self._ensure_column("citation_audit", "TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_owner ON jobs(owner_key_hash)")
         self.db.commit()
 
@@ -66,8 +67,8 @@ class JobStore:
 
     def update_job(self, job_id: str, **fields) -> None:
         """Patch arbitrary columns: status, active_node, report, source_map,
-        quality_score, usage, pending_plan, error. Dict-valued fields are
-        JSON-encoded on write."""
+        quality_score, usage, pending_plan, citation_audit, error. Dict-valued
+        fields are JSON-encoded on write."""
         if not fields:
             return
         fields = dict(fields)

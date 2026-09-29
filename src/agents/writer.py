@@ -1,5 +1,6 @@
-"""Writer agent: synthesizes the final report using only the provided evidence,
-with rigorous per-claim citation."""
+"""Writer agent: synthesizes the report from verified evidence, with a
+citation id on each claim. The citation auditor checks those sentences
+against the same evidence after this node."""
 
 import logging
 from langchain_core.prompts import ChatPromptTemplate
@@ -24,18 +25,19 @@ def _as_text(content) -> str:
     return "".join(parts)
 
 
-def writer_node(state: AgentState) -> dict:
-    """Write the final report."""
-    logger.info("Writer: Synthesizing report...")
+def build_citation_remap(source_map: dict) -> tuple[dict, dict]:
+    """Collapse duplicate URLs in ``source_map`` into single renumbered
+    citation IDs (two source_ids pointing at the same URL become one ``[n]``).
 
-    query = state["query"]
-    evidence = state.get("verified_facts", [])
-    source_map = state.get("source_map", {})
-
-    # Collapse duplicate URLs from source_map into a single renumbered citation ID.
+    Returns ``(new_source_map, old_to_new_id_map)``. ``old_to_new_id_map`` is
+    keyed by both the original source_id (e.g. ``"[4]"``) and the URL itself,
+    so callers can resolve a fact by whichever one it carries — shared by
+    ``writer_node`` and the citation_auditor, which both need to map a fact
+    back to the report's final citation numbering.
+    """
     unique_urls = {}       # url -> new_source_id (e.g. "[1]")
     new_source_map = {}    # new_source_id -> {"url": url, ...}
-    old_to_new_id_map = {} # old_source_id (e.g. "[4]") -> new_source_id (e.g. "[1]")
+    old_to_new_id_map = {} # old_source_id or url -> new_source_id
 
     next_id = 1
     for old_id, data in source_map.items():
@@ -45,30 +47,43 @@ def writer_node(state: AgentState) -> dict:
             unique_urls[url] = new_id
             new_source_map[new_id] = data
             next_id += 1
-        
-        old_to_new_id_map[old_id] = unique_urls[url]
 
-    url_to_new_id = {}
-    for old_id, data in source_map.items():
-        url = data.get("url")
-        if url and url in unique_urls:
-            url_to_new_id[url] = unique_urls[url]
+        old_to_new_id_map[old_id] = unique_urls[url]
+        if url:
+            old_to_new_id_map[url] = unique_urls[url]
+
+    return new_source_map, old_to_new_id_map
+
+
+def resolve_fact_citation_id(fact: dict, old_to_new_id_map: dict) -> str | None:
+    """Resolve one fact's final citation ID through the collapsed remap,
+    falling back from its stored source_id to its source_url."""
+    new_sid = old_to_new_id_map.get(fact.get("source_id", "?"))
+    if new_sid is None:
+        new_sid = old_to_new_id_map.get(fact.get("source_url", ""))
+    return new_sid
+
+
+def writer_node(state: AgentState) -> dict:
+    """Write the final report."""
+    logger.info("Writer: Synthesizing report...")
+
+    query = state["query"]
+    evidence = state.get("verified_facts", [])
+    source_map = state.get("source_map", {})
+
+    new_source_map, old_to_new_id_map = build_citation_remap(source_map)
 
     evidence_text = ""
     for fact in evidence:
         if fact.get("support_level") not in ["SUPPORTED", "PARTIALLY_SUPPORTED"]:
             continue
-        old_sid = fact.get("source_id", "?")
-        new_sid = old_to_new_id_map.get(old_sid)
-        
-        if new_sid is None:
-            fact_url = fact.get("source_url", "")
-            new_sid = url_to_new_id.get(fact_url, None)
+        new_sid = resolve_fact_citation_id(fact, old_to_new_id_map)
 
         if new_sid is None:
-            new_sid = old_sid
-            logger.warning(f"Writer: Unresolvable source_id={old_sid}")
-            
+            new_sid = fact.get("source_id", "?")
+            logger.warning(f"Writer: Unresolvable source_id={new_sid}")
+
         claim = fact.get("claim", fact.get("text", ""))
         score = fact.get("credibility_score", 0.4)
         stype = fact.get("source_type", "Unknown")

@@ -11,6 +11,7 @@ async def _fake_stream_success(query, thread_id=None, callbacks=None, resume=Fal
         "report": "final report text",
         "source_map": {"[1]": {"url": "http://a.com"}},
         "quality_score": {"coverage": 0.9},
+        "citation_audit": [{"sentence": "x", "verdict": "SUPPORTED"}],
         "node_seconds": {"librarian": 1.2, "scout": 3.4},
     }
 
@@ -36,6 +37,7 @@ async def test_run_updates_job_progress_then_marks_done(mock_store):
     assert final_call["report"] == "final report text"
     assert final_call["source_map"] == {"[1]": {"url": "http://a.com"}}
     assert final_call["quality_score"] == {"coverage": 0.9}
+    assert final_call["citation_audit"] == [{"sentence": "x", "verdict": "SUPPORTED"}]
     assert final_call["usage"]["node_seconds"] == {"librarian": 1.2, "scout": 3.4}
     assert "llm" in final_call["usage"]
 

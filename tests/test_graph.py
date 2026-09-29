@@ -22,7 +22,8 @@ from src.graph.persistence import generate_thread_id, get_run_config
 @patch("src.graph.builder.reflector_node", return_value={})
 @patch("src.graph.builder.consensus_node", return_value={})
 @patch("src.graph.builder.writer_node", return_value={})
-def test_graph_compiles(mock_writer, mock_consensus, mock_reflector, mock_critic, mock_verifier, mock_refiner, mock_scout, mock_librarian):
+@patch("src.graph.builder.citation_auditor_node", return_value={})
+def test_graph_compiles(mock_auditor, mock_writer, mock_consensus, mock_reflector, mock_critic, mock_verifier, mock_refiner, mock_scout, mock_librarian):
     """build_graph() should return a compiled graph without errors."""
     graph = build_graph()
     assert graph is not None
@@ -36,12 +37,26 @@ def test_graph_compiles(mock_writer, mock_consensus, mock_reflector, mock_critic
 @patch("src.graph.builder.reflector_node", return_value={})
 @patch("src.graph.builder.consensus_node", return_value={})
 @patch("src.graph.builder.writer_node", return_value={})
-def test_graph_node_names(mock_writer, mock_consensus, mock_reflector, mock_critic, mock_verifier, mock_refiner, mock_scout, mock_librarian):
+@patch("src.graph.builder.citation_auditor_node", return_value={})
+def test_graph_node_names(mock_auditor, mock_writer, mock_consensus, mock_reflector, mock_critic, mock_verifier, mock_refiner, mock_scout, mock_librarian):
     """Graph should contain all expected node names."""
     graph = build_graph()
-    expected_nodes = {"librarian", "plan_gate", "scout", "refiner", "verifier", "fact_checker", "reflector", "consensus", "ghostwriter"}
+    expected_nodes = {
+        "librarian", "plan_gate", "scout", "refiner", "verifier", "fact_checker",
+        "reflector", "consensus", "ghostwriter", "citation_auditor",
+    }
     graph_nodes = set(graph.get_graph().nodes.keys()) - {"__start__", "__end__"}
     assert expected_nodes == graph_nodes
+
+
+def test_ghostwriter_feeds_citation_auditor_before_end():
+    """The audit must run after the report is written, not before or in parallel."""
+    graph = build_graph()
+    node_map = graph.get_graph().nodes
+    edges = {(e.source, e.target) for e in graph.get_graph().edges}
+    assert ("ghostwriter", "citation_auditor") in edges
+    assert ("citation_auditor", "__end__") in edges
+    assert ("ghostwriter", "__end__") not in edges
 
 
 # ── Routing Logic Tests ─────────────────────────────────────────────────────

@@ -21,7 +21,8 @@ NVIDIA_API_KEY: str = os.getenv("NVIDIA_API_KEY", "")
 # (own free-tier quota) but shares this base URL.
 NVIDIA_BASE_URL: str = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
-# Nemotron-3 Ultra (reasoning). Writer's primary when the key is set.
+# Nemotron-3 Ultra (reasoning). Not on the default Writer ladder — a slow
+# 503 failover blows the per-run timeout. Set WRITER_FALLBACK_CHAIN to use it.
 NVIDIA_API_NEMOTRON3_KEY: str = os.getenv("NVIDIA_API_NEMOTRON3_KEY", "")
 NEMOTRON_MODEL: str = os.getenv("NEMOTRON_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 # Unused: NVIDIA's model runner currently rejects this param. See llm_factory._nim_spec.
@@ -72,6 +73,15 @@ WRITER_PROVIDER: str = os.getenv("WRITER_PROVIDER", "groq")
 # (long retry-after on a 503) to blow the per-case timeout on its own. Set
 # WRITER_FALLBACK_CHAIN to re-insert it if its availability improves.
 WRITER_FALLBACK_CHAIN: str = os.getenv("WRITER_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
+
+# Citation auditor: checks the Writer's own sentences against their cited
+# evidence (Phase 10.A) — a structured judgment call like Verifier/Critic,
+# not prose generation, so it shares their model tier rather than the Writer's.
+CITATION_AUDITOR_MODEL: str = os.getenv("CITATION_AUDITOR_MODEL", "openai/gpt-oss-120b")
+CITATION_AUDITOR_PROVIDER: str = os.getenv("CITATION_AUDITOR_PROVIDER", "groq")
+CITATION_AUDITOR_FALLBACK_CHAIN: str = os.getenv("CITATION_AUDITOR_FALLBACK_CHAIN", _STRUCTURED_FALLBACK)
+# Sentences per LLM call — batched so a long report doesn't cost one call per sentence.
+CITATION_AUDIT_BATCH_SIZE: int = int(os.getenv("CITATION_AUDIT_BATCH_SIZE", "15"))
 
 # Embedding Settings
 EMBEDDING_MODE: str = os.getenv("EMBEDDING_MODE", "local") # "local" or "openai"

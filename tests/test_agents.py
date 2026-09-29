@@ -8,13 +8,14 @@ scrape) are mocked — no API keys or network access required.
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
-from src.schema.state import AgentState, ResearchPlan, SearchIntent, FactCheckResult
+from src.schema.state import AgentState, ResearchPlan, SearchIntent, FactCheckResult, CitationAuditBatch, CitationVerdict
 from src.agents.librarian import librarian_node
 from src.agents.scout import scout_node
 from src.agents.refiner import refiner_node, _split_into_batches
 from src.agents.critic import critic_node, _compute_coverage_gaps
 from src.agents.reflector import reflector_node, ReflectorOutput
-from src.agents.writer import writer_node
+from src.agents.writer import writer_node, build_citation_remap, resolve_fact_citation_id
+from src.agents.citation_auditor import citation_auditor_node, _split_citable_sentences
 
 
 # ── Shared state builder ──────────────────────────────────────────────────────
@@ -686,6 +687,158 @@ def test_writer_handles_list_content_response(mock_get_llm):
     result = writer_node(state)
 
     assert "Report from a list-content response." in result["report"]
+
+
+# ── Citation remap helpers (shared by Writer and CitationAuditor) ────────────
+
+def test_build_citation_remap_collapses_duplicate_urls():
+    source_map = {
+        "[1]": {"url": "http://a.com"},
+        "[4]": {"url": "http://a.com"},  # same URL, different original id
+        "[2]": {"url": "http://b.com"},
+    }
+    new_source_map, old_to_new_id_map = build_citation_remap(source_map)
+
+    assert old_to_new_id_map["[1]"] == old_to_new_id_map["[4]"]
+    assert old_to_new_id_map["[1]"] != old_to_new_id_map["[2]"]
+    assert len(new_source_map) == 2
+    # The URL itself resolves too, not just the original source_id.
+    assert old_to_new_id_map["http://a.com"] == old_to_new_id_map["[1]"]
+
+
+def test_resolve_fact_citation_id_falls_back_to_source_url():
+    source_map = {"[1]": {"url": "http://a.com"}}
+    _, old_to_new_id_map = build_citation_remap(source_map)
+
+    # A fact with an unresolvable source_id but a matching source_url still resolves.
+    fact = {"source_id": "[99]", "source_url": "http://a.com"}
+    assert resolve_fact_citation_id(fact, old_to_new_id_map) == "[1]"
+
+    assert resolve_fact_citation_id({"source_id": "[99]", "source_url": "http://nowhere.com"}, old_to_new_id_map) is None
+
+
+# ── Citation Auditor Tests (Phase 10.A) ───────────────────────────────────────
+
+def _report_with_two_citations() -> str:
+    return (
+        "> **Research Quality** — 2 verified facts\n\n"
+        "SpaceX achieved a valuation of $350 billion in December 2024 [1]. "
+        "The company continues to expand Starlink coverage globally [2].\n\n"
+        "---\n### References\n"
+        "- **[1]**: http://a.com *(Credibility: 0.9, Academic/Scientific)*\n"
+        "- **[2]**: http://b.com *(Credibility: 0.7, Major News)*\n"
+    )
+
+
+def test_split_citable_sentences_excludes_references_and_uncited_lines():
+    sentences = _split_citable_sentences(_report_with_two_citations())
+    assert len(sentences) == 2
+    assert all("[1]" in s or "[2]" in s for s in sentences)
+    assert not any("References" in s or "Credibility" in s for s in sentences)
+
+
+def test_split_citable_sentences_empty_when_nothing_to_check():
+    report = "\n\n---\n### References\n- **[1]**: http://a.com\n"
+    assert _split_citable_sentences(report) == []
+
+
+@patch("src.agents.citation_auditor.get_llm_with_fallbacks")
+def test_citation_auditor_skips_llm_call_when_no_citations(mock_get_llm):
+    state = _base_state(report="A report with no citations at all.")
+    result = citation_auditor_node(state)
+
+    assert result == {"citation_audit": [], "active_node": "citation_auditor"}
+    mock_get_llm.assert_not_called()
+
+
+@patch("src.agents.citation_auditor.get_llm_with_fallbacks")
+def test_citation_auditor_all_supported_banner(mock_get_llm):
+    mock_get_llm.return_value.return_value = CitationAuditBatch(results=[
+        CitationVerdict(sentence="SpaceX achieved a valuation of $350 billion in December 2024 [1].",
+                        cited_ids=["[1]"], verdict="SUPPORTED", reason="matches source"),
+        CitationVerdict(sentence="The company continues to expand Starlink coverage globally [2].",
+                        cited_ids=["[2]"], verdict="SUPPORTED", reason="matches source"),
+    ])
+
+    state = _base_state(
+        report=_report_with_two_citations(),
+        verified_facts=[
+            {"claim": "SpaceX valued at $350B", "source_id": "[1]", "source_url": "http://a.com",
+             "support_level": "SUPPORTED"},
+            {"claim": "Starlink expands globally", "source_id": "[2]", "source_url": "http://b.com",
+             "support_level": "SUPPORTED"},
+        ],
+        source_map={"[1]": {"url": "http://a.com"}, "[2]": {"url": "http://b.com"}},
+    )
+    result = citation_auditor_node(state)
+
+    assert len(result["citation_audit"]) == 2
+    assert all(v["verdict"] == "SUPPORTED" for v in result["citation_audit"])
+    assert "Citation Integrity" in result["report"]
+    assert "2/2 cited sentences fully supported" in result["report"]
+    assert "flagged" not in result["report"]
+    assert result["active_node"] == "citation_auditor"
+
+
+@patch("src.agents.citation_auditor.get_llm_with_fallbacks")
+def test_citation_auditor_flags_unsupported_sentence(mock_get_llm):
+    """A sentence broader than its evidence must show up as flagged in the
+    banner, not silently pass — this is the whole point of Phase 10.A."""
+    mock_get_llm.return_value.return_value = CitationAuditBatch(results=[
+        CitationVerdict(sentence="SpaceX achieved a valuation of $350 billion in December 2024 [1].",
+                        cited_ids=["[1]"], verdict="SUPPORTED", reason="matches source"),
+        CitationVerdict(sentence="The company continues to expand Starlink coverage globally [2].",
+                        cited_ids=["[2]"], verdict="UNSUPPORTED", reason="evidence says nothing about Starlink"),
+    ])
+
+    state = _base_state(
+        report=_report_with_two_citations(),
+        verified_facts=[
+            {"claim": "SpaceX valued at $350B", "source_id": "[1]", "source_url": "http://a.com",
+             "support_level": "SUPPORTED"},
+        ],
+        source_map={"[1]": {"url": "http://a.com"}, "[2]": {"url": "http://b.com"}},
+    )
+    result = citation_auditor_node(state)
+
+    assert result["citation_audit"][1]["verdict"] == "UNSUPPORTED"
+    assert "1/2 cited sentences fully supported" in result["report"]
+    assert "1 flagged" in result["report"]
+
+
+@patch("src.agents.citation_auditor.get_llm_with_fallbacks")
+@patch("src.agents.citation_auditor.CITATION_AUDIT_BATCH_SIZE", 1)
+def test_citation_auditor_batches_sentences(mock_get_llm):
+    """More sentences than the batch size must produce multiple LLM calls,
+    not one oversized prompt."""
+    mock_get_llm.return_value.return_value = CitationAuditBatch(results=[
+        CitationVerdict(sentence="x", cited_ids=["[1]"], verdict="SUPPORTED", reason="ok"),
+    ])
+
+    state = _base_state(
+        report=_report_with_two_citations(),
+        verified_facts=[],
+        source_map={"[1]": {"url": "http://a.com"}, "[2]": {"url": "http://b.com"}},
+    )
+    result = citation_auditor_node(state)
+
+    assert mock_get_llm.return_value.call_count == 2
+    assert len(result["citation_audit"]) == 2  # one verdict per batch, two batches
+
+
+@patch("src.agents.citation_auditor.get_llm_with_fallbacks")
+def test_citation_auditor_degrades_on_batch_failure(mock_get_llm):
+    """A failed batch must not crash the run — it's skipped, not fatal."""
+    mock_get_llm.return_value.side_effect = RuntimeError("provider outage")
+
+    state = _base_state(
+        report=_report_with_two_citations(),
+        verified_facts=[],
+        source_map={"[1]": {"url": "http://a.com"}, "[2]": {"url": "http://b.com"}},
+    )
+    result = citation_auditor_node(state)
+
+    assert result == {"citation_audit": [], "active_node": "citation_auditor"}
 
 
 # ── Refiner batching ─────────────────────────────────────────────────────────

@@ -6,7 +6,7 @@ Wires agent nodes into a cyclic LangGraph StateGraph:
         ├→ scout               (avg source credibility too low — broaden, don't chase claims)
         ├→ reflector → scout   (targeted gap-fill loop when gaps detected)
         ├→ scout               (broad re-search loop when no specific gaps)
-        └→ ghostwriter → END
+        └→ ghostwriter → citation_auditor → END
 
 The conditional edge honours MAX_RESEARCH_LOOPS to prevent infinite loops.
 """
@@ -26,6 +26,7 @@ from src.agents.critic import critic_node
 from src.agents.reflector import reflector_node
 from src.agents.consensus import consensus_node
 from src.agents.writer import writer_node
+from src.agents.citation_auditor import citation_auditor_node
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,8 @@ def route_after_critic(state: AgentState) -> str:
         the low-credibility source that made it)
       • gaps + specific claims detected → "reflector" (targeted sub-queries)
       • re-search requested but no specific gaps → "scout" (broad re-search)
-      • loop cap hit or sufficient evidence → "consensus" (then Writer)
+      • loop cap hit or sufficient evidence → "consensus" (then Writer,
+        then the citation auditor)
     """
     re_search = state.get("re_search_required", False)
     gap_detected = state.get("knowledge_gap_detected", False)
@@ -117,6 +119,7 @@ def build_graph(checkpointer=None):
     builder.add_node("reflector", reflector_node)
     builder.add_node("consensus", consensus_node)
     builder.add_node("ghostwriter", writer_node)
+    builder.add_node("citation_auditor", citation_auditor_node)
 
     builder.add_edge(START, "librarian")
     builder.add_edge("librarian", "plan_gate")
@@ -138,9 +141,12 @@ def build_graph(checkpointer=None):
         },
     )
 
-    # Consensus runs once on the final evidence, then the Writer synthesizes.
+    # Consensus runs once on the final evidence, then the Writer synthesizes,
+    # then the citation auditor checks the Writer's own sentences against
+    # what they actually cite (Phase 10.A) before the run ends.
     builder.add_edge("consensus", "ghostwriter")
-    builder.add_edge("ghostwriter", END)
+    builder.add_edge("ghostwriter", "citation_auditor")
+    builder.add_edge("citation_auditor", END)
 
     compile_kwargs = {}
     if checkpointer is not None:

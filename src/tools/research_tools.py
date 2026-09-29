@@ -35,8 +35,8 @@ _current_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 # The current run's owner (API key hash), so a KG_LOOKUP_GLOBAL lookup can be
 # scoped to "this owner's facts" rather than every owner's — the KG has no
-# other tenant boundary. Empty for the CLI/Streamlit paths, which have no
-# owner concept; those callers implicitly share one "local" bucket.
+# other tenant boundary. Empty for the CLI, which has no owner concept;
+# that caller implicitly shares one "local" bucket.
 _current_owner_key_hash: contextvars.ContextVar[str] = contextvars.ContextVar(
     "kg_lookup_owner_key_hash", default=""
 )

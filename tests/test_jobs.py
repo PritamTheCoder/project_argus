@@ -61,12 +61,14 @@ def test_update_job_patches_fields_and_json_encodes_dicts():
         report="final report text",
         source_map={"[1]": {"url": "http://a.com"}},
         quality_score={"coverage": 0.9},
+        citation_audit=[{"sentence": "x", "verdict": "SUPPORTED"}],
     )
     fetched = store.get_job(job["job_id"])
     assert fetched["status"] == "done"
     assert fetched["report"] == "final report text"
     assert fetched["source_map"] == {"[1]": {"url": "http://a.com"}}
     assert fetched["quality_score"] == {"coverage": 0.9}
+    assert fetched["citation_audit"] == [{"sentence": "x", "verdict": "SUPPORTED"}]
     _cleanup(store, tmp_dir, db_path)
 
 

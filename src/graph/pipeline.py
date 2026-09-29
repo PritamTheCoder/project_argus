@@ -1,6 +1,6 @@
 """Shared pipeline entrypoint — the one place that builds the graph, seeds
-initial state, and drives graph.astream(). main.py (CLI), src/ui/runner.py
-(Streamlit), and src/api (HTTP) all call this instead of duplicating it."""
+initial state, and drives graph.astream(). main.py (CLI) and src/api (HTTP)
+both call this instead of duplicating it."""
 
 import time
 from typing import Any, AsyncGenerator, Optional

@@ -78,7 +78,7 @@ async def root():
         "docs": "/docs",
         "endpoints": {
             "POST /research": "submit a research query, returns a job_id (requires an API key)",
-            "GET /research/{job_id}": "poll job status/progress/result (requires an API key)",
+            "GET /research/{job_id}": "poll status, progress, report, and citation_audit (requires an API key)",
             "GET /research/{job_id}/graph": "the evidence graph for a run: facts, sources, contradictions, consensus findings, gaps (requires an API key)",
             "GET /research/{job_id}/facts/{fact_id}": "one fact's quote, source, and contradictions (requires an API key)",
             "GET /research/{job_id}/history": "the run's checkpoint history, for picking a branch point (requires an API key)",
