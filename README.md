@@ -4,6 +4,8 @@ Argus turns a research question into a cited report. A LangGraph pipeline plans 
 
 By Pritam Thapa
 
+Finished runs, query included, are in [`assets/samples/`](assets/samples/). [Lecanemab and donanemab phase 3 trials](assets/samples/lecanemab-donanemab-phase3.md) is a 2026-09-29 medical run. [EV adoption in Nepal](assets/samples/nepal-ev-adoption-2020-2026.md) is the cleaner prose example: claims cite `[n]`, and those markers match the reference list. [SpaceX growth, 2020–2026](assets/samples/spacex-growth-2020-2026.md) is an earlier stored report.
+
 ## Pipeline
 
 ```

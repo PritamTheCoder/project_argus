@@ -43,6 +43,8 @@ async def run_query(query: str):
             print(f"  -> {node_name}", flush=True)
             previous_node = node_name
 
+        # A node that writes nothing (plan_gate with approval off) streams None.
+        node_output = node_output or {}
         if "plan" in node_output and node_output["plan"]:
             print(f"       generated {len(node_output['plan'])} search queries", flush=True)
         if "scraped_data" in node_output:
